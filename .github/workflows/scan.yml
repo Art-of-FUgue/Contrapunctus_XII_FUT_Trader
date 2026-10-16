@@ -14,6 +14,10 @@ jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    env:
+      DB_FILE: market_pc.db
+      DATA_BRANCH: data
+
     steps:
       - uses: actions/checkout@v4
 
@@ -23,34 +27,55 @@ jobs:
 
       - run: pip install requests
 
-      # Price history is a real file, market_pc.db, kept on the "data" branch.
+      # ── Restore price history from the "data" branch ─────────────────────
+      # The DB is kept on a separate orphan branch so it never bloats main.
+      # On the very first run the branch won't exist yet; that is fine.
       - name: Restore price history
         run: |
-          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
-            git fetch --depth=1 origin data
-            git show FETCH_HEAD:market_pc.db > market_pc.db || rm -f market_pc.db
+          if git ls-remote --exit-code --heads origin "$DATA_BRANCH" > /dev/null 2>&1; then
+            echo "Data branch found – fetching price history…"
+            git fetch --depth=1 origin "$DATA_BRANCH"
+            if git show FETCH_HEAD:"$DB_FILE" > "$DB_FILE" 2>/dev/null; then
+              echo "Restored $(du -h "$DB_FILE" | cut -f1) price history database."
+            else
+              rm -f "$DB_FILE"
+              echo "Branch exists but DB file not found – starting fresh."
+            fi
+          else
+            echo "No data branch yet – first run, starting with empty database."
           fi
-          ls -l market_pc.db || echo "no history yet (first run)"
 
-      - run: python fc_market_scanner.py --once
+      # ── Run the scan ──────────────────────────────────────────────────────
+      - name: Run scan
+        id: scan
+        run: python fc_market_scanner.py --once
         env:
           FC_PLATFORM: pc
           FC_NOTIFY_EACH_RUN: "1"      # set to "0" to stop the per-run Discord line
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
-      # Replaces the branch with one commit each run, so the repo does not grow.
+      # ── Save price history back to the "data" branch ──────────────────────
+      # Runs even if the scan step fails so no history snapshots are lost.
+      # Each push replaces the single commit on the branch (--force) so the
+      # repository size stays constant no matter how long the bot runs.
       - name: Save price history
+        if: always()
         env:
           REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
         run: |
-          set -e
+          if [ ! -f "$DB_FILE" ]; then
+            echo "No DB file to save (scan never wrote one) – skipping."
+            exit 0
+          fi
+          echo "Saving $(du -h "$DB_FILE" | cut -f1) price history database…"
           OUT=$(mktemp -d)
-          cp market_pc.db "$OUT/"
+          cp "$DB_FILE" "$OUT/"
           cd "$OUT"
-          git init -q -b data
+          git init -q -b "$DATA_BRANCH"
           git config user.name "fc-scanner"
           git config user.email "fc-scanner@users.noreply.github.com"
-          git add market_pc.db
+          git add "$DB_FILE"
           git commit -q -m "price history $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git remote add origin "$REPO_URL"
-          git push -q --force origin data
+          git push -q --force origin "$DATA_BRANCH"
+          echo "Price history saved to branch '$DATA_BRANCH'."
