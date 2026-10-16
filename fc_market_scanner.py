@@ -1,6 +1,12 @@
 """
 EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
 
+    Premium cards (Icons, Heroes, Holographic variants) use a wider averaging
+    window (ICON_HERO_HISTORY_HOURS = 72h default) so their 'usual' price is
+    stable and not skewed by short-term moves.
+    TOTW cards below TOTW_MIN_PRICE (15k) are skipped from dip/spike alerts
+    to eliminate min-price fluctuation noise.
+
     pip install requests
     export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
     export FC_PLATFORM=pc            # pc (default) or ps
@@ -35,10 +41,14 @@ import os
 import random
 import sqlite3
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 
 import requests
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 NOTIFY_EACH_RUN = os.environ.get("FC_NOTIFY_EACH_RUN", "1") == "1"   # "scan ran" line in Discord
@@ -53,6 +63,30 @@ POLL_SECONDS = 15 * 60
 COMPARE_HOURS = 6                # compare today's price with this many hours ago
 HISTORY_HOURS = 24               # window for "usually" / price range / 24h high
 MIN_SAMPLES = 12                 # snapshots needed before a card is judged
+
+# ---- premium card settings (Icons, Heroes, Holos) --------------------------
+# Rarity names that get special treatment (own dip detector, holographic)
+PREMIUM_KINDS = {
+    "Icon", "Heroes", "Hero",
+    "Icon Moments",
+    "Holographic Icon", "Holo Icon",
+    "Holographic Hero", "Holo Hero",
+    "Holographic",                       # generic holo rarity used by some sets
+}
+# 24 h window: enough history without diluting recent price moves
+PREMIUM_HISTORY_HOURS = 24
+# A premium dip must be this deep vs the 24 h median to be worth alerting
+PREMIUM_DIP_MIN_PCT = 5.0
+# Liquidity gate: at least this many consecutive-snapshot price changes in 24 h
+# (proxy for active trading – icons that don't move are untradeable at the dip)
+PREMIUM_MIN_PRICE_CHANGES = 4
+# Minimum snapshots required in the 24 h window for the liquidity check
+PREMIUM_MIN_SNAPSHOTS_24H = 8
+
+# ---- TOTW fodder filter ----------------------------------------------------
+# TOTW cards below this price produce noisy min-price fluctuations → skip them
+TOTW_MIN_PRICE = 15_000
+TOTW_KINDS = {"TOTW", "Team of the Week", "TOTW Rare"}
 
 DIP_BANDS = [(15_000, 100_000), (100_000, 500_000)]
 DIP_MIN_PCT = 3.0                # drop vs COMPARE_HOURS ago
@@ -206,23 +240,100 @@ def load_watchlist(path: str | None) -> set[str]:
     return result
 
 
-def card_stats(db, card: Card, now: float):
+def extract_recent_sales(rows: list[tuple[float, int]]) -> list[int]:
+    """Extract distinct sale/trade price points by filtering consecutive identical prices.
+
+    In the FC transfer market, when a card sells and clears the market,
+    the live lowest BIN shifts to the next listed card. Deduplicating
+    consecutive identical snapshot prices isolates the sequence of actual
+    sales and market price changes.
+    """
+    if not rows:
+        return []
+    sales = [rows[0][1]]
+    for _, price in rows[1:]:
+        if price != sales[-1]:
+            sales.append(price)
+    return sales
+
+
+def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
+    """Return price stats for a card over *history_hours*.
+
+    Non-premium cards use the default HISTORY_HOURS window.
+    Premium cards are handled by card_premium_dip_stats() instead.
+    """
     rows = db.execute(
         "select ts, price from prices where card_id=? and ts>=? order by ts",
-        (card.card_id, now - HISTORY_HOURS * 3600)).fetchall()
+        (card.card_id, now - history_hours * 3600)).fetchall()
     if len(rows) < MIN_SAMPLES:
         return None
     older = [p for t, p in rows if t <= now - COMPARE_HOURS * 3600]
     if not older:
         return None
     prices = [p for _, p in rows]
+    sales = extract_recent_sales(rows)
+    sales_avg = int(statistics.mean(sales)) if sales else int(statistics.median(prices))
+    sales_count = max(0, len(sales) - 1)
     q = statistics.quantiles(prices, n=4)
     return {
         "ref": older[-1],                       # newest price >= COMPARE_HOURS old
         "usual": statistics.median(prices),
+        "sales_avg": sales_avg,
+        "sales_count": sales_count,
         "low": q[0],
         "high": q[2],
         "high24": max(p for t, p in rows if t >= now - 24 * 3600),
+    }
+
+
+def card_premium_dip_stats(db, card: Card, now: float) -> dict | None:
+    """Specialised stats for premium-card dip detection using recent sales history.
+
+    Criteria applied here (all must pass):
+    1. Enough snapshots in the 24 h window (PREMIUM_MIN_SNAPSHOTS_24H).
+    2. Liquidity / Sales demand: at least PREMIUM_MIN_PRICE_CHANGES actual sales
+       (price changes) in the 24h window. A card whose price never moved is
+       illiquid and lacks buyer demand.
+    3. Price dip: current price is at least PREMIUM_DIP_MIN_PCT below the
+       24h Recent Sales Average (mean of actual traded price points).
+
+    Returns a dict with stats, or None if any gate fails.
+    """
+    rows = db.execute(
+        "select ts, price from prices where card_id=? and ts>=? order by ts",
+        (card.card_id, now - PREMIUM_HISTORY_HOURS * 3600)).fetchall()
+    if len(rows) < PREMIUM_MIN_SNAPSHOTS_24H:
+        return None                              # not enough data yet
+
+    prices = [p for _, p in rows]
+    sales = extract_recent_sales(rows)
+    sales_count = max(0, len(sales) - 1)
+
+    # ── liquidity / trading activity gate ───────────────────────────────────
+    if sales_count < PREMIUM_MIN_PRICE_CHANGES:
+        return None                              # price barely moved – illiquid
+
+    # ── recent sales average ────────────────────────────────────────────────
+    # Mean of the actual traded prices (filtering out stale idle periods)
+    sales_avg = int(statistics.mean(sales))
+    if sales_avg <= 0:
+        return None
+
+    dip_pct = (card.price - sales_avg) / sales_avg * 100
+    if dip_pct > -PREMIUM_DIP_MIN_PCT:
+        return None                              # not enough of a dip vs sales avg
+
+    q = statistics.quantiles(prices, n=4)
+    return {
+        "sales_avg": sales_avg,
+        "sales_median": int(statistics.median(sales)),
+        "usual": statistics.median(prices),
+        "low": q[0],
+        "high": q[2],
+        "dip_pct": dip_pct,
+        "sales_count": sales_count,
+        "snapshots": len(rows),
     }
 
 
@@ -255,13 +366,13 @@ def build_dips(items) -> list[dict]:
         for c, s, pct in band:
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
                          f"{link(c)} {c.rating} {c.kind}")
-            lines.append(f"buy under **{k(c.price)}** · usually {k(s['usual'])} "
-                         f"| {k(s['low'])} – {k(s['high'])} | {HISTORY_HOURS}h")
+            lines.append(f"buy under **{k(c.price)}** · sales avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
+                         f"| {k(s['low'])} – {k(s['high'])} | {s['sales_count']} sales")
         lines += ["", "🟠 10%+ · 🟢 5–10% · 🟡 3–5%"]
         e = {"title": f"⚡ {COMPARE_HOURS} Hour dips {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0x2ECC71,
-             "footer": {"text": f"{COMPARE_HOURS} Hour dips"}}
+             "footer": {"text": f"{COMPARE_HOURS} Hour dips · recent sales avg"}}
         if band[0][0].image_url:
             e["thumbnail"] = {"url": band[0][0].image_url}
         embeds.append(e)
@@ -337,6 +448,46 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
     return embeds
 
 
+def build_premium_dips(items) -> list[dict]:
+    """Dedicated embed for Icon / Hero / Holo dip opportunities.
+
+    Each entry already passed the 24 h sales avg + liquidity gate in
+    card_premium_dip_stats(), so everything shown here is a real signal.
+    """
+    items = sorted(items, key=lambda i: i[1]["dip_pct"])[:MAX_LINES]   # deepest first
+    if not items:
+        return []
+    lines = [
+        f"{len(items)} premium card(s) dipped ≥{PREMIUM_DIP_MIN_PCT:.0f}% vs 24 h sales avg",
+        f"Liquidity gate: ≥{PREMIUM_MIN_PRICE_CHANGES} sales in last 24 h · {PREMIUM_HISTORY_HOURS}h window",
+        "",
+    ]
+    for c, s in items:
+        liq_bar = "🔥" * min(max(s["sales_count"] // 3, 1), 5)   # visual liquidity meter
+        lines.append(
+            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` **{k(c.price)}** "
+            f"{link(c)} {c.rating} · *{c.kind}*"
+        )
+        lines.append(
+            f"sales avg **{k(s['sales_avg'])}** (median {k(s['sales_median'])}) "
+            f"· range {k(s['low'])}–{k(s['high'])} "
+            f"· {s['sales_count']} sales {liq_bar}"
+        )
+    lines += ["", "🟠 10%+ · 🟢 5–10% · 🟡 3–5%"]
+    e = {
+        "title": f"💎 Premium Dips (Icon / Hero / Holo) · {PLATFORM_LABEL}",
+        "description": "\n".join(lines),
+        "color": 0x8E44AD,
+        "footer": {"text": (
+            f"24 h sales avg · ≥{PREMIUM_DIP_MIN_PCT:.0f}% dip · "
+            f"≥{PREMIUM_MIN_PRICE_CHANGES} sales"
+        )},
+    }
+    if items[0][0].image_url:
+        e["thumbnail"] = {"url": items[0][0].image_url}
+    return [e]
+
+
 def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dict]:
     """Embed showing current price for every card on the watchlist."""
     hits = [cards_map[cid] for cid in watchlist if cid in cards_map]
@@ -354,21 +505,55 @@ def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dic
 
 
 # ------------------------------------------------------------------- scan --
+def _is_premium(card: Card) -> bool:
+    """True for Icons, Heroes, and Holographic card variants."""
+    return card.kind in PREMIUM_KINDS
+
+
+def _is_totw_fodder(card: Card) -> bool:
+    """True for TOTW cards below the minimum price threshold.
+
+    These cards tend to sit at EA's minimum price and generate spurious
+    min-price fluctuation alerts that add noise without actionable signal.
+    """
+    return card.kind in TOTW_KINDS and card.price < TOTW_MIN_PRICE
+
+
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -> list[dict]:
     dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
+    premium_dips: list[tuple[Card, dict]] = []   # (card, stats) – own embed
     cards_map = {c.card_id: c for c in cards}
 
     for c in cards:
-        # ── 6h dip / spike ──────────────────────────────────────────────────
-        s = card_stats(db, c, now)
-        if s and s["ref"] > 0:
-            pct = (c.price - s["ref"]) / s["ref"] * 100
-            if pct <= -DIP_MIN_PCT and c.price < s["usual"]:
-                dips.append((c, s, pct))
-            if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
-                spikes.append((c, s, pct))
+        # ── skip TOTW fodder at min price (noisy, no signal) ────────────────
+        if _is_totw_fodder(c):
+            continue
 
-        # ── micro-spike / dip / crash (last two snapshots) ───────────────────────
+        if _is_premium(c):
+            # ── premium path: dedicated dip detector (24 h, liquidity-gated) ─
+            ps = card_premium_dip_stats(db, c, now)
+            if ps is not None:
+                premium_dips.append((c, ps))
+
+            # Premium cards still participate in spike and flash alerts.
+            # They are intentionally excluded from the general dip list to
+            # avoid duplicate / lower-quality alerts for the same card.
+            s = card_stats(db, c, now)
+            if s and s["ref"] > 0:
+                pct = (c.price - s["ref"]) / s["ref"] * 100
+                if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
+                    spikes.append((c, s, pct))
+        else:
+            # ── standard path: 6h dip / spike ───────────────────────────────
+            s = card_stats(db, c, now)
+            if s and s["ref"] > 0:
+                pct = (c.price - s["ref"]) / s["ref"] * 100
+                if pct <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
+                    dips.append((c, s, pct))
+                if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
+                    spikes.append((c, s, pct))
+
+        # ── micro-spike / dip / crash (last two snapshots) ───────────────────
         if c.price >= FLASH_MIN_PRICE:
             f = card_flash_stats(db, c)
             if f and f["prev_price"] > 0:
@@ -380,7 +565,12 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
                 elif pct <= -FLASH_DIP_PCT:
                     flash_dips.append((c, f, pct))
 
-    embeds = build_dips(dips) + build_spikes(spikes) + build_flashes(flash_spikes, flash_dips, flash_crashes)
+    embeds = (
+        build_dips(dips)
+        + build_spikes(spikes)
+        + build_flashes(flash_spikes, flash_dips, flash_crashes)
+        + build_premium_dips(premium_dips)    # 💎 Icon / Hero / Holo dips
+    )
 
     # ── watchlist ────────────────────────────────────────────────────────────
     if watchlist:
