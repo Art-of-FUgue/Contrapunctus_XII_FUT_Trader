@@ -1,0 +1,33 @@
+name: FC market scan
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"     # every 15 min (GitHub may delay runs a few minutes)
+  workflow_dispatch:           # lets you run it manually from the Actions tab
+
+concurrency: fc-scan           # never run two scans at once
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      # Keep price history between runs (each run starts on a blank machine)
+      - uses: actions/cache@v4
+        with:
+          path: market_pc.db
+          key: market-db-${{ github.run_id }}
+          restore-keys: market-db-
+
+      - run: python fc_market_scanner.py --once
+        env:
+          FC_PLATFORM: pc
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
