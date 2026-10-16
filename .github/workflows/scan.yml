@@ -2,7 +2,7 @@ name: FC market scan
 
 on:
   schedule:
-    - cron: "*/15 * * * *"     # every 15 min (GitHub may delay runs a few minutes)
+    - cron: "7,22,37,52 * * * *"   # every 15 min, off the busy :00/:15 marks
   workflow_dispatch:           # lets you run it manually from the Actions tab
 
 concurrency: fc-scan           # never run two scans at once
