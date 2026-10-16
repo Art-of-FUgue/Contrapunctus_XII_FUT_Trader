@@ -60,9 +60,10 @@ SPIKE_BAND = (20_000, 950_000)
 SPIKE_MIN_PCT = 30.0             # jump vs COMPARE_HOURS ago
 MAX_LINES = 8                    # per embed
 
-# ---- micro-spike / crash (single scan-to-scan delta, ~15 min window) -------
+# ---- micro-spike / dip / crash (single scan-to-scan delta, ~15 min window) -
 FLASH_SPIKE_PCT = 10.0           # jump between last two snapshots to count as micro-spike
-FLASH_CRASH_PCT = 8.0            # drop between last two snapshots to count as crash
+FLASH_DIP_PCT = 3.0              # drop between last two snapshots to count as micro-dip
+FLASH_CRASH_PCT = 8.0            # drop threshold that escalates a micro-dip to a crash
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
 
 # ---- watchlist -------------------------------------------------------------
@@ -287,8 +288,8 @@ def build_spikes(items) -> list[dict]:
     return [e]
 
 
-def build_flashes(spike_items, crash_items) -> list[dict]:
-    """Embeds for micro-spikes and crashes detected between the last two scans."""
+def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
+    """Embeds for micro-spikes, micro-dips, and crashes detected between the last two scans."""
     embeds = []
 
     if spike_items:
@@ -303,6 +304,20 @@ def build_flashes(spike_items, crash_items) -> list[dict]:
              "footer": {"text": "Micro-spike (last scan delta)"}}
         if spike_items[0][0].image_url:
             e["thumbnail"] = {"url": spike_items[0][0].image_url}
+        embeds.append(e)
+
+    if dip_items:
+        dip_items = sorted(dip_items, key=lambda i: i[2])[:MAX_LINES]   # most negative first
+        lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
+        for c, f, pct in dip_items:
+            lines.append(f"📉 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible buy window")
+        e = {"title": f"📉 Micro-Dips · {PLATFORM_LABEL}",
+             "description": "\n".join(lines),
+             "color": 0x1ABC9C,
+             "footer": {"text": f"Micro-dip ({FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}% drop, last scan delta)"}}
+        if dip_items[0][0].image_url:
+            e["thumbnail"] = {"url": dip_items[0][0].image_url}
         embeds.append(e)
 
     if crash_items:
@@ -340,7 +355,7 @@ def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dic
 
 # ------------------------------------------------------------------- scan --
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -> list[dict]:
-    dips, spikes, flash_spikes, flash_crashes = [], [], [], []
+    dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
     cards_map = {c.card_id: c for c in cards}
 
     for c in cards:
@@ -353,7 +368,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
             if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
                 spikes.append((c, s, pct))
 
-        # ── micro-spike / crash (last two snapshots) ─────────────────────────
+        # ── micro-spike / dip / crash (last two snapshots) ───────────────────────
         if c.price >= FLASH_MIN_PRICE:
             f = card_flash_stats(db, c)
             if f and f["prev_price"] > 0:
@@ -362,8 +377,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
                     flash_spikes.append((c, f, pct))
                 elif pct <= -FLASH_CRASH_PCT:
                     flash_crashes.append((c, f, pct))
+                elif pct <= -FLASH_DIP_PCT:
+                    flash_dips.append((c, f, pct))
 
-    embeds = build_dips(dips) + build_spikes(spikes) + build_flashes(flash_spikes, flash_crashes)
+    embeds = build_dips(dips) + build_spikes(spikes) + build_flashes(flash_spikes, flash_dips, flash_crashes)
 
     # ── watchlist ────────────────────────────────────────────────────────────
     if watchlist:
