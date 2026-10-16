@@ -30,4 +30,5 @@ jobs:
       - run: python fc_market_scanner.py --once
         env:
           FC_PLATFORM: pc
+          FC_NOTIFY_EACH_RUN: "1"      # set to "0" to stop the per-run Discord line
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}

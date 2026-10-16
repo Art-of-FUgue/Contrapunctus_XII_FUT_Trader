@@ -4,10 +4,13 @@ EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
     pip install requests
     export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
     export FC_PLATFORM=pc            # pc (default) or ps
+    export FC_NOTIFY_EACH_RUN=1      # post a short "scan ran" line to Discord each run (0 = off)
 
     python fc_market_scanner.py                    # loop forever, scan every 15 min
     python fc_market_scanner.py --once             # one scan, then exit (GitHub Actions)
     python fc_market_scanner.py --dry-run          # print embeds instead of posting
+    python fc_market_scanner.py --interval 60 --max-scans 10 --db test.db --dry-run
+                                                   # fast test run with a throwaway database
     python fc_market_scanner.py --demo --dry-run   # fake data, to preview the output
 
 How it works
@@ -32,6 +35,7 @@ from dataclasses import dataclass
 import requests
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+NOTIFY_EACH_RUN = os.environ.get("FC_NOTIFY_EACH_RUN", "1") == "1"   # "scan ran" line in Discord
 HERE = os.path.dirname(os.path.abspath(__file__))   # data files live next to the script
 PLATFORMS = {"pc": ("🖥️ PC", "pc"), "ps": ("🎮 PS", "ps5")}   # name -> (label, fut.gg file key)
 PLATFORM = os.environ.get("FC_PLATFORM", "pc").lower()
@@ -291,13 +295,33 @@ def demo_seed(db, now: float):
     return now_cards
 
 
+def notice(text: str, dry_run: bool) -> None:
+    """Short status line in Discord so you can see each run happen."""
+    if not NOTIFY_EACH_RUN:
+        return
+    try:
+        if dry_run:
+            print(f"[notice] {text}")
+        else:
+            requests.post(WEBHOOK_URL, json={"content": text}, timeout=10).raise_for_status()
+    except Exception as e:                # a failed notice must never fail the scan
+        print(f"[warn] could not post notice: {e}")
+
+
 def run_cycle(db, dry_run: bool) -> None:
     now = time.time()
-    cards = fetch_market()
-    embeds = scan(db, cards, now)         # judge against history first
-    post(embeds, dry_run)
-    save_snapshot(db, cards, now)
-    print(f"[info] scanned {len(cards)} cards, posted {len(embeds)} embed(s)")
+    try:
+        cards = fetch_market()
+        embeds = scan(db, cards, now)     # judge against history first
+        post(embeds, dry_run)
+        save_snapshot(db, cards, now)
+    except Exception as e:
+        notice(f"⚠️ {PLATFORM_LABEL} scan failed: {str(e)[:300]}", dry_run)
+        raise
+    stamp = time.strftime("%H:%M:%S", time.gmtime())
+    print(f"[info] {stamp} UTC scanned {len(cards)} cards, posted {len(embeds)} embed(s)")
+    notice(f"🔄 {PLATFORM_LABEL} scan ran at {stamp} UTC · {len(cards)} cards · "
+           f"{len(embeds)} alert embed(s)", dry_run)
 
 
 def main() -> None:
@@ -306,7 +330,14 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="print, don't send")
     ap.add_argument("--once", action="store_true",
                     help="one scan then exit (for GitHub Actions / cron)")
+    ap.add_argument("--interval", type=float, default=POLL_SECONDS,
+                    help="seconds between scans in loop mode (minimum 30)")
+    ap.add_argument("--max-scans", type=int, default=0,
+                    help="stop after this many scans (0 = run forever)")
+    ap.add_argument("--db", default=DB_PATH, help="price history database file")
     args = ap.parse_args()
+    if args.interval < 30:
+        raise SystemExit("--interval must be at least 30 seconds (be kind to fut.gg)")
 
     if not args.dry_run and not WEBHOOK_URL:
         raise SystemExit("Set DISCORD_WEBHOOK_URL (or use --dry-run)")
@@ -320,16 +351,23 @@ def main() -> None:
         post(embeds, args.dry_run)
         return
 
-    db = open_db(DB_PATH)
+    db = open_db(args.db)
     if args.once:
         run_cycle(db, args.dry_run)       # errors fail the run, visible in Actions
         return
+    done = failed = 0
     while True:
         try:
             run_cycle(db, args.dry_run)
         except Exception as e:
+            failed += 1
             print(f"[warn] {e}")
-        time.sleep(POLL_SECONDS)
+        done += 1
+        if args.max_scans and done >= args.max_scans:
+            break
+        time.sleep(args.interval)
+    if failed == done:
+        raise SystemExit("every scan failed")
 
 
 if __name__ == "__main__":
