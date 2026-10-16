@@ -1,31 +1,29 @@
 """
-EA FC market scanner -> Discord embeds (6h dips + spikes), like R21 Trader.
+EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
 
     pip install requests
     export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-    export FC_PLATFORM=pc            # pc (default), ps or xbox
-    export NTFY_TOPIC="your-long-random-topic"   # phone alerts (instead of Discord)
+    export FC_PLATFORM=pc            # pc (default) or ps
 
-    python fc_market_scanner.py --once             # single scan, then exit
-
-    python fc_market_scanner.py --demo --dry-run   # fake data, print JSON only
-    python fc_market_scanner.py --demo             # fake data, post to Discord
-    python fc_market_scanner.py                    # real loop (needs fetch_market)
+    python fc_market_scanner.py                    # loop forever, scan every 15 min
+    python fc_market_scanner.py --once             # one scan, then exit (GitHub Actions)
+    python fc_market_scanner.py --dry-run          # print embeds instead of posting
+    python fc_market_scanner.py --demo --dry-run   # fake data, to preview the output
 
 How it works
-  1. fetch_market() returns the current price of many cards (YOU implement this).
-  2. Every poll, prices are saved to SQLite (market.db).
-  3. A card is a DIP if it is >=3% below its price 6h ago AND below its usual
-     (56h median) price. A SPIKE is >=30% above its price 6h ago.
+  1. Each scan reads current prices from fut.gg's static price files and labels
+     them using players.json (build it with build_players.py).
+  2. Prices are saved to a local SQLite file (market_<platform>.db).
+  3. A card is a DIP if it is >=3% below its price COMPARE_HOURS ago and below its
+     usual (median over HISTORY_HOURS) price. A SPIKE is >=30% above that price.
   4. Results are grouped into price bands and posted as Discord embeds.
 
-History needs ~56h to build up before "usually" is meaningful (see MIN_SAMPLES).
+First alerts appear after ~COMPARE_HOURS hours (it needs a snapshot that old).
 """
 import argparse
 import json
 import os
 import random
-import re
 import sqlite3
 import statistics
 import time
@@ -34,19 +32,22 @@ from dataclasses import dataclass
 import requests
 
 WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")           # phone alerts via ntfy
-NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 HERE = os.path.dirname(os.path.abspath(__file__))   # data files live next to the script
-PLATFORM = os.environ.get("FC_PLATFORM", "pc").lower()   # "pc", "ps" or "xbox"
-PLATFORM_LABEL = {"pc": "🖥️ PC", "ps": "🎮 PS", "xbox": "❎ Xbox"}[PLATFORM]
+PLATFORMS = {"pc": ("🖥️ PC", "pc"), "ps": ("🎮 PS", "ps5")}   # name -> (label, fut.gg file key)
+PLATFORM = os.environ.get("FC_PLATFORM", "pc").lower()
+if PLATFORM not in PLATFORMS:
+    raise SystemExit(f"FC_PLATFORM must be one of {list(PLATFORMS)}, got {PLATFORM!r}")
+PLATFORM_LABEL, PRICE_KEY = PLATFORMS[PLATFORM]
 DB_PATH = os.path.join(HERE, f"market_{PLATFORM}.db")      # separate history per platform
 POLL_SECONDS = 15 * 60
-MIN_SAMPLES = 20                 # snapshots needed before a card is judged
+COMPARE_HOURS = 6                # compare today's price with this many hours ago
+HISTORY_HOURS = 24               # window for "usually" / price range / 24h high
+MIN_SAMPLES = 12                 # snapshots needed before a card is judged
 
 DIP_BANDS = [(15_000, 100_000), (100_000, 500_000)]
-DIP_MIN_PCT = 3.0                # drop vs 6h ago
+DIP_MIN_PCT = 3.0                # drop vs COMPARE_HOURS ago
 SPIKE_BAND = (20_000, 950_000)
-SPIKE_MIN_PCT = 30.0             # jump vs 6h ago
+SPIKE_MIN_PCT = 30.0             # jump vs COMPARE_HOURS ago
 MAX_LINES = 8                    # per embed
 
 
@@ -72,7 +73,6 @@ FUTGG_HEADERS = {"Referer": "https://www.fut.gg/",
 # your saved copy instead of calling it. Re-save it when new cards release.
 PLAYERS_FILE = os.environ.get("FUTGG_PLAYERS_FILE", os.path.join(HERE, "players.json"))
 MIN_TRACK_PRICE = 5_000          # ignore cheaper cards (keeps the DB small)
-_PRICE_KEY = {"pc": "pc", "ps": "ps5"}
 _cache: dict = {}
 
 
@@ -116,14 +116,12 @@ def _load_ids(manifest: dict, players: dict) -> list[int]:
     return _cache["ids"]
 
 
-def fetch_market(platform: str = PLATFORM) -> list[Card]:
+def fetch_market() -> list[Card]:
     """Current prices for tracked cards, from fut.gg's static price files."""
-    if platform not in _PRICE_KEY:
-        raise SystemExit(f"Platform {platform!r} not supported by this source.")
     manifest = _get_json(R2 + "manifest.json")      # maps names -> current hashes
     players = _load_players()
     ids = _load_ids(manifest, players)
-    prices = _r2(f"player-prices-{_PRICE_KEY[platform]}-dyn", manifest)["p"]
+    prices = _r2(f"player-prices-{PRICE_KEY}-dyn", manifest)["p"]
     if len(prices) != len(ids):
         raise RuntimeError(f"{len(prices)} prices vs {len(ids)} ids - files out of sync")
     cards = []
@@ -148,23 +146,23 @@ def open_db(path: str) -> sqlite3.Connection:
 def save_snapshot(db, cards: list[Card], now: float) -> None:
     db.executemany("insert into prices values (?,?,?)",
                    [(c.card_id, now, c.price) for c in cards])
-    db.execute("delete from prices where ts < ?", (now - 72 * 3600,))
+    db.execute("delete from prices where ts < ?", (now - (HISTORY_HOURS + 12) * 3600,))
     db.commit()
 
 
 def card_stats(db, card: Card, now: float):
     rows = db.execute(
         "select ts, price from prices where card_id=? and ts>=? order by ts",
-        (card.card_id, now - 56 * 3600)).fetchall()
+        (card.card_id, now - HISTORY_HOURS * 3600)).fetchall()
     if len(rows) < MIN_SAMPLES:
         return None
-    older = [p for t, p in rows if t <= now - 6 * 3600]
+    older = [p for t, p in rows if t <= now - COMPARE_HOURS * 3600]
     if not older:
         return None
     prices = [p for _, p in rows]
     q = statistics.quantiles(prices, n=4)
     return {
-        "ref": older[-1],                       # price ~6h ago
+        "ref": older[-1],                       # newest price >= COMPARE_HOURS old
         "usual": statistics.median(prices),
         "low": q[0],
         "high": q[2],
@@ -202,12 +200,12 @@ def build_dips(items) -> list[dict]:
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
                          f"{link(c)} {c.rating} {c.kind}")
             lines.append(f"buy under **{k(c.price)}** · usually {k(s['usual'])} "
-                         f"| {k(s['low'])} – {k(s['high'])} | 56h")
+                         f"| {k(s['low'])} – {k(s['high'])} | {HISTORY_HOURS}h")
         lines += ["", "🟠 10%+ · 🟢 5–10% · 🟡 3–5%"]
-        e = {"title": f"⚡ 6 Hour dips {PLATFORM_LABEL}",
+        e = {"title": f"⚡ {COMPARE_HOURS} Hour dips {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0x2ECC71,
-             "footer": {"text": "6 Hour dips"}}
+             "footer": {"text": f"{COMPARE_HOURS} Hour dips"}}
         if band[0][0].image_url:
             e["thumbnail"] = {"url": band[0][0].image_url}
         embeds.append(e)
@@ -218,14 +216,14 @@ def build_spikes(items) -> list[dict]:
     items = sorted(items, key=lambda i: -i[2])[:MAX_LINES]
     if not items:
         return []
-    lines = [f"{len(items)} cards jumped {SPIKE_MIN_PCT:.0f}%+ in the last 6h", ""]
+    lines = [f"{len(items)} cards jumped {SPIKE_MIN_PCT:.0f}%+ in the last {COMPARE_HOURS}h", ""]
     for c, s, pct in items:
         verdict = ("well above usual – sell" if c.price > s["usual"] * 1.3
                    else "above usual – sell")
         lines.append(f"🔵 `▲{pct:.0f}%` {link(c)} {c.rating} {c.kind} · "
                      f"~~{k(s['ref'])}~~ → **{k(c.price)}**")
         lines.append(f"24h high {k(s['high24'])} · **{verdict}**")
-    e = {"title": f"🚀 Spikes · last 6h · {k(SPIKE_BAND[0])}–{k(SPIKE_BAND[1])} {PLATFORM_LABEL}",
+    e = {"title": f"🚀 Spikes · last {COMPARE_HOURS}h · {k(SPIKE_BAND[0])}–{k(SPIKE_BAND[1])} {PLATFORM_LABEL}",
          "description": "\n".join(lines),
          "color": 0xE67E22,
          "footer": {"text": "Spikes"}}
@@ -249,33 +247,19 @@ def scan(db, cards: list[Card], now: float) -> list[dict]:
     return build_dips(dips) + build_spikes(spikes)
 
 
-def plain(text: str) -> str:
-    """Strip Discord markdown so it reads cleanly in a phone notification."""
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    return re.sub(r"[*`~]", "", text)
-
-
 def post(embeds: list[dict], dry_run: bool) -> None:
     for e in embeds:
         if dry_run:
             print(json.dumps(e, ensure_ascii=False, indent=2))
             continue
-        if NTFY_TOPIC:                    # phone notification via ntfy
-            r = requests.post(NTFY_SERVER, json={
-                "topic": NTFY_TOPIC,
-                "title": plain(e["title"]),
-                "message": plain(e["description"]),
-                "priority": 3,
-            }, timeout=10)
-        else:                             # Discord webhook
-            r = requests.post(WEBHOOK_URL, json={"embeds": [e]}, timeout=10)
+        r = requests.post(WEBHOOK_URL, json={"embeds": [e]}, timeout=10)
         r.raise_for_status()
         time.sleep(1)
 
 
 # ------------------------------------------------------------------- demo --
 def demo_seed(db, now: float):
-    """Fake 56h of history for 40 cards; a few dip, a few spike at the end."""
+    """Fake history for 40 cards; a few dip, a few spike at the end."""
     rnd = random.Random(7)
     kinds = ["Hero", "Icon", "TOTW", "Rare Gold"]
     cards = []
@@ -283,7 +267,7 @@ def demo_seed(db, now: float):
         base = rnd.choice([30_000, 55_000, 70_000, 250_000, 450_000])
         cards.append(Card(str(i), f"Demo Player {i}", rnd.randint(84, 91),
                           rnd.choice(kinds), base, url="https://example.com"))
-    steps = 56 * 2
+    steps = HISTORY_HOURS * 2
     for step in range(steps, -1, -1):
         ts = now - step * 1800
         for c in cards:
@@ -310,8 +294,10 @@ def demo_seed(db, now: float):
 def run_cycle(db, dry_run: bool) -> None:
     now = time.time()
     cards = fetch_market()
-    post(scan(db, cards, now), dry_run)   # judge against history first
+    embeds = scan(db, cards, now)         # judge against history first
+    post(embeds, dry_run)
     save_snapshot(db, cards, now)
+    print(f"[info] scanned {len(cards)} cards, posted {len(embeds)} embed(s)")
 
 
 def main() -> None:
@@ -322,8 +308,8 @@ def main() -> None:
                     help="one scan then exit (for GitHub Actions / cron)")
     args = ap.parse_args()
 
-    if not args.dry_run and not (WEBHOOK_URL or NTFY_TOPIC):
-        raise SystemExit("Set NTFY_TOPIC or DISCORD_WEBHOOK_URL (or use --dry-run)")
+    if not args.dry_run and not WEBHOOK_URL:
+        raise SystemExit("Set DISCORD_WEBHOOK_URL (or use --dry-run)")
 
     if args.demo:
         db = open_db(":memory:")
