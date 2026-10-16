@@ -2,10 +2,13 @@ name: FC market scan
 
 on:
   schedule:
-    - cron: "7,22,37,52 * * * *"   # every 15 min, off the busy :00/:15 marks
-  workflow_dispatch:           # lets you run it manually from the Actions tab
+    - cron: "7,22,37,52 * * * *"   # backup timer; GitHub often skips or delays these
+  workflow_dispatch:               # also started every 15 min by the outside timer
 
-concurrency: fc-scan           # never run two scans at once
+concurrency: fc-scan               # never run two scans at once
+
+permissions:
+  contents: write                  # needed to save market_pc.db on the "data" branch
 
 jobs:
   scan:
@@ -20,15 +23,34 @@ jobs:
 
       - run: pip install requests
 
-      # Keep price history between runs (each run starts on a blank machine)
-      - uses: actions/cache@v4
-        with:
-          path: market_pc.db
-          key: market-db-${{ github.run_id }}
-          restore-keys: market-db-
+      # Price history is a real file, market_pc.db, kept on the "data" branch.
+      - name: Restore price history
+        run: |
+          if git ls-remote --exit-code --heads origin data >/dev/null 2>&1; then
+            git fetch --depth=1 origin data
+            git show FETCH_HEAD:market_pc.db > market_pc.db || rm -f market_pc.db
+          fi
+          ls -l market_pc.db || echo "no history yet (first run)"
 
       - run: python fc_market_scanner.py --once
         env:
           FC_PLATFORM: pc
           FC_NOTIFY_EACH_RUN: "1"      # set to "0" to stop the per-run Discord line
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      # Replaces the branch with one commit each run, so the repo does not grow.
+      - name: Save price history
+        env:
+          REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+        run: |
+          set -e
+          OUT=$(mktemp -d)
+          cp market_pc.db "$OUT/"
+          cd "$OUT"
+          git init -q -b data
+          git config user.name "fc-scanner"
+          git config user.email "fc-scanner@users.noreply.github.com"
+          git add market_pc.db
+          git commit -q -m "price history $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git remote add origin "$REPO_URL"
+          git push -q --force origin data
