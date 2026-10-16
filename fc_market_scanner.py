@@ -308,8 +308,14 @@ def notice(text: str, dry_run: bool) -> None:
         print(f"[warn] could not post notice: {e}")
 
 
+def fmt_gap(seconds: float) -> str:
+    m = int(seconds // 60)
+    return f"{m}m" if m < 120 else f"{m // 60}h{m % 60:02d}m"
+
+
 def run_cycle(db, dry_run: bool) -> None:
     now = time.time()
+    prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         cards = fetch_market()
         embeds = scan(db, cards, now)     # judge against history first
@@ -320,8 +326,11 @@ def run_cycle(db, dry_run: bool) -> None:
         raise
     stamp = time.strftime("%H:%M:%S", time.gmtime())
     print(f"[info] {stamp} UTC scanned {len(cards)} cards, posted {len(embeds)} embed(s)")
+    gap = f" · {fmt_gap(now - prev)} since last scan" if prev else " · first scan"
+    via = os.environ.get("GITHUB_EVENT_NAME", "")      # set by GitHub Actions
+    via = f" · via {via}" if via else ""
     notice(f"🔄 {PLATFORM_LABEL} scan ran at {stamp} UTC · {len(cards)} cards · "
-           f"{len(embeds)} alert embed(s)", dry_run)
+           f"{len(embeds)} alert embed(s){gap}{via}", dry_run)
 
 
 def main() -> None:
