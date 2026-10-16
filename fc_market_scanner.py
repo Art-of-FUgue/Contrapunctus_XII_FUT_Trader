@@ -12,6 +12,7 @@ EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
     python fc_market_scanner.py --interval 60 --max-scans 10 --db test.db --dry-run
                                                    # fast test run with a throwaway database
     python fc_market_scanner.py --demo --dry-run   # fake data, to preview the output
+    python fc_market_scanner.py --watchlist watchlist.json   # enable watchlist alerts
 
 How it works
   1. Each scan reads current prices from fut.gg's static price files and labels
@@ -19,9 +20,14 @@ How it works
   2. Prices are saved to a local SQLite file (market_<platform>.db).
   3. A card is a DIP if it is >=3% below its price COMPARE_HOURS ago and below its
      usual (median over HISTORY_HOURS) price. A SPIKE is >=30% above that price.
-  4. Results are grouped into price bands and posted as Discord embeds.
+  4. MICRO-SPIKES / CRASHES compare the last two consecutive snapshots (~15 min
+     apart) and fire immediately without waiting for COMPARE_HOURS of history.
+  5. WATCHLIST cards are always posted with their current price each scan,
+     regardless of dip/spike thresholds.
+  6. Results are grouped into price bands and posted as Discord embeds.
 
-First alerts appear after ~COMPARE_HOURS hours (it needs a snapshot that old).
+First 6h alerts appear after ~COMPARE_HOURS hours (it needs a snapshot that old).
+Micro-spike / crash alerts fire as soon as 2 snapshots exist for a card (~15 min).
 """
 import argparse
 import json
@@ -53,6 +59,14 @@ DIP_MIN_PCT = 3.0                # drop vs COMPARE_HOURS ago
 SPIKE_BAND = (20_000, 950_000)
 SPIKE_MIN_PCT = 30.0             # jump vs COMPARE_HOURS ago
 MAX_LINES = 8                    # per embed
+
+# ---- micro-spike / crash (single scan-to-scan delta, ~15 min window) -------
+FLASH_SPIKE_PCT = 10.0           # jump between last two snapshots to count as micro-spike
+FLASH_CRASH_PCT = 8.0            # drop between last two snapshots to count as crash
+FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
+
+# ---- watchlist -------------------------------------------------------------
+WATCHLIST_FILE = os.path.join(HERE, "watchlist.json") if False else None  # set via --watchlist
 
 
 @dataclass
@@ -154,6 +168,43 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
     db.commit()
 
 
+def card_flash_stats(db, card: Card):
+    """Return (prev_price, prev_ts) from the second-most-recent snapshot, or None.
+
+    Used for micro-spike / crash detection: compares only the last two
+    consecutive snapshots, so alerts fire within one scan interval (~15 min)
+    without needing COMPARE_HOURS of history.
+    """
+    rows = db.execute(
+        "select ts, price from prices where card_id=? order by ts desc limit 2",
+        (card.card_id,)).fetchall()
+    if len(rows) < 2:
+        return None
+    # rows[0] is the freshly saved snapshot; rows[1] is the previous one
+    prev_ts, prev_price = rows[1]
+    return {"prev_price": prev_price, "prev_ts": prev_ts}
+
+
+def load_watchlist(path: str | None) -> set[str]:
+    """Load a JSON file containing a list of EA card IDs to always track.
+
+    The file should be a JSON array of strings or ints, e.g.:
+        ["158023", "20801", 231747]
+
+    Returns an empty set if path is None or the file does not exist.
+    """
+    if not path:
+        return set()
+    if not os.path.exists(path):
+        print(f"[warn] watchlist file not found: {path}")
+        return set()
+    with open(path, encoding="utf-8") as f:
+        ids = json.load(f)
+    result = {str(i) for i in ids}
+    print(f"[info] watchlist loaded: {len(result)} card(s) from {path}")
+    return result
+
+
 def card_stats(db, card: Card, now: float):
     rows = db.execute(
         "select ts, price from prices where card_id=? and ts>=? order by ts",
@@ -236,19 +287,89 @@ def build_spikes(items) -> list[dict]:
     return [e]
 
 
+def build_flashes(spike_items, crash_items) -> list[dict]:
+    """Embeds for micro-spikes and crashes detected between the last two scans."""
+    embeds = []
+
+    if spike_items:
+        spike_items = sorted(spike_items, key=lambda i: -i[2])[:MAX_LINES]
+        lines = [f"{len(spike_items)} card(s) jumped ≥{FLASH_SPIKE_PCT:.0f}% in the last scan (~15 min)", ""]
+        for c, f, pct in spike_items:
+            lines.append(f"⚡ `▲{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}**")
+        e = {"title": f"⚡ Micro-Spikes · {PLATFORM_LABEL}",
+             "description": "\n".join(lines),
+             "color": 0xF1C40F,
+             "footer": {"text": "Micro-spike (last scan delta)"}}
+        if spike_items[0][0].image_url:
+            e["thumbnail"] = {"url": spike_items[0][0].image_url}
+        embeds.append(e)
+
+    if crash_items:
+        crash_items = sorted(crash_items, key=lambda i: i[2])[:MAX_LINES]  # most negative first
+        lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
+        for c, f, pct in crash_items:
+            lines.append(f"💥 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible dump")
+        e = {"title": f"💥 Price Crashes · {PLATFORM_LABEL}",
+             "description": "\n".join(lines),
+             "color": 0xE74C3C,
+             "footer": {"text": "Crash (last scan delta)"}}
+        if crash_items[0][0].image_url:
+            e["thumbnail"] = {"url": crash_items[0][0].image_url}
+        embeds.append(e)
+
+    return embeds
+
+
+def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dict]:
+    """Embed showing current price for every card on the watchlist."""
+    hits = [cards_map[cid] for cid in watchlist if cid in cards_map]
+    if not hits:
+        return []
+    hits = sorted(hits, key=lambda c: -c.price)
+    lines = []
+    for c in hits:
+        lines.append(f"👁 **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
+    e = {"title": f"👁 Watchlist · {PLATFORM_LABEL}",
+         "description": "\n".join(lines),
+         "color": 0x9B59B6,
+         "footer": {"text": "Watchlist – current prices"}}
+    return [e]
+
+
 # ------------------------------------------------------------------- scan --
-def scan(db, cards: list[Card], now: float) -> list[dict]:
-    dips, spikes = [], []
+def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -> list[dict]:
+    dips, spikes, flash_spikes, flash_crashes = [], [], [], []
+    cards_map = {c.card_id: c for c in cards}
+
     for c in cards:
+        # ── 6h dip / spike ──────────────────────────────────────────────────
         s = card_stats(db, c, now)
-        if not s or s["ref"] <= 0:
-            continue
-        pct = (c.price - s["ref"]) / s["ref"] * 100
-        if pct <= -DIP_MIN_PCT and c.price < s["usual"]:
-            dips.append((c, s, pct))
-        if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
-            spikes.append((c, s, pct))
-    return build_dips(dips) + build_spikes(spikes)
+        if s and s["ref"] > 0:
+            pct = (c.price - s["ref"]) / s["ref"] * 100
+            if pct <= -DIP_MIN_PCT and c.price < s["usual"]:
+                dips.append((c, s, pct))
+            if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
+                spikes.append((c, s, pct))
+
+        # ── micro-spike / crash (last two snapshots) ─────────────────────────
+        if c.price >= FLASH_MIN_PRICE:
+            f = card_flash_stats(db, c)
+            if f and f["prev_price"] > 0:
+                pct = (c.price - f["prev_price"]) / f["prev_price"] * 100
+                if pct >= FLASH_SPIKE_PCT:
+                    flash_spikes.append((c, f, pct))
+                elif pct <= -FLASH_CRASH_PCT:
+                    flash_crashes.append((c, f, pct))
+
+    embeds = build_dips(dips) + build_spikes(spikes) + build_flashes(flash_spikes, flash_crashes)
+
+    # ── watchlist ────────────────────────────────────────────────────────────
+    if watchlist:
+        embeds += build_watchlist(cards_map, watchlist)
+
+    return embeds
 
 
 def post(embeds: list[dict], dry_run: bool) -> None:
@@ -313,12 +434,12 @@ def fmt_gap(seconds: float) -> str:
     return f"{m}m" if m < 120 else f"{m // 60}h{m % 60:02d}m"
 
 
-def run_cycle(db, dry_run: bool) -> None:
+def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None) -> None:
     now = time.time()
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         cards = fetch_market()
-        embeds = scan(db, cards, now)     # judge against history first
+        embeds = scan(db, cards, now, watchlist)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
     except Exception as e:
@@ -344,7 +465,10 @@ def main() -> None:
     ap.add_argument("--max-scans", type=int, default=0,
                     help="stop after this many scans (0 = run forever)")
     ap.add_argument("--db", default=DB_PATH, help="price history database file")
+    ap.add_argument("--watchlist", default=None, metavar="FILE",
+                    help="JSON file with a list of card IDs to always post prices for")
     args = ap.parse_args()
+    watchlist = load_watchlist(args.watchlist)
     if args.interval < 30:
         raise SystemExit("--interval must be at least 30 seconds (be kind to fut.gg)")
 
@@ -362,12 +486,12 @@ def main() -> None:
 
     db = open_db(args.db)
     if args.once:
-        run_cycle(db, args.dry_run)       # errors fail the run, visible in Actions
+        run_cycle(db, args.dry_run, watchlist)       # errors fail the run, visible in Actions
         return
     done = failed = 0
     while True:
         try:
-            run_cycle(db, args.dry_run)
+            run_cycle(db, args.dry_run, watchlist)
         except Exception as e:
             failed += 1
             print(f"[warn] {e}")
