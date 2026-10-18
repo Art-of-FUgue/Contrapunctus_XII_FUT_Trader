@@ -103,6 +103,46 @@ def write_console_script(candidates: list[int]) -> None:
         f.write(js)
 
 
+def coverage_report(candidates: list[int], defs: list[str]) -> None:
+    """How many holo versions were found, per rarity, and whether the lookup looks complete."""
+    if not defs or not os.path.exists(bp.HOLO_OUT):
+        return
+    with open(bp.OUT, encoding="utf-8") as f:
+        rows = json.load(f)["data"]
+    with open(bp.HOLO_OUT, encoding="utf-8") as f:
+        holo = {int(i) for i in json.load(f)}
+    recs: dict[int, dict] = {}
+    for fp in defs:
+        try:
+            for rec in bp.load_page(fp)["data"]:
+                recs[rec["eaId"]] = rec
+        except (ValueError, KeyError, TypeError):
+            pass
+    print("\n---- holo coverage ----")
+    if candidates:
+        got = sum(1 for c in candidates if c in recs)
+        print(f"lookup asked about {len(candidates)} ids, {got} came back in defs/ "
+              f"({len(candidates) - got} missing" + (" - the download may be incomplete, run the "
+              "browser script again)" if len(candidates) - got > len(candidates) * 0.05 else ")"))
+    by_base = {r["eaId"]: r for r in rows if r["eaId"] not in holo}
+    base_with_holo = {rec.get("standardItemEaId") or rec.get("basePlayerEaId")
+                      for rec in recs.values() if rec.get("holographicType") == "holographic"}
+    per: dict[str, list[int]] = {}
+    for eid, r in by_base.items():
+        t = per.setdefault(r.get("rarityName") or "?", [0, 0])
+        t[0] += 1
+        t[1] += eid in base_with_holo
+    print(f"{'rarity':32} base  with holo")
+    for name, (n, h) in sorted(per.items(), key=lambda kv: -kv[1][0]):
+        print(f"{name[:32]:32} {n:4}  {h:4}")
+    without = [r for eid, r in by_base.items() if eid not in base_with_holo]
+    if without:
+        print("\nsome base cards with NO holo found (check one on fut.gg to be sure):")
+        for r in without[:5]:
+            print(f"  {r.get('commonName')} {r.get('overall')} {r.get('rarityName')}  "
+                  f"https://www.fut.gg{r.get('url', '')}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--download", action="store_true", help="fetch the fut.gg list pages (opt-in)")
@@ -127,6 +167,7 @@ def main() -> None:
         return
 
     # 3. holo lookup script with a fresh id list
+    candidates: list[int] = []
     known = list_ids()
     defs = glob.glob(os.path.join(DEFS_DIR, "*.json")) + glob.glob(os.path.join(DEFS_DIR, "*.txt"))
     try:
@@ -141,7 +182,10 @@ def main() -> None:
     print()
     bp.merge()
 
-    # 5. status
+    # 5. coverage report
+    coverage_report(candidates, defs)
+
+    # 6. status
     holo_ids = []
     if os.path.exists(bp.HOLO_OUT):
         with open(bp.HOLO_OUT, encoding="utf-8") as f:
