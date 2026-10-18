@@ -14,6 +14,7 @@ EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
 
     python fc_market_scanner.py                    # loop forever, scan every 15 min
     python fc_market_scanner.py --once             # one scan, then exit (GitHub Actions)
+    python fc_market_scanner.py --once --runs 3 --run-gap 150   # 3 scans per launch
     python fc_market_scanner.py --dry-run          # print embeds instead of posting
     python fc_market_scanner.py --interval 60 --max-scans 10 --db test.db --dry-run
                                                    # fast test run with a throwaway database
@@ -774,6 +775,10 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="print, don't send")
     ap.add_argument("--once", action="store_true",
                     help="one scan then exit (for GitHub Actions / cron)")
+    ap.add_argument("--runs", type=int, default=int(os.environ.get("FC_RUNS", "1")),
+                    help="with --once: scan this many times in one launch (default 1)")
+    ap.add_argument("--run-gap", type=float, default=float(os.environ.get("FC_RUN_GAP", "150")),
+                    help="seconds between the scans of one launch (default 150, min 30)")
     ap.add_argument("--interval", type=float, default=POLL_SECONDS,
                     help="seconds between scans in loop mode (minimum 30)")
     ap.add_argument("--max-scans", type=int, default=0,
@@ -813,7 +818,23 @@ def main() -> None:
 
     db = open_db(args.db)
     if args.once:
-        run_cycle(db, args.dry_run, watchlist)       # errors fail the run, visible in Actions
+        if args.runs <= 1:
+            run_cycle(db, args.dry_run, watchlist)   # errors fail the run, visible in Actions
+            return
+        if args.run_gap < 30:
+            raise SystemExit("--run-gap must be at least 30 seconds")
+        failed = 0
+        for i in range(args.runs):
+            if i:
+                time.sleep(args.run_gap)
+            print(f"[info] run {i + 1}/{args.runs}")
+            try:
+                run_cycle(db, args.dry_run, watchlist)   # each run saves its snapshot to the DB
+            except Exception as e:
+                failed += 1
+                print(f"[warn] run {i + 1} failed: {e}")
+        if failed == args.runs:
+            raise SystemExit("every scan failed")
         return
     done = failed = 0
     while True:
