@@ -32,6 +32,12 @@ MAX_TOTAL = 2000          # the special-card list is ~500; far more means the fi
 # Standard (non-special) rarities. The list should never contain them; if it does
 # (an unfiltered download), merge() drops them so players.json stays special-only.
 STANDARD_RARITIES = {"common", "rare"}
+# Rarities that are not tradable: dropped from players.json. Add more (lower-case).
+EXCLUDE_RARITIES = {"base hall of fut"}
+# Flags in fut.gg's definition-data records (defs/) that mark a card as SBC/objective/
+# untradable reward. A card with any of these set is dropped, if its record is in defs/.
+UNTRADABLE_FLAGS = ("isSbcItem", "isObjectiveItem", "isUntradeable",
+                    "sbcSetEaId", "objectiveGroupEaId")
 
 
 def load_page(path: str) -> dict:
@@ -80,6 +86,30 @@ def download(max_pages: int, delay: float, max_total: int = MAX_TOTAL) -> None:
         page = nxt
     else:
         print(f"[info] stopped at --max-pages {max_pages}; more pages exist")
+
+
+def drop_untradable(rows: dict) -> None:
+    """Remove cards that cannot be traded: excluded rarities, plus SBC / objective /
+    untradable rewards known from the definition records in defs/."""
+    by_rarity = [eid for eid, r in rows.items()
+                 if (r.get("rarityName") or "").strip().lower() in EXCLUDE_RARITIES]
+    for eid in by_rarity:
+        del rows[eid]
+    flagged = set()
+    for fp in sorted(glob.glob(os.path.join(DEFS_DIR, "*.json")) + glob.glob(os.path.join(DEFS_DIR, "*.txt"))):
+        try:
+            recs = load_page(fp)["data"]
+        except (ValueError, KeyError, TypeError):
+            continue
+        for rec in recs:
+            if rec.get("eaId") in rows and rec.get("holographicType") != "holographic" \
+                    and any(rec.get(f) for f in UNTRADABLE_FLAGS):
+                flagged.add(rec["eaId"])
+    for eid in flagged:
+        del rows[eid]
+    if by_rarity or flagged:
+        print(f"[info] dropped untradable cards: {len(by_rarity)} by rarity, "
+              f"{len(flagged)} SBC/objective/untradable by flag")
 
 
 def add_holos(rows: dict) -> None:
@@ -145,6 +175,7 @@ def merge() -> None:
             last = data
     if dropped:
         print(f"[info] ignored {dropped} standard (Common/Rare) cards: the pages were not special-only")
+    drop_untradable(rows)
     add_holos(rows)
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump({"data": list(rows.values())}, f, ensure_ascii=False)

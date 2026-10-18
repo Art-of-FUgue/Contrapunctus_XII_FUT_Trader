@@ -172,8 +172,10 @@ def main() -> None:
     defs = glob.glob(os.path.join(DEFS_DIR, "*.json")) + glob.glob(os.path.join(DEFS_DIR, "*.txt"))
     try:
         candidates = [i for i in price_index_ids() if i >= HOLO_ID_FLOOR and i not in known]
-        write_console_script(candidates)
-        print(f"\nholo lookup script written: {CONSOLE_JS} ({len(candidates)} candidate ids)")
+        # also look up the cards already in the list, to learn which are SBC/untradable
+        write_console_script(sorted(set(candidates) | known))
+        print(f"\nlookup script written: {CONSOLE_JS} ({len(candidates)} holo candidates "
+              f"+ {len(known)} listed cards, to detect untradable ones)")
     except Exception as e:                          # offline or fut.gg changed: keep the old script
         print(f"\n[warn] could not read the price index ({str(e)[:80]}); "
               f"{'keeping the existing' if os.path.exists(CONSOLE_JS) else 'no'} holo lookup script")
