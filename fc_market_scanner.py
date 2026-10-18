@@ -608,7 +608,8 @@ def _is_totw_fodder(card: Card) -> bool:
     return _is_totw(card) and card.price < TOTW_MIN_PRICE
 
 
-def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -> list[dict]:
+def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
+         spikes_on: bool = True) -> list[dict]:
     dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
     premium_dips: list[tuple[Card, dict]] = []   # (card, stats) – own embed
     cards_map = {c.card_id: c for c in cards}
@@ -662,8 +663,8 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
 
     embeds = (
         build_dips(dips)
-        + build_spikes(spikes)
-        + build_flashes(flash_spikes, flash_dips, flash_crashes)
+        + (build_spikes(spikes) if spikes_on else [])
+        + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
         + build_premium_dips(premium_dips)    # 💎 Icon / Hero dips
     )
 
@@ -748,12 +749,13 @@ def fmt_gap(seconds: float) -> str:
     return f"{m}m" if m < 120 else f"{m // 60}h{m % 60:02d}m"
 
 
-def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None) -> None:
+def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
+              spikes_on: bool = True) -> None:
     now = time.time()
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         cards = fetch_market(watchlist)
-        embeds = scan(db, cards, now, watchlist)   # judge against history first
+        embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
     except Exception as e:
@@ -829,7 +831,8 @@ def main() -> None:
                 time.sleep(args.run_gap)
             print(f"[info] run {i + 1}/{args.runs}")
             try:
-                run_cycle(db, args.dry_run, watchlist)   # each run saves its snapshot to the DB
+                # spike alerts (6h + micro) only on the first scan of a launch
+                run_cycle(db, args.dry_run, watchlist, spikes_on=(i == 0))
             except Exception as e:
                 failed += 1
                 print(f"[warn] run {i + 1} failed: {e}")
