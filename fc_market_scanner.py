@@ -251,7 +251,31 @@ def open_db(path: str) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.execute("create table if not exists prices(card_id text, ts real, price int)")
     db.execute("create index if not exists ix on prices(card_id, ts)")
+    db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
     return db
+
+
+# A card already alerted as a spike stays quiet this long unless it rises further.
+SPIKE_COOLDOWN_HOURS = float(os.environ.get("FC_SPIKE_COOLDOWN_HOURS", "6"))
+SPIKE_REALERT_PCT = 5.0          # ...or climbs this much above the price last alerted
+
+
+def fresh_spikes(db, items, now: float, kind: str):
+    """Keep only spike items not already alerted recently; record the kept ones."""
+    out = []
+    for item in items:
+        c = item[0]
+        row = db.execute(
+            "select price from alerts where card_id=? and kind=? and ts>=? "
+            "order by ts desc limit 1",
+            (c.card_id, kind, now - SPIKE_COOLDOWN_HOURS * 3600)).fetchone()
+        if row and c.price < row[0] * (1 + SPIKE_REALERT_PCT / 100):
+            continue                              # same spike, already posted
+        out.append(item)
+        db.execute("insert into alerts values (?,?,?,?)", (c.card_id, kind, now, c.price))
+    db.execute("delete from alerts where ts < ?", (now - 48 * 3600,))
+    db.commit()
+    return out
 
 
 def save_snapshot(db, cards: list[Card], now: float) -> None:
@@ -661,6 +685,9 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 elif pct <= -FLASH_DIP_PCT:
                     flash_dips.append((c, f, pct))
 
+    if spikes_on:
+        spikes = fresh_spikes(db, spikes, now, "spike")
+        flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
     embeds = (
         build_dips(dips)
         + (build_spikes(spikes) if spikes_on else [])
