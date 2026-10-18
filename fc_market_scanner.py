@@ -14,7 +14,7 @@ EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
 
     python fc_market_scanner.py                    # loop forever, scan every 15 min
     python fc_market_scanner.py --once             # one scan, then exit (GitHub Actions)
-    python fc_market_scanner.py --once --runs 3 --run-gap 150   # 3 scans per launch
+    python fc_market_scanner.py --once --runs 3 --run-gap 300   # 3 scans per launch
     python fc_market_scanner.py --dry-run          # print embeds instead of posting
     python fc_market_scanner.py --interval 60 --max-scans 10 --db test.db --dry-run
                                                    # fast test run with a throwaway database
@@ -777,8 +777,8 @@ def main() -> None:
                     help="one scan then exit (for GitHub Actions / cron)")
     ap.add_argument("--runs", type=int, default=int(os.environ.get("FC_RUNS", "1")),
                     help="with --once: scan this many times in one launch (default 1)")
-    ap.add_argument("--run-gap", type=float, default=float(os.environ.get("FC_RUN_GAP", "150")),
-                    help="seconds between the scans of one launch (default 150, min 30)")
+    ap.add_argument("--run-gap", type=float, default=float(os.environ.get("FC_RUN_GAP", "300")),
+                    help="seconds between the scans of one launch (default 300, min 30)")
     ap.add_argument("--interval", type=float, default=POLL_SECONDS,
                     help="seconds between scans in loop mode (minimum 30)")
     ap.add_argument("--max-scans", type=int, default=0,
