@@ -261,18 +261,26 @@ def open_db(path: str) -> sqlite3.Connection:
 # alerts. A card counts as "new" for NEW_CARD_DAYS after it first shows up in
 # players.json. The first run on an empty DB treats every existing card as old.
 NEW_CARD_DAYS = float(os.environ.get("FC_NEW_CARD_DAYS", "4"))
+# Safety valve: if more than this many ids appear at once it is a bulk update of
+# players.json (re-running setup, adding holos), not a promo drop - treat them as old.
+NEW_CARD_MAX_BATCH = int(os.environ.get("FC_NEW_CARD_MAX_BATCH", "120"))
 
 
 def register_cards(db, ids, now: float) -> None:
     """Record when each card id was first seen in the player list."""
     empty = db.execute("select 1 from seen limit 1").fetchone() is None
     known = {r[0] for r in db.execute("select card_id from seen")}
-    new = [(str(i), 0.0 if empty else now) for i in ids if str(i) not in known]
-    if new:
-        db.executemany("insert into seen values (?,?)", new)
+    fresh = [str(i) for i in ids if str(i) not in known]
+    bulk = len(fresh) > NEW_CARD_MAX_BATCH
+    ts = 0.0 if (empty or bulk) else now
+    if fresh:
+        db.executemany("insert into seen values (?,?)", [(i, ts) for i in fresh])
         db.commit()
-        if not empty:
-            print(f"[info] {len(new)} new card id(s) registered; muted for {NEW_CARD_DAYS:g} days")
+        if bulk and not empty:
+            print(f"[info] {len(fresh)} new ids at once (> {NEW_CARD_MAX_BATCH}): "
+                  "treated as a bulk update, not muted")
+        elif not empty:
+            print(f"[info] {len(fresh)} new card id(s) registered; muted for {NEW_CARD_DAYS:g} days")
 
 
 def new_card_ids(db, now: float) -> set[str]:
