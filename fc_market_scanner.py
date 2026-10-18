@@ -298,6 +298,22 @@ def load_watchlist(path: str | None) -> set[str]:
     return result
 
 
+# Outlier trimming for the baseline: snapshots far from the window's median
+# (stale/inflated listings) are ignored so they can't distort the average.
+OUTLIER_FACTOR = 2.5             # drop prices > 2.5x or < 1/2.5 of the window median
+OUTLIER_ABS_MAX = 15_000_000     # and anything above this absolute cap
+
+
+def trim_outliers(rows: list[tuple[float, int]]) -> list[tuple[float, int]]:
+    """Drop snapshots that are wildly off the window median (or above the cap)."""
+    if len(rows) < 3:
+        return rows
+    med = statistics.median(p for _, p in rows)
+    kept = [(t, p) for t, p in rows
+            if med / OUTLIER_FACTOR <= p <= med * OUTLIER_FACTOR and p <= OUTLIER_ABS_MAX]
+    return kept or rows
+
+
 def extract_recent_sales(rows: list[tuple[float, int]]) -> list[int]:
     """Extract distinct sale/trade price points by filtering consecutive identical prices.
 
@@ -329,6 +345,7 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
     older = [p for t, p in rows if t <= now - COMPARE_HOURS * 3600]
     if not older:
         return None
+    rows = trim_outliers(rows)
     prices = [p for _, p in rows]
     sales = extract_recent_sales(rows)
     sales_avg = int(statistics.mean(sales)) if sales else int(statistics.median(prices))
@@ -339,6 +356,7 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
         "usual": statistics.median(prices),
         "sales_avg": sales_avg,
         "sales_count": sales_count,
+        "snapshots": len(rows),
         "low": q[0],
         "high": q[2],
         "high24": max(p for t, p in rows if t >= now - 24 * 3600),
@@ -364,6 +382,7 @@ def card_premium_dip_stats(db, card: Card, now: float) -> dict | None:
     if len(rows) < PREMIUM_MIN_SNAPSHOTS_24H:
         return None                              # not enough data yet
 
+    rows = trim_outliers(rows)                   # ignore stale / inflated snapshots
     prices = [p for _, p in rows]
     sales = extract_recent_sales(rows)
     sales_count = max(0, len(sales) - 1)
@@ -375,17 +394,18 @@ def card_premium_dip_stats(db, card: Card, now: float) -> dict | None:
     # ── recent sales average ────────────────────────────────────────────────
     # Mean of the actual traded prices (filtering out stale idle periods)
     sales_avg = int(statistics.mean(sales))
-    if sales_avg <= 0:
+    base = int(statistics.median(sales))         # median is the dip baseline
+    if base <= 0:
         return None
 
-    dip_pct = (card.price - sales_avg) / sales_avg * 100
+    dip_pct = (card.price - base) / base * 100
     if dip_pct > -PREMIUM_DIP_MIN_PCT:
-        return None                              # not enough of a dip vs sales avg
+        return None                              # not enough of a dip vs median
 
     q = statistics.quantiles(prices, n=4)
     return {
         "sales_avg": sales_avg,
-        "sales_median": int(statistics.median(sales)),
+        "sales_median": base,
         "usual": statistics.median(prices),
         "low": q[0],
         "high": q[2],
@@ -424,13 +444,13 @@ def build_dips(items) -> list[dict]:
         for c, s, pct in band:
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
                          f"{link(c)} {c.rating} {c.kind}")
-            lines.append(f"buy under **{k(c.price)}** · sales avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
-                         f"| {k(s['low'])} – {k(s['high'])} | {s['sales_count']} sales")
+            lines.append(f"buy under **{k(c.price)}** · avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
+                         f"| {k(s['low'])} – {k(s['high'])} | {s['snapshots']} snapshots")
         lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
         e = {"title": f"⚡ {COMPARE_HOURS} Hour dips {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0x2ECC71,
-             "footer": {"text": f"{COMPARE_HOURS} Hour dips · recent sales avg"}}
+             "footer": {"text": f"{COMPARE_HOURS} Hour dips · recent avg price"}}
         if band[0][0].image_url:
             e["thumbnail"] = {"url": band[0][0].image_url}
         embeds.append(e)
@@ -510,15 +530,15 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
 def build_premium_dips(items) -> list[dict]:
     """Dedicated embed for Icon / Hero dip opportunities.
 
-    Each entry already passed the 24 h sales avg + liquidity gate in
+    Each entry already passed the 24 h median + liquidity gate in
     card_premium_dip_stats(), so everything shown here is a real signal.
     """
     items = _limit(sorted(items, key=lambda i: i[1]["dip_pct"]))   # deepest first
     if not items:
         return []
     lines = [
-        f"{len(items)} premium card(s) dipped ≥{PREMIUM_DIP_MIN_PCT:.0f}% vs 24 h sales avg",
-        f"Liquidity gate: ≥{PREMIUM_MIN_PRICE_CHANGES} sales in last 24 h · {PREMIUM_HISTORY_HOURS}h window",
+        f"{len(items)} premium card(s) dipped ≥{PREMIUM_DIP_MIN_PCT:.0f}% vs 24 h median",
+        f"Liquidity gate: ≥{PREMIUM_MIN_PRICE_CHANGES} price changes in last 24 h · {PREMIUM_HISTORY_HOURS}h window",
         "",
     ]
     for c, s in items:
@@ -528,9 +548,9 @@ def build_premium_dips(items) -> list[dict]:
             f"{link(c)} {c.rating} · *{c.kind}*"
         )
         lines.append(
-            f"sales avg **{k(s['sales_avg'])}** (median {k(s['sales_median'])}) "
+            f"median **{k(s['sales_median'])}** (avg {k(s['sales_avg'])}) "
             f"· range {k(s['low'])}–{k(s['high'])} "
-            f"· {s['sales_count']} sales {liq_bar}"
+            f"· {s['snapshots']} snapshots {liq_bar}"
         )
     lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
     e = {
@@ -538,8 +558,8 @@ def build_premium_dips(items) -> list[dict]:
         "description": "\n".join(lines),
         "color": 0x8E44AD,
         "footer": {"text": (
-            f"24 h sales avg · ≥{PREMIUM_DIP_MIN_PCT:.0f}% dip · "
-            f"≥{PREMIUM_MIN_PRICE_CHANGES} sales"
+            f"24 h median · ≥{PREMIUM_DIP_MIN_PCT:.0f}% dip · "
+            f"≥{PREMIUM_MIN_PRICE_CHANGES} price changes"
         )},
     }
     if items[0][0].image_url:
