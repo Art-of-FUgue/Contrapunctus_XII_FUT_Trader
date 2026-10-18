@@ -126,7 +126,7 @@ def coverage_report(candidates: list[int], defs: list[str]) -> None:
               "browser script again)" if len(candidates) - got > len(candidates) * 0.05 else ")"))
     by_base = {r["eaId"]: r for r in rows if r["eaId"] not in holo}
     base_with_holo = {rec.get("standardItemEaId") or rec.get("basePlayerEaId")
-                      for rec in recs.values() if rec.get("holographicType") == "holographic"}
+                      for rec in recs.values() if rec.get("holographicType") in ("holographic", "pristine")}
     per: dict[str, list[int]] = {}
     for eid, r in by_base.items():
         t = per.setdefault(r.get("rarityName") or "?", [0, 0])

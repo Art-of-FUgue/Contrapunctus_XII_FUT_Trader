@@ -102,7 +102,7 @@ def drop_untradable(rows: dict) -> None:
         except (ValueError, KeyError, TypeError):
             continue
         for rec in recs:
-            if rec.get("eaId") in rows and rec.get("holographicType") != "holographic" \
+            if rec.get("eaId") in rows and rec.get("holographicType") not in ("holographic", "pristine") \
                     and any(rec.get(f) for f in UNTRADABLE_FLAGS):
                 flagged.add(rec["eaId"])
     for eid in flagged:
@@ -128,7 +128,7 @@ def add_holos(rows: dict) -> None:
             print(f"[skip] {fp}: not a definition-data page")
             continue
         for rec in recs:
-            if rec.get("holographicType") != "holographic":
+            if rec.get("holographicType") not in ("holographic", "pristine"):
                 continue
             base = rows.get(rec.get("standardItemEaId") or rec.get("basePlayerEaId"))
             if base is None:
@@ -137,7 +137,12 @@ def add_holos(rows: dict) -> None:
             row = dict(base)
             row["eaId"] = rec["eaId"]
             row["url"] = rec.get("url", base.get("url"))
-            row["holographicType"] = "holographic"
+            row["holographicType"] = rec.get("holographicType") or "holographic"
+            if rec.get("futggCardImagePath"):
+                row["cardImageUrl"] = (
+                    "https://game-assets.fut.gg/cdn-cgi/image/quality=85,format=auto,width=300/"
+                    + rec["futggCardImagePath"]
+                )
             rows[rec["eaId"]] = row
             holo_ids.add(rec["eaId"])
     with open(HOLO_OUT, "w", encoding="utf-8") as f:
