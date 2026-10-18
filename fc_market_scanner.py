@@ -251,8 +251,35 @@ def open_db(path: str) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.execute("create table if not exists prices(card_id text, ts real, price int)")
     db.execute("create index if not exists ix on prices(card_id, ts)")
+    db.execute("create table if not exists seen(card_id text primary key, first_ts real)")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
     return db
+
+
+# ---- new-card filter ---------------------------------------------------------
+# Freshly released cards crash/swing wildly in their first days, which floods the
+# alerts. A card counts as "new" for NEW_CARD_DAYS after it first shows up in
+# players.json. The first run on an empty DB treats every existing card as old.
+NEW_CARD_DAYS = float(os.environ.get("FC_NEW_CARD_DAYS", "4"))
+
+
+def register_cards(db, ids, now: float) -> None:
+    """Record when each card id was first seen in the player list."""
+    empty = db.execute("select 1 from seen limit 1").fetchone() is None
+    known = {r[0] for r in db.execute("select card_id from seen")}
+    new = [(str(i), 0.0 if empty else now) for i in ids if str(i) not in known]
+    if new:
+        db.executemany("insert into seen values (?,?)", new)
+        db.commit()
+        if not empty:
+            print(f"[info] {len(new)} new card id(s) registered; muted for {NEW_CARD_DAYS:g} days")
+
+
+def new_card_ids(db, now: float) -> set[str]:
+    if NEW_CARD_DAYS <= 0:
+        return set()
+    return {r[0] for r in db.execute(
+        "select card_id from seen where first_ts > ?", (now - NEW_CARD_DAYS * 86400,))}
 
 
 # A card already alerted as a spike stays quiet this long unless it rises further.
@@ -708,8 +735,11 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     spikes_on = spikes_on and SPIKE_ALERTS
     premium_dips: list[tuple[Card, dict]] = []   # (card, stats) – own embed
     cards_map = {c.card_id: c for c in cards}
+    muted_new = new_card_ids(db, now)
 
     for c in cards:
+        if c.card_id in muted_new:
+            continue                                  # released in the last few days
         # ── filter cards outside price range of interest ────────────────────
         if MIN_PRICE is not None and c.price < MIN_PRICE:
             continue
@@ -858,6 +888,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         cards = fetch_market(watchlist)
+        register_cards(db, _load_players().keys(), now)
         embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
