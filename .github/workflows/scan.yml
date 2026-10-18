@@ -53,6 +53,9 @@ jobs:
           FC_PLATFORM: pc
           FC_NOTIFY_EACH_RUN: "1"      # set to "0" to stop the per-run Discord line
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          FC_MAX_LINES: "16"           # max cards per section (0 = unlimited)
+          FC_MIN_PRICE: "15k"          # min card price of interest (e.g. 15k, 50k, 100k)
+          FC_MAX_PRICE: "2M"             # max card price of interest (e.g. 1M, 2.5M, or empty for no max)
 
       # ── Save price history back to the "data" branch ──────────────────────
       # Runs even if the scan step fails so no history snapshots are lost.

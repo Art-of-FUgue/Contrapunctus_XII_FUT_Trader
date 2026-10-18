@@ -22,6 +22,9 @@ def main():
     parser.add_argument("--live", action="store_true", help="Send results to DISCORD_WEBHOOK_URL (default: dry run)")
     parser.add_argument("--demo", action="store_true", help="Simulate price alert embeds to test Discord formatting")
     parser.add_argument("--webhook", type=str, default=None, help="Discord Webhook URL to use for this test run")
+    parser.add_argument("--max-lines", type=int, default=None, help="Max cards per section (default: 16, 0 = unlimited)")
+    parser.add_argument("--min-price", type=str, default=None, help="Min card price of interest (e.g. '20k')")
+    parser.add_argument("--max-price", type=str, default=None, help="Max card price of interest (e.g. '1M')")
     args = parser.parse_args()
 
     env = os.environ.copy()
@@ -30,6 +33,13 @@ def main():
         args.live = True
 
     cmd = [sys.executable, SCANNER]
+    if args.max_lines is not None:
+        cmd.extend(["--max-lines", str(args.max_lines)])
+    if args.min_price is not None:
+        cmd.extend(["--min-price", args.min_price])
+    if args.max_price is not None:
+        cmd.extend(["--max-price", args.max_price])
+
     if args.demo:
         cmd.append("--demo")
         if not args.live:

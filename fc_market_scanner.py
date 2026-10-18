@@ -81,16 +81,44 @@ PREMIUM_MIN_PRICE_CHANGES = 4
 # Minimum snapshots required in the 24 h window for the liquidity check
 PREMIUM_MIN_SNAPSHOTS_24H = 8
 
+def parse_price(val: str | int | float | None) -> int | None:
+    """Parse an integer or shorthand price string ('15k', '1.5M') into an int."""
+    if val is None or val == "" or str(val).strip().lower() in ("none", "0", "unlimited"):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().lower().replace(",", "")
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1_000)
+    return int(float(s))
+
+
+# Price range for cards of interest (set via FC_MIN_PRICE / FC_MAX_PRICE or --min-price / --max-price)
+# Cards outside this range are ignored for alerts. Supports e.g. "15k", "1.5M", 50000.
+MIN_PRICE = parse_price(os.environ.get("FC_MIN_PRICE", 15_000))
+MAX_PRICE = parse_price(os.environ.get("FC_MAX_PRICE", None))  # None = no upper bound
+
 # ---- TOTW fodder filter ----------------------------------------------------
 # TOTW cards below this price produce noisy min-price fluctuations → skip them
 TOTW_MIN_PRICE = 15_000
 # fut.gg's rarity name is "Team of the week" (lower-case w), so match loosely.
 
-DIP_BANDS = [(15_000, 100_000), (100_000, 500_000)]
+DIP_BANDS = [
+    (15_000, 100_000),
+    (100_000, 500_000),
+    (500_000, 1_500_000),
+    (1_500_000, 15_000_000),
+]
 DIP_MIN_PCT = 10.0               # drop vs COMPARE_HOURS ago
 SPIKE_BAND = (20_000, 950_000)
 SPIKE_MIN_PCT = 10.0             # jump vs COMPARE_HOURS ago
-MAX_LINES = int(os.environ.get("FC_MAX_LINES", 8))   # per embed
+MAX_LINES = int(os.environ.get("FC_MAX_LINES", 16))   # per embed (0 = unlimited)
+
+def _limit(items: list) -> list:
+    """Limit the number of cards shown per embed/section, or return all if MAX_LINES <= 0."""
+    return items[:MAX_LINES] if MAX_LINES > 0 else items
 
 # ---- micro-spike / dip / crash (single scan-to-scan delta, ~15 min window) -
 FLASH_SPIKE_PCT = 10.0           # jump between last two snapshots to count as micro-spike
@@ -379,8 +407,8 @@ def link(c: Card) -> str:
 def build_dips(items) -> list[dict]:
     embeds = []
     for lo, hi in DIP_BANDS:
-        band = sorted((i for i in items if lo <= i[0].price < hi),
-                      key=lambda i: i[2])[:MAX_LINES]
+        band = _limit(sorted((i for i in items if lo <= i[0].price < hi),
+                             key=lambda i: i[2]))
         if not band:
             continue
         lines = [f"**{k(lo)} – {k(hi)}**"]
@@ -401,7 +429,7 @@ def build_dips(items) -> list[dict]:
 
 
 def build_spikes(items) -> list[dict]:
-    items = sorted(items, key=lambda i: -i[2])[:MAX_LINES]
+    items = _limit(sorted(items, key=lambda i: -i[2]))
     if not items:
         return []
     lines = [f"{len(items)} cards jumped {SPIKE_MIN_PCT:.0f}%+ in the last {COMPARE_HOURS}h", ""]
@@ -411,7 +439,8 @@ def build_spikes(items) -> list[dict]:
         lines.append(f"🔵 `▲{pct:.0f}%` {link(c)} {c.rating} {c.kind} · "
                      f"~~{k(s['ref'])}~~ → **{k(c.price)}**")
         lines.append(f"24h high {k(s['high24'])} · **{verdict}**")
-    e = {"title": f"🚀 Spikes · last {COMPARE_HOURS}h · {k(SPIKE_BAND[0])}–{k(SPIKE_BAND[1])} {PLATFORM_LABEL}",
+    range_label = f" · {k(MIN_PRICE or 15_000)}–{k(MAX_PRICE) if MAX_PRICE else '∞'}"
+    e = {"title": f"🚀 Spikes · last {COMPARE_HOURS}h{range_label} {PLATFORM_LABEL}",
          "description": "\n".join(lines),
          "color": 0xE67E22,
          "footer": {"text": "Spikes"}}
@@ -425,7 +454,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
     embeds = []
 
     if spike_items:
-        spike_items = sorted(spike_items, key=lambda i: -i[2])[:MAX_LINES]
+        spike_items = _limit(sorted(spike_items, key=lambda i: -i[2]))
         lines = [f"{len(spike_items)} card(s) jumped ≥{FLASH_SPIKE_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in spike_items:
             lines.append(f"⚡ `▲{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
@@ -439,7 +468,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         embeds.append(e)
 
     if dip_items:
-        dip_items = sorted(dip_items, key=lambda i: i[2])[:MAX_LINES]   # most negative first
+        dip_items = _limit(sorted(dip_items, key=lambda i: i[2]))   # most negative first
         lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in dip_items:
             lines.append(f"📉 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
@@ -453,7 +482,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         embeds.append(e)
 
     if crash_items:
-        crash_items = sorted(crash_items, key=lambda i: i[2])[:MAX_LINES]  # most negative first
+        crash_items = _limit(sorted(crash_items, key=lambda i: i[2]))  # most negative first
         lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in crash_items:
             lines.append(f"💥 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
@@ -475,7 +504,7 @@ def build_premium_dips(items) -> list[dict]:
     Each entry already passed the 24 h sales avg + liquidity gate in
     card_premium_dip_stats(), so everything shown here is a real signal.
     """
-    items = sorted(items, key=lambda i: i[1]["dip_pct"])[:MAX_LINES]   # deepest first
+    items = _limit(sorted(items, key=lambda i: i[1]["dip_pct"]))   # deepest first
     if not items:
         return []
     lines = [
@@ -552,6 +581,12 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
     cards_map = {c.card_id: c for c in cards}
 
     for c in cards:
+        # ── filter cards outside price range of interest ────────────────────
+        if MIN_PRICE is not None and c.price < MIN_PRICE:
+            continue
+        if MAX_PRICE is not None and c.price > MAX_PRICE:
+            continue
+
         # ── skip TOTW fodder at min price (noisy, no signal) ────────────────
         if _is_totw_fodder(c):
             continue
@@ -568,7 +603,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
             s = card_stats(db, c, now)
             if s and s["ref"] > 0:
                 pct = (c.price - s["ref"]) / s["ref"] * 100
-                if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
+                if pct >= SPIKE_MIN_PCT:
                     spikes.append((c, s, pct))
         else:
             # ── standard path: 6h dip / spike ───────────────────────────────
@@ -577,7 +612,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
                 pct = (c.price - s["ref"]) / s["ref"] * 100
                 if pct <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
                     dips.append((c, s, pct))
-                if pct >= SPIKE_MIN_PCT and SPIKE_BAND[0] <= c.price <= SPIKE_BAND[1]:
+                if pct >= SPIKE_MIN_PCT:
                     spikes.append((c, s, pct))
 
         # ── micro-spike / dip / crash (last two snapshots) ───────────────────
@@ -689,7 +724,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None) -> None:
 
 
 def main() -> None:
-    global MAX_LINES
+    global MAX_LINES, MIN_PRICE, MAX_PRICE
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="print, don't send")
@@ -703,10 +738,18 @@ def main() -> None:
     ap.add_argument("--watchlist", default=None, metavar="FILE",
                     help="JSON file with a list of card IDs to always post prices for")
     ap.add_argument("--max-lines", type=int, default=MAX_LINES,
-                    help="maximum number of cards to display per section/embed (default: 8, or set FC_MAX_LINES)")
+                    help="maximum number of cards to display per section/embed (default: 16, 0 = unlimited)")
+    ap.add_argument("--min-price", default=None,
+                    help="minimum card price of interest (e.g. 20000 or '20k')")
+    ap.add_argument("--max-price", default=None,
+                    help="maximum card price of interest (e.g. 1000000 or '1M')")
     args = ap.parse_args()
-    if args.max_lines:
+    if args.max_lines is not None:
         MAX_LINES = args.max_lines
+    if args.min_price is not None:
+        MIN_PRICE = parse_price(args.min_price)
+    if args.max_price is not None:
+        MAX_PRICE = parse_price(args.max_price)
     watchlist = load_watchlist(args.watchlist)
     if args.interval < 30:
         raise SystemExit("--interval must be at least 30 seconds (be kind to fut.gg)")
