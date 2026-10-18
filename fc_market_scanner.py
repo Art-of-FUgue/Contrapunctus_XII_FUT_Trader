@@ -127,7 +127,8 @@ FLASH_CRASH_PCT = 12.0           # drop threshold that escalates a micro-dip to 
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
 
 # ---- watchlist -------------------------------------------------------------
-WATCHLIST_FILE = os.path.join(HERE, "watchlist.json") if False else None  # set via --watchlist
+WATCHLIST_FILE = os.path.join(HERE, "watchlist.json")   # auto-loaded if it exists
+UNLISTED: list = []   # watchlist cards with no current listing (filled by fetch_market)
 
 
 @dataclass
@@ -215,7 +216,7 @@ def _load_ids(manifest: dict, players: dict) -> list[int]:
     return _cache["ids"]
 
 
-def fetch_market() -> list[Card]:
+def fetch_market(watchlist: set[str] | None = None) -> list[Card]:
     """Current prices for tracked cards, from fut.gg's static price files."""
     manifest = _get_json(R2 + "manifest.json")      # maps names -> current hashes
     players = _load_players()
@@ -225,14 +226,22 @@ def fetch_market() -> list[Card]:
     if len(prices) != len(ids):
         raise RuntimeError(f"{len(prices)} prices vs {len(ids)} ids - files out of sync")
     cards = []
+    UNLISTED.clear()
+    watch = watchlist or set()
     for ea_id, price in zip(ids, prices):
         meta = players.get(ea_id)
-        if meta is None or price < MIN_TRACK_PRICE:
-            continue                                 # unknown card, no price or cheap
+        if meta is None:
+            continue                                 # unknown card
+        watched = str(ea_id) in watch
+        if price < MIN_TRACK_PRICE and not watched:
+            continue                                 # no price or cheap
         kind = meta["rarityName"] + (" 🃏 Holo" if ea_id in holo else "")
-        cards.append(Card(str(ea_id), meta["commonName"], meta["overall"],
-                          kind, price,
-                          "https://www.fut.gg" + meta["url"], meta["cardImageUrl"]))
+        card = Card(str(ea_id), meta["commonName"], meta["overall"], kind, price,
+                    "https://www.fut.gg" + meta["url"], meta["cardImageUrl"])
+        if price <= 0:
+            UNLISTED.append(card)                    # watched but nothing on the market
+        else:
+            cards.append(card)
     return cards
 
 
@@ -541,12 +550,15 @@ def build_premium_dips(items) -> list[dict]:
 def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dict]:
     """Embed showing current price for every card on the watchlist."""
     hits = [cards_map[cid] for cid in watchlist if cid in cards_map]
-    if not hits:
+    unlisted = [c for c in UNLISTED if c.card_id in watchlist]
+    if not hits and not unlisted:
         return []
     hits = sorted(hits, key=lambda c: -c.price)
     lines = []
     for c in hits:
         lines.append(f"👁 **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
+    for c in unlisted:
+        lines.append(f"👁 **no listing** {link(c)} {c.rating} {c.kind}")
     e = {"title": f"👁 Watchlist · {PLATFORM_LABEL}",
          "description": "\n".join(lines),
          "color": 0x9B59B6,
@@ -636,6 +648,18 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
 
     # ── watchlist ────────────────────────────────────────────────────────────
     if watchlist:
+        # first time a watched card shows up with a price (never saved before)
+        if db.execute("select 1 from prices limit 1").fetchone():
+            fresh = [cards_map[cid] for cid in watchlist if cid in cards_map and
+                     not db.execute("select 1 from prices where card_id=? limit 1",
+                                    (cid,)).fetchone()]
+            if fresh:
+                embeds.append({"title": f"🆕 Watched card listed · {PLATFORM_LABEL}",
+                               "description": "\n".join(
+                                   f"🆕 **{k(c.price)}** {link(c)} {c.rating} {c.kind}"
+                                   for c in fresh),
+                               "color": 0x2ECC71,
+                               "footer": {"text": "First listing seen for a watched card"}})
         embeds += build_watchlist(cards_map, watchlist)
 
     return embeds
@@ -707,7 +731,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None) -> None:
     now = time.time()
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
-        cards = fetch_market()
+        cards = fetch_market(watchlist)
         embeds = scan(db, cards, now, watchlist)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
@@ -750,7 +774,8 @@ def main() -> None:
         MIN_PRICE = parse_price(args.min_price)
     if args.max_price is not None:
         MAX_PRICE = parse_price(args.max_price)
-    watchlist = load_watchlist(args.watchlist)
+    watchlist = load_watchlist(
+        args.watchlist or (WATCHLIST_FILE if os.path.exists(WATCHLIST_FILE) else None))
     if args.interval < 30:
         raise SystemExit("--interval must be at least 30 seconds (be kind to fut.gg)")
 
