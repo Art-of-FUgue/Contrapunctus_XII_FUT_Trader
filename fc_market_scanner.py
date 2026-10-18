@@ -24,8 +24,8 @@ How it works
   1. Each scan reads current prices from fut.gg's static price files and labels
      them using players.json (build it with build_players.py).
   2. Prices are saved to a local SQLite file (market_<platform>.db).
-  3. A card is a DIP if it is >=3% below its price COMPARE_HOURS ago and below its
-     usual (median over HISTORY_HOURS) price. A SPIKE is >=30% above that price.
+  3. A card is a DIP if it is >=10% below its price COMPARE_HOURS ago and below its
+     usual (median over HISTORY_HOURS) price. A SPIKE is >=10% above that price.
   4. MICRO-SPIKES / CRASHES compare the last two consecutive snapshots (~15 min
      apart) and fire immediately without waiting for COMPARE_HOURS of history.
   5. WATCHLIST cards are always posted with their current price each scan,
@@ -74,7 +74,7 @@ PREMIUM_WORDS = ("icon", "hero")
 # 24 h window: enough history without diluting recent price moves
 PREMIUM_HISTORY_HOURS = 24
 # A premium dip must be this deep vs the 24 h median to be worth alerting
-PREMIUM_DIP_MIN_PCT = 5.0
+PREMIUM_DIP_MIN_PCT = 10.0
 # Liquidity gate: at least this many consecutive-snapshot price changes in 24 h
 # (proxy for active trading – icons that don't move are untradeable at the dip)
 PREMIUM_MIN_PRICE_CHANGES = 4
@@ -87,15 +87,15 @@ TOTW_MIN_PRICE = 15_000
 # fut.gg's rarity name is "Team of the week" (lower-case w), so match loosely.
 
 DIP_BANDS = [(15_000, 100_000), (100_000, 500_000)]
-DIP_MIN_PCT = 3.0                # drop vs COMPARE_HOURS ago
+DIP_MIN_PCT = 10.0               # drop vs COMPARE_HOURS ago
 SPIKE_BAND = (20_000, 950_000)
-SPIKE_MIN_PCT = 30.0             # jump vs COMPARE_HOURS ago
-MAX_LINES = 8                    # per embed
+SPIKE_MIN_PCT = 10.0             # jump vs COMPARE_HOURS ago
+MAX_LINES = int(os.environ.get("FC_MAX_LINES", 8))   # per embed
 
 # ---- micro-spike / dip / crash (single scan-to-scan delta, ~15 min window) -
 FLASH_SPIKE_PCT = 10.0           # jump between last two snapshots to count as micro-spike
-FLASH_DIP_PCT = 3.0              # drop between last two snapshots to count as micro-dip
-FLASH_CRASH_PCT = 8.0            # drop threshold that escalates a micro-dip to a crash
+FLASH_DIP_PCT = 10.0             # drop between last two snapshots to count as micro-dip
+FLASH_CRASH_PCT = 15.0           # drop threshold that escalates a micro-dip to a crash
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
 
 # ---- watchlist -------------------------------------------------------------
@@ -369,7 +369,7 @@ def k(n: float) -> str:
 
 def tier_emoji(pct: float) -> str:
     a = abs(pct)
-    return "🟠" if a >= 10 else "🟢" if a >= 5 else "🟡"
+    return "🔴" if a >= 20 else "🟠" if a >= 15 else "🟢"
 
 
 def link(c: Card) -> str:
@@ -389,7 +389,7 @@ def build_dips(items) -> list[dict]:
                          f"{link(c)} {c.rating} {c.kind}")
             lines.append(f"buy under **{k(c.price)}** · sales avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
                          f"| {k(s['low'])} – {k(s['high'])} | {s['sales_count']} sales")
-        lines += ["", "🟠 10%+ · 🟢 5–10% · 🟡 3–5%"]
+        lines += ["", "🔴 20%+ · 🟠 15–20% · 🟢 10–15%"]
         e = {"title": f"⚡ {COMPARE_HOURS} Hour dips {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0x2ECC71,
@@ -494,7 +494,7 @@ def build_premium_dips(items) -> list[dict]:
             f"· range {k(s['low'])}–{k(s['high'])} "
             f"· {s['sales_count']} sales {liq_bar}"
         )
-    lines += ["", "🟠 10%+ · 🟢 5–10% · 🟡 3–5%"]
+    lines += ["", "🔴 20%+ · 🟠 15–20% · 🟢 10–15%"]
     e = {
         "title": f"💎 Premium Dips (Icon / Hero) · {PLATFORM_LABEL}",
         "description": "\n".join(lines),
@@ -633,7 +633,7 @@ def demo_seed(db, now: float):
             p = c.price * (1 + rnd.uniform(-0.015, 0.015))
             if step <= 4:                              # last ~2h: moves
                 if int(c.card_id) % 8 == 0:
-                    p = c.price * 0.9                  # dip
+                    p = c.price * 0.88                 # dip (>=10%)
                 if int(c.card_id) % 13 == 0:
                     p = c.price * 1.45                 # spike
             db.execute("insert into prices values (?,?,?)",
@@ -643,7 +643,7 @@ def demo_seed(db, now: float):
     for c in cards:
         p = c.price
         if int(c.card_id) % 8 == 0:
-            p = int(c.price * 0.9)
+            p = int(c.price * 0.88)
         if int(c.card_id) % 13 == 0:
             p = int(c.price * 1.45)
         now_cards.append(Card(c.card_id, c.name, c.rating, c.kind, p, c.url))
@@ -689,6 +689,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None) -> None:
 
 
 def main() -> None:
+    global MAX_LINES
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true")
     ap.add_argument("--dry-run", action="store_true", help="print, don't send")
@@ -701,7 +702,11 @@ def main() -> None:
     ap.add_argument("--db", default=DB_PATH, help="price history database file")
     ap.add_argument("--watchlist", default=None, metavar="FILE",
                     help="JSON file with a list of card IDs to always post prices for")
+    ap.add_argument("--max-lines", type=int, default=MAX_LINES,
+                    help="maximum number of cards to display per section/embed (default: 8, or set FC_MAX_LINES)")
     args = ap.parse_args()
+    if args.max_lines:
+        MAX_LINES = args.max_lines
     watchlist = load_watchlist(args.watchlist)
     if args.interval < 30:
         raise SystemExit("--interval must be at least 30 seconds (be kind to fut.gg)")
