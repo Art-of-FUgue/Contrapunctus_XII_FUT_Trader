@@ -28,6 +28,10 @@ PAGES_DIR = os.path.join(HERE, "pages")
 OUT = os.path.join(HERE, "players.json")
 DEFS_DIR = os.path.join(HERE, "defs")                # holo lookup pages (see holo_lookup_urls.txt)
 HOLO_OUT = os.path.join(HERE, "holo_ids.json")
+MAX_TOTAL = 2000          # the special-card list is ~500; far more means the filter was ignored
+# Standard (non-special) rarities. The list should never contain them; if it does
+# (an unfiltered download), merge() drops them so players.json stays special-only.
+STANDARD_RARITIES = {"common", "rare"}
 
 
 def load_page(path: str) -> dict:
@@ -43,7 +47,7 @@ def fetch(page: int) -> dict:
         return json.load(r)
 
 
-def download(max_pages: int, delay: float) -> None:
+def download(max_pages: int, delay: float, max_total: int = MAX_TOTAL) -> None:
     os.makedirs(PAGES_DIR, exist_ok=True)
     page, fetched_any = 1, False
     while page <= max_pages:
@@ -60,7 +64,16 @@ def download(max_pages: int, delay: float) -> None:
                                  f"{data.get('currentPage')} - stopping.")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
-            print(f"downloaded page {page} (total {data.get('total')})")
+            total = data.get("total") or 0
+            if total > max_total:
+                os.remove(path)
+                raise SystemExit(
+                    f"The server reports {total} cards, but the special-card list should be about "
+                    f"500: the quality_id=10 filter was not applied to this request, so nothing "
+                    f"more will be downloaded. Save the pages from your browser instead (open the "
+                    f"URL, Ctrl+S into pages/), which does apply the filter. "
+                    f"(Override with --max-total if you really want more than {max_total}.)")
+            print(f"downloaded page {page} (total {total})")
         nxt = data.get("next")
         if not nxt or nxt <= page:
             break
@@ -111,6 +124,7 @@ def merge() -> None:
                          "Create that folder and save the fut.gg pages into it "
                          "(.json or .txt files).")
     rows: dict[int, dict] = {}
+    dropped = 0
     seen: set[int] = set()
     last: dict | None = None
     for fp in files:
@@ -121,11 +135,16 @@ def merge() -> None:
             print(f"[skip] {fp}: not a player page")
             continue
         for row in page_rows:
+            if (row.get("rarityName") or "").strip().lower() in STANDARD_RARITIES:
+                dropped += 1                     # not a special card
+                continue
             rows[row["eaId"]] = row
         cp = data.get("currentPage", 0)
         seen.add(cp)
         if last is None or cp >= last.get("currentPage", 0):
             last = data
+    if dropped:
+        print(f"[info] ignored {dropped} standard (Common/Rare) cards: the pages were not special-only")
     add_holos(rows)
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump({"data": list(rows.values())}, f, ensure_ascii=False)
@@ -145,7 +164,8 @@ if __name__ == "__main__":
     ap.add_argument("--download", action="store_true")
     ap.add_argument("--max-pages", type=int, default=100)
     ap.add_argument("--delay", type=float, default=5.0)
+    ap.add_argument("--max-total", type=int, default=MAX_TOTAL)
     args = ap.parse_args()
     if args.download:
-        download(args.max_pages, args.delay)
+        download(args.max_pages, args.delay, args.max_total)
     merge()

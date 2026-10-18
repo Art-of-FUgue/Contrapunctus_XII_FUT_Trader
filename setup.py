@@ -108,6 +108,7 @@ def main() -> None:
     ap.add_argument("--download", action="store_true", help="fetch the fut.gg list pages (opt-in)")
     ap.add_argument("--max-pages", type=int, default=100)
     ap.add_argument("--delay", type=float, default=5.0)
+    ap.add_argument("--max-total", type=int, default=bp.MAX_TOTAL)
     args = ap.parse_args()
 
     os.makedirs(PAGES_DIR, exist_ok=True)
@@ -116,7 +117,7 @@ def main() -> None:
 
     # 2. list pages
     if args.download:
-        bp.download(args.max_pages, args.delay)
+        bp.download(args.max_pages, args.delay, args.max_total)
     pages = glob.glob(os.path.join(PAGES_DIR, "*.json")) + glob.glob(os.path.join(PAGES_DIR, "*.txt"))
     if not pages:
         print("\nSTEP 1 NEEDED: no list pages in pages/.")
