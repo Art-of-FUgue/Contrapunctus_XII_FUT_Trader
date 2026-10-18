@@ -434,6 +434,11 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
     older = [p for t, p in rows if t <= now - COMPARE_HOURS * 3600]
     if not older:
         return None
+    # Reference = median of the hour just before the compare point, so one
+    # blip snapshot can't set the baseline (falls back to the single snapshot).
+    band = [p for t, p in rows
+            if now - (COMPARE_HOURS + 1) * 3600 <= t <= now - COMPARE_HOURS * 3600]
+    ref = statistics.median(band) if len(band) >= 3 else older[-1]
     rows = trim_outliers(rows)
     prices = [p for _, p in rows]
     sales = extract_recent_sales(rows)
@@ -441,7 +446,7 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
     sales_count = max(0, len(sales) - 1)
     q = statistics.quantiles(prices, n=4)
     return {
-        "ref": older[-1],                       # newest price >= COMPARE_HOURS old
+        "ref": ref,                             # median price ~COMPARE_HOURS ago
         "usual": statistics.median(prices),
         "sales_avg": sales_avg,
         "sales_count": sales_count,
@@ -533,7 +538,7 @@ def build_dips(items) -> list[dict]:
         for c, s, pct in band:
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
                          f"{link(c)} {c.rating} {c.kind}")
-            lines.append(f"buy under **{k(c.price)}** · avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
+            lines.append(f"buy under **{k(c.price)}** · vs **{k(s['ref'])}** {COMPARE_HOURS}h ago · avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
                          f"| {k(s['low'])} – {k(s['high'])} | {s['snapshots']} snapshots")
         lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
         e = {"title": f"⚡ {COMPARE_HOURS} Hour dips {PLATFORM_LABEL}",
