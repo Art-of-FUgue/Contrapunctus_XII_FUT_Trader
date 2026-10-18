@@ -1,9 +1,9 @@
 """
 EA FC market scanner: posts 6-hour price dips and spikes to a Discord webhook.
 
-    Premium cards (Icons, Heroes, Holographic variants) use a wider averaging
-    window (ICON_HERO_HISTORY_HOURS = 72h default) so their 'usual' price is
-    stable and not skewed by short-term moves.
+    Premium cards (Icons and Heroes) get their own dip detector (24h sales
+    average + liquidity gate). fut.gg's data has no holo flag, so holo cards are
+    labelled from your own list in holo_ids.json (see HOLO_FILE below).
     TOTW cards below TOTW_MIN_PRICE (15k) are skipped from dip/spike alerts
     to eliminate min-price fluctuation noise.
 
@@ -47,6 +47,7 @@ from dataclasses import dataclass
 
 import requests
 
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -64,15 +65,12 @@ COMPARE_HOURS = 6                # compare today's price with this many hours ag
 HISTORY_HOURS = 24               # window for "usually" / price range / 24h high
 MIN_SAMPLES = 12                 # snapshots needed before a card is judged
 
-# ---- premium card settings (Icons, Heroes, Holos) --------------------------
-# Rarity names that get special treatment (own dip detector, holographic)
-PREMIUM_KINDS = {
-    "Icon", "Heroes", "Hero",
-    "Icon Moments",
-    "Holographic Icon", "Holo Icon",
-    "Holographic Hero", "Holo Hero",
-    "Holographic",                       # generic holo rarity used by some sets
-}
+# ---- premium card settings (Icons, Heroes) ---------------------------------
+# A card is premium if its fut.gg rarity name contains one of these words
+# (case-insensitive). The real names are e.g. "Base Icon", "Debut International
+# Icon" and "Base Hero", so exact-name matching would never match. "Base Hall of
+# FUT" is not included; add "hall of fut" here if you want it.
+PREMIUM_WORDS = ("icon", "hero")
 # 24 h window: enough history without diluting recent price moves
 PREMIUM_HISTORY_HOURS = 24
 # A premium dip must be this deep vs the 24 h median to be worth alerting
@@ -86,7 +84,7 @@ PREMIUM_MIN_SNAPSHOTS_24H = 8
 # ---- TOTW fodder filter ----------------------------------------------------
 # TOTW cards below this price produce noisy min-price fluctuations → skip them
 TOTW_MIN_PRICE = 15_000
-TOTW_KINDS = {"TOTW", "Team of the Week", "TOTW Rare"}
+# fut.gg's rarity name is "Team of the week" (lower-case w), so match loosely.
 
 DIP_BANDS = [(15_000, 100_000), (100_000, 500_000)]
 DIP_MIN_PCT = 3.0                # drop vs COMPARE_HOURS ago
@@ -125,6 +123,12 @@ FUTGG_HEADERS = {"Referer": "https://www.fut.gg/",
 # That API is disallowed for bots in fut.gg's robots.txt, so the script reads
 # your saved copy instead of calling it. Re-save it when new cards release.
 PLAYERS_FILE = os.environ.get("FUTGG_PLAYERS_FILE", os.path.join(HERE, "players.json"))
+# Optional: holo_ids.json = a JSON list of card (EA) ids to label as holographic,
+# e.g. [162895, 50578336]. The id is the last number in the card's fut.gg URL
+# (.../players/226362-louisa-necib/27-84112442/ -> 84112442). A holo card is
+# tracked as its own card only if it has its own id; if it shares the id of the
+# normal card there is just one price and it can only be labelled.
+HOLO_FILE = os.environ.get("FC_HOLO_FILE", os.path.join(HERE, "holo_ids.json"))
 MIN_TRACK_PRICE = 5_000          # ignore cheaper cards (keeps the DB small)
 _cache: dict = {}
 
@@ -152,6 +156,20 @@ def _load_players() -> dict[int, dict]:
     return _cache["players"]
 
 
+def _load_holo(players: dict) -> set[int]:
+    if "holo" not in _cache:
+        ids: set[int] = set()
+        if os.path.exists(HOLO_FILE):
+            with open(HOLO_FILE, encoding="utf-8") as f:
+                ids = {int(i) for i in json.load(f)}
+            missing = sorted(i for i in ids if i not in players)
+            print(f"[info] {len(ids)} holo id(s) loaded from {HOLO_FILE}")
+            if missing:
+                print(f"[warn] holo ids not in players.json (add their pages): {missing}")
+        _cache["holo"] = ids
+    return _cache["holo"]
+
+
 def _load_ids(manifest: dict, players: dict) -> list[int]:
     """Price index = first id + gaps between sorted ids (delta encoding)."""
     h = manifest["player-prices-index"]
@@ -174,6 +192,7 @@ def fetch_market() -> list[Card]:
     manifest = _get_json(R2 + "manifest.json")      # maps names -> current hashes
     players = _load_players()
     ids = _load_ids(manifest, players)
+    holo = _load_holo(players)
     prices = _r2(f"player-prices-{PRICE_KEY}-dyn", manifest)["p"]
     if len(prices) != len(ids):
         raise RuntimeError(f"{len(prices)} prices vs {len(ids)} ids - files out of sync")
@@ -182,8 +201,9 @@ def fetch_market() -> list[Card]:
         meta = players.get(ea_id)
         if meta is None or price < MIN_TRACK_PRICE:
             continue                                 # unknown card, no price or cheap
+        kind = meta["rarityName"] + (" 🃏 Holo" if ea_id in holo else "")
         cards.append(Card(str(ea_id), meta["commonName"], meta["overall"],
-                          meta["rarityName"], price,
+                          kind, price,
                           "https://www.fut.gg" + meta["url"], meta["cardImageUrl"]))
     return cards
 
@@ -204,19 +224,20 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 
 
 def card_flash_stats(db, card: Card):
-    """Return (prev_price, prev_ts) from the second-most-recent snapshot, or None.
+    """Return the previous scan's price and timestamp, or None.
 
     Used for micro-spike / crash detection: compares only the last two
     consecutive snapshots, so alerts fire within one scan interval (~15 min)
     without needing COMPARE_HOURS of history.
     """
+    # scan() runs BEFORE the current prices are saved, so the newest saved row
+    # is the previous scan, which is the baseline to compare against.
     rows = db.execute(
-        "select ts, price from prices where card_id=? order by ts desc limit 2",
+        "select ts, price from prices where card_id=? order by ts desc limit 1",
         (card.card_id,)).fetchall()
-    if len(rows) < 2:
+    if not rows:
         return None
-    # rows[0] is the freshly saved snapshot; rows[1] is the previous one
-    prev_ts, prev_price = rows[1]
+    prev_ts, prev_price = rows[0]
     return {"prev_price": prev_price, "prev_ts": prev_ts}
 
 
@@ -449,7 +470,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
 
 
 def build_premium_dips(items) -> list[dict]:
-    """Dedicated embed for Icon / Hero / Holo dip opportunities.
+    """Dedicated embed for Icon / Hero dip opportunities.
 
     Each entry already passed the 24 h sales avg + liquidity gate in
     card_premium_dip_stats(), so everything shown here is a real signal.
@@ -475,7 +496,7 @@ def build_premium_dips(items) -> list[dict]:
         )
     lines += ["", "🟠 10%+ · 🟢 5–10% · 🟡 3–5%"]
     e = {
-        "title": f"💎 Premium Dips (Icon / Hero / Holo) · {PLATFORM_LABEL}",
+        "title": f"💎 Premium Dips (Icon / Hero) · {PLATFORM_LABEL}",
         "description": "\n".join(lines),
         "color": 0x8E44AD,
         "footer": {"text": (
@@ -506,8 +527,14 @@ def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dic
 
 # ------------------------------------------------------------------- scan --
 def _is_premium(card: Card) -> bool:
-    """True for Icons, Heroes, and Holographic card variants."""
-    return card.kind in PREMIUM_KINDS
+    """True for Icons and Heroes (matched on words in the rarity name)."""
+    kind = card.kind.lower()
+    return any(word in kind for word in PREMIUM_WORDS)
+
+
+def _is_totw(card: Card) -> bool:
+    kind = card.kind.lower()
+    return "team of the week" in kind or kind.startswith("totw")
 
 
 def _is_totw_fodder(card: Card) -> bool:
@@ -516,7 +543,7 @@ def _is_totw_fodder(card: Card) -> bool:
     These cards tend to sit at EA's minimum price and generate spurious
     min-price fluctuation alerts that add noise without actionable signal.
     """
-    return card.kind in TOTW_KINDS and card.price < TOTW_MIN_PRICE
+    return _is_totw(card) and card.price < TOTW_MIN_PRICE
 
 
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -> list[dict]:
@@ -569,7 +596,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None) -
         build_dips(dips)
         + build_spikes(spikes)
         + build_flashes(flash_spikes, flash_dips, flash_crashes)
-        + build_premium_dips(premium_dips)    # 💎 Icon / Hero / Holo dips
+        + build_premium_dips(premium_dips)    # 💎 Icon / Hero dips
     )
 
     # ── watchlist ────────────────────────────────────────────────────────────

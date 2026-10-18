@@ -26,6 +26,8 @@ URL = ("https://www.fut.gg/api/fut/players/v2/27/"
 HERE = os.path.dirname(os.path.abspath(__file__))   # always next to this script
 PAGES_DIR = os.path.join(HERE, "pages")
 OUT = os.path.join(HERE, "players.json")
+DEFS_DIR = os.path.join(HERE, "defs")                # holo lookup pages (see holo_lookup_urls.txt)
+HOLO_OUT = os.path.join(HERE, "holo_ids.json")
 
 
 def load_page(path: str) -> dict:
@@ -67,6 +69,40 @@ def download(max_pages: int, delay: float) -> None:
         print(f"[info] stopped at --max-pages {max_pages}; more pages exist")
 
 
+def add_holos(rows: dict) -> None:
+    """Holo cards are separate EA ids that the list endpoint hides. Pages saved
+    in defs/ (from holo_lookup_urls.txt) describe them; each holo whose normal
+    card is in the list becomes its own row, flagged in holo_ids.json."""
+    files = sorted(glob.glob(os.path.join(DEFS_DIR, "*.json"))
+                   + glob.glob(os.path.join(DEFS_DIR, "*.txt")))
+    if not files:
+        return
+    holo_ids, orphans = set(), 0
+    for fp in files:
+        try:
+            recs = load_page(fp)["data"]
+        except (ValueError, KeyError, TypeError):
+            print(f"[skip] {fp}: not a definition-data page")
+            continue
+        for rec in recs:
+            if rec.get("holographicType") != "holographic":
+                continue
+            base = rows.get(rec.get("standardItemEaId") or rec.get("basePlayerEaId"))
+            if base is None:
+                orphans += 1                   # normal card is not a special card we track
+                continue
+            row = dict(base)
+            row["eaId"] = rec["eaId"]
+            row["url"] = rec.get("url", base.get("url"))
+            row["holographicType"] = "holographic"
+            rows[rec["eaId"]] = row
+            holo_ids.add(rec["eaId"])
+    with open(HOLO_OUT, "w", encoding="utf-8") as f:
+        json.dump(sorted(holo_ids), f)
+    print(f"holos: {len(holo_ids)} added, wrote {HOLO_OUT}"
+          + (f" ({orphans} holo(s) skipped: normal card not in the list)" if orphans else ""))
+
+
 def merge() -> None:
     files = sorted(glob.glob(os.path.join(PAGES_DIR, "*.json"))
                    + glob.glob(os.path.join(PAGES_DIR, "*.txt")))
@@ -90,9 +126,10 @@ def merge() -> None:
         seen.add(cp)
         if last is None or cp >= last.get("currentPage", 0):
             last = data
+    add_holos(rows)
     with open(OUT, "w", encoding="utf-8") as f:
         json.dump({"data": list(rows.values())}, f, ensure_ascii=False)
-    print(f"wrote {OUT}: {len(rows)} cards from {len(seen)} page(s)")
+    print(f"wrote {OUT}: {len(rows)} cards (holos included) from {len(seen)} page(s)")
     if seen:
         missing = sorted(set(range(1, max(seen) + 1)) - seen)
         if missing:
