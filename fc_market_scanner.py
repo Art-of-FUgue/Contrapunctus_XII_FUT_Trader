@@ -300,17 +300,17 @@ def load_watchlist(path: str | None) -> set[str]:
 
 # Outlier trimming for the baseline: snapshots far from the window's median
 # (stale/inflated listings) are ignored so they can't distort the average.
-OUTLIER_FACTOR = 2.5             # drop prices > 2.5x or < 1/2.5 of the window median
+OUTLIER_FACTOR = 5.0             # drop prices more than 5x the window median (no lower bound)
 OUTLIER_ABS_MAX = 15_000_000     # and anything above this absolute cap
 
 
 def trim_outliers(rows: list[tuple[float, int]]) -> list[tuple[float, int]]:
-    """Drop snapshots that are wildly off the window median (or above the cap)."""
+    """Drop snapshots far above the window median (or above the cap)."""
     if len(rows) < 3:
         return rows
     med = statistics.median(p for _, p in rows)
     kept = [(t, p) for t, p in rows
-            if med / OUTLIER_FACTOR <= p <= med * OUTLIER_FACTOR and p <= OUTLIER_ABS_MAX]
+            if p <= med * OUTLIER_FACTOR and p <= OUTLIER_ABS_MAX]
     return kept or rows
 
 
