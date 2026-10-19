@@ -251,6 +251,13 @@ def open_db(path: str) -> sqlite3.Connection:
     db = sqlite3.connect(path)
     db.execute("create table if not exists prices(card_id text, ts real, price int)")
     db.execute("create index if not exists ix on prices(card_id, ts)")
+    db.execute("create table if not exists prices_hourly(card_id text, hour_ts real, price int, "
+               "primary key(card_id, hour_ts))")
+    db.execute("create table if not exists outcomes(id integer primary key autoincrement, "
+               "card_id text, kind text, ts real, price int, depth real, mkt real, "
+               "g text, band text, dbin text, dtype text, "
+               "r1 real, r3 real, r6 real, done int default 0)")
+    db.execute("create index if not exists ox on outcomes(card_id, ts)")
     db.execute("create table if not exists seen(card_id text primary key, first_ts real)")
     db.execute("create table if not exists watch_auto(card_id text primary key, added_ts real)")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
@@ -453,8 +460,39 @@ def fresh_spikes(db, items, now: float, kind: str):
 def save_snapshot(db, cards: list[Card], now: float) -> None:
     db.executemany("insert into prices values (?,?,?)",
                    [(c.card_id, now, c.price) for c in cards])
-    db.execute("delete from prices where ts < ?", (now - (HISTORY_HOURS + 12) * 3600,))
+    compact_history(db, now)
     db.commit()
+
+
+# Raw snapshots are kept RAW_HOURS; older data is squeezed into one median per
+# card per hour and kept until RETENTION_HOURS (3 days).
+RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
+RETENTION_HOURS = 72
+
+
+def compact_history(db, now: float) -> None:
+    cut = int((now - RAW_HOURS * 3600) // 3600) * 3600        # whole hours only
+    rows = db.execute("select card_id, ts, price from prices where ts < ?", (cut,)).fetchall()
+    if rows:
+        buckets: dict = {}
+        for cid, ts, price in rows:
+            buckets.setdefault((cid, int(ts // 3600) * 3600), []).append(price)
+        db.executemany("insert or replace into prices_hourly values (?,?,?)",
+                       [(cid, h, int(statistics.median(v))) for (cid, h), v in buckets.items()])
+        db.execute("delete from prices where ts < ?", (cut,))
+    db.execute("delete from prices_hourly where hour_ts < ?", (now - RETENTION_HOURS * 3600,))
+    db.execute("delete from outcomes where ts < ?", (now - 60 * 86400,))
+
+
+def history_rows(db, card_id: str, since: float) -> list[tuple[float, int]]:
+    """Raw snapshots plus hourly medians (stamped mid-hour) for older data, oldest first."""
+    raw = db.execute("select ts, price from prices where card_id=? and ts>=? order by ts",
+                     (card_id, since)).fetchall()
+    first_raw = raw[0][0] if raw else float("inf")
+    old = db.execute("select hour_ts+1800, price from prices_hourly where card_id=? "
+                     "and hour_ts+1800>=? and hour_ts+1800<? order by hour_ts",
+                     (card_id, since, first_raw)).fetchall()
+    return old + raw
 
 
 def card_flash_stats(db, card: Card):
@@ -565,7 +603,7 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
     }
 
 
-def card_premium_dip_stats(db, card: Card, now: float) -> dict | None:
+def card_premium_dip_stats(db, card: Card, now: float, mkt_adj: float = 0.0) -> dict | None:
     """Specialised stats for premium-card dip detection using recent sales history.
 
     Criteria applied here (all must pass):
@@ -600,7 +638,8 @@ def card_premium_dip_stats(db, card: Card, now: float) -> dict | None:
     if base <= 0:
         return None
 
-    dip_pct = (card.price - base) / base * 100
+    raw_pct = (card.price - base) / base * 100
+    dip_pct = raw_pct - mkt_adj                  # dip beyond the market's own move
     if dip_pct > -PREMIUM_DIP_MIN_PCT:
         return None                              # not enough of a dip vs median
 
@@ -612,6 +651,8 @@ def card_premium_dip_stats(db, card: Card, now: float) -> dict | None:
         "low": q[0],
         "high": q[2],
         "dip_pct": dip_pct,
+        "raw_pct": raw_pct,
+        "mkt": mkt_adj,
         "sales_count": sales_count,
         "snapshots": len(rows),
     }
@@ -639,7 +680,7 @@ def build_dips(items) -> list[dict]:
     embeds = []
     for lo, hi in DIP_BANDS:
         band = _limit(sorted((i for i in items if lo <= i[0].price < hi),
-                             key=lambda i: i[2]))
+                             key=lambda i: _score_key(i[1], i[2])))
         if not band:
             continue
         lines = [f"**{k(lo)} – {k(hi)}**"]
@@ -647,7 +688,9 @@ def build_dips(items) -> list[dict]:
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
                          f"{link(c)} {c.rating} {c.kind}")
             lines.append(f"buy under **{k(c.price)}** · vs **{k(s['ref'])}** {COMPARE_HOURS}h ago · avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
-                         f"| {k(s['low'])} – {k(s['high'])} | {s['snapshots']} snapshots")
+                         f"| {k(s['low'])} – {k(s['high'])} | {s['snapshots']} snapshots{_mkt_text(s)}")
+            if s.get("score"):
+                lines.append(f"↳ {score_text(s['score'])}")
         lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
         e = {"title": f"⚡ {COMPARE_HOURS} Hour dips {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -703,7 +746,8 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in dip_items:
             lines.append(f"📉 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible buy window")
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible buy window{_mkt_text(f)}"
+                         + (f"\n↳ {score_text(f['score'])}" if f.get("score") else ""))
         e = {"title": f"📉 Micro-Dips · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0x1ABC9C,
@@ -717,7 +761,8 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in crash_items:
             lines.append(f"💥 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible dump")
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible dump{_mkt_text(f)}"
+                         + (f"\n↳ {score_text(f['score'])}" if f.get("score") else ""))
         e = {"title": f"💥 Price Crashes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0xE74C3C,
@@ -735,7 +780,7 @@ def build_premium_dips(items) -> list[dict]:
     Each entry already passed the 24 h median + liquidity gate in
     card_premium_dip_stats(), so everything shown here is a real signal.
     """
-    items = _limit(sorted(items, key=lambda i: i[1]["dip_pct"]))   # deepest first
+    items = _limit(sorted(items, key=lambda i: _score_key(i[1], i[1]["dip_pct"])))
     if not items:
         return []
     lines = [
@@ -752,8 +797,10 @@ def build_premium_dips(items) -> list[dict]:
         lines.append(
             f"median **{k(s['sales_median'])}** (avg {k(s['sales_avg'])}) "
             f"· range {k(s['low'])}–{k(s['high'])} "
-            f"· {s['snapshots']} snapshots {liq_bar}"
+            f"· {s['snapshots']} snapshots{_mkt_text(s)} {liq_bar}"
         )
+        if s.get("score"):
+            lines.append(f"↳ {score_text(s['score'])}")
     lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
     e = {
         "title": f"💎 Premium Dips (Icon / Hero) · {PLATFORM_LABEL}",
@@ -809,6 +856,130 @@ def _is_totw_fodder(card: Card) -> bool:
     return _is_totw(card) and card.price < TOTW_MIN_PRICE
 
 
+# ---- market-wide move (peer group) -----------------------------------------
+MARKET_MIN_GROUP = 8             # peers needed before a group move is subtracted
+
+
+def rgroup(c: Card) -> str:
+    base = "premium" if _is_premium(c) else "totw" if _is_totw(c) else "promo"
+    return base + (" holo" if "holo" in c.kind.lower() else "")
+
+
+def _group_median(vals: dict) -> dict:
+    return {g: (statistics.median(v) if len(v) >= MARKET_MIN_GROUP else 0.0)
+            for g, v in vals.items()}
+
+
+def market_moves(db, cards, stats: dict, skip: set):
+    """Median % move per peer group: vs 6 h ref, vs 24 h median, vs last scan."""
+    v6, v24, vf = {}, {}, {}
+    last = dict(db.execute("select card_id, price from prices "
+                           "where ts=(select max(ts) from prices)").fetchall())
+    for c in cards:
+        if c.card_id in skip:
+            continue
+        g = rgroup(c)
+        s = stats.get(c.card_id)
+        if s and s["ref"] > 0:
+            v6.setdefault(g, []).append((c.price - s["ref"]) / s["ref"] * 100)
+        if s and s["usual"] > 0:
+            v24.setdefault(g, []).append((c.price - s["usual"]) / s["usual"] * 100)
+        lp = last.get(c.card_id)
+        if lp:
+            vf.setdefault(g, []).append((c.price - lp) / lp * 100)
+    return _group_median(v6), _group_median(v24), _group_median(vf)
+
+
+# ---- dip outcomes + similar-dip score -------------------------------------
+SCORE_HORIZON = 3                # hours: the return the score is based on
+SCORE_MIN_N = int(os.environ.get("FC_SCORE_MIN_N", "20"))   # bucket size before backoff
+SCORE_SHRINK_K = 15              # shrinkage strength toward the coarser bucket
+OUTCOME_COOLDOWN_H = 6           # don't log the same card's dip again inside this
+EXIT_HAIRCUT_PCT = 1.0           # exit below the floor (undercut) on top of the tax
+
+
+def price_band(p: float) -> str:
+    return ("<100k" if p < 100_000 else "100-500k" if p < 500_000
+            else "500k-1.5M" if p < 1_500_000 else ">1.5M")
+
+
+def depth_bin(d: float) -> str:
+    d = abs(d)
+    return "<10%" if d < 10 else "10-15%" if d < 15 else "15-25%" if d < 25 else "25%+"
+
+
+def log_outcome(db, c: Card, dtype: str, rel: float, mkt: float, now: float) -> None:
+    if db.execute("select 1 from outcomes where card_id=? and ts>=?",
+                  (c.card_id, now - OUTCOME_COOLDOWN_H * 3600)).fetchone():
+        return
+    db.execute("insert into outcomes(card_id,kind,ts,price,depth,mkt,g,band,dbin,dtype) "
+               "values (?,?,?,?,?,?,?,?,?,?)",
+               (c.card_id, c.kind, now, c.price, rel, mkt, rgroup(c),
+                price_band(c.price), depth_bin(rel), dtype))
+
+
+def resolve_outcomes(db, now: float) -> None:
+    """Fill in the floor price 1/3/6 h after each logged dip (net of tax + haircut)."""
+    rows = db.execute("select id, card_id, ts, price, r1, r3, r6 from outcomes where done=0").fetchall()
+    for oid, cid, ts, price, *got in rows:
+        vals = list(got)
+        for i, h in enumerate((1, 3, 6)):
+            target = ts + h * 3600
+            if vals[i] is not None or now < target + 600:
+                continue
+            row = db.execute(
+                "select price from prices where card_id=? and ts between ? and ? "
+                "order by abs(ts-?) limit 1", (cid, target - 900, target + 1800, target)).fetchone()
+            if row and price > 0:
+                vals[i] = (row[0] * (1 - EA_TAX) - price) / price * 100 - EXIT_HAIRCUT_PCT
+        done = 1 if (vals[2] is not None or now > ts + 8 * 3600) else 0
+        db.execute("update outcomes set r1=?, r3=?, r6=?, done=? where id=?", (*vals, done, oid))
+    db.commit()
+
+
+def score_dip(db, g: str, band: str, dbin: str, dtype: str):
+    """Shrunken average net return of similar past dips (nested buckets, coarse -> fine)."""
+    col = {1: "r1", 3: "r3", 6: "r6"}[SCORE_HORIZON]
+    rows = db.execute(f"select g, band, dbin, dtype, {col} from outcomes "
+                      f"where {col} is not null").fetchall()
+    if len(rows) < SCORE_MIN_N:
+        return {"status": "cold", "n": len(rows)}
+    me = {"g": g, "band": band, "dbin": dbin, "dtype": dtype}
+    levels = [(), ("dbin",), ("g", "dbin"), ("g", "dbin", "dtype"),
+              ("g", "band", "dbin", "dtype")]
+    idx = {"g": 0, "band": 1, "dbin": 2, "dtype": 3}
+    parent, chosen = None, None
+    for keys in levels:
+        sel = [r[4] for r in rows if all(r[idx[kk]] == me[kk] for kk in keys)]
+        if keys and len(sel) < SCORE_MIN_N:
+            break
+        n, tot = len(sel), sum(sel)
+        est = tot / n if parent is None else (tot + SCORE_SHRINK_K * parent) / (n + SCORE_SHRINK_K)
+        parent = est
+        chosen = {"status": "ok", "mean": est, "n": n, "hits": sum(1 for x in sel if x > 0),
+                  "label": " ".join(me[kk] for kk in keys) or "all dips"}
+    return chosen
+
+
+def score_text(sc) -> str:
+    if not sc:
+        return ""
+    if sc["status"] == "cold":
+        return f"similar dips: not enough history yet ({sc['n']}/{SCORE_MIN_N})"
+    return (f"similar ({sc['label']}): {sc['hits']}/{sc['n']} profitable @{SCORE_HORIZON}h "
+            f"· avg {sc['mean']:+.1f}% net")
+
+
+def _score_key(d: dict, depth: float):
+    sc = d.get("score")
+    return (0, -sc["mean"]) if sc and sc["status"] == "ok" else (1, depth)
+
+
+def _mkt_text(d: dict) -> str:
+    m = d.get("mkt", 0.0)
+    return f" · mkt {m:+.1f}%" if abs(m) >= 0.5 else ""
+
+
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
          spikes_on: bool = True, run_cycles: bool = True) -> list[dict]:
     dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
@@ -820,6 +991,9 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     watch = watchlist or set()
     auto = auto_watch_ids(db, now)
     watch_hits: list = []
+    stats = {c.card_id: card_stats(db, c, now) for c in cards
+             if c.card_id not in muted_new and c.card_id not in watch}
+    adj6, adj24, adjf = market_moves(db, cards, stats, muted_new | watch)
 
     for c in cards:
         if c.card_id in watch:
@@ -850,25 +1024,27 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
 
         if _is_premium(c):
             # ── premium path: dedicated dip detector (24 h, liquidity-gated) ─
-            ps = card_premium_dip_stats(db, c, now)
+            ps = card_premium_dip_stats(db, c, now, adj24.get(rgroup(c), 0.0))
             if ps is not None:
                 premium_dips.append((c, ps))
 
             # Premium cards still participate in spike and flash alerts.
             # They are intentionally excluded from the general dip list to
             # avoid duplicate / lower-quality alerts for the same card.
-            s = card_stats(db, c, now)
+            s = stats.get(c.card_id)
             if s and s["ref"] > 0:
                 pct = (c.price - s["ref"]) / s["ref"] * 100
                 if pct >= SPIKE_MIN_PCT:
                     spikes.append((c, s, pct))
         else:
             # ── standard path: 6h dip / spike ───────────────────────────────
-            s = card_stats(db, c, now)
+            s = stats.get(c.card_id)
             if s and s["ref"] > 0:
                 pct = (c.price - s["ref"]) / s["ref"] * 100
-                if pct <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
-                    dips.append((c, s, pct))
+                m6 = adj6.get(rgroup(c), 0.0)
+                rel = pct - m6                          # dip beyond the market's own move
+                if rel <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
+                    dips.append((c, dict(s, mkt=m6, raw=pct), rel))
                 if pct >= SPIKE_MIN_PCT:
                     spikes.append((c, s, pct))
 
@@ -877,12 +1053,25 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
             f = card_flash_stats(db, c)
             if f and f["prev_price"] > 0:
                 pct = (c.price - f["prev_price"]) / f["prev_price"] * 100
+                mf = adjf.get(rgroup(c), 0.0)
+                rel = pct - mf
+                f = dict(f, mkt=mf, raw=pct)
                 if pct >= FLASH_SPIKE_PCT:
                     flash_spikes.append((c, f, pct))
-                elif pct <= -FLASH_CRASH_PCT:
-                    flash_crashes.append((c, f, pct))
-                elif pct <= -FLASH_DIP_PCT:
-                    flash_dips.append((c, f, pct))
+                elif rel <= -FLASH_CRASH_PCT:
+                    flash_crashes.append((c, f, rel))
+                elif rel <= -FLASH_DIP_PCT:
+                    flash_dips.append((c, f, rel))
+
+    # score each dip by how similar past dips turned out, then log it for later scoring
+    for items, dtype in ((dips, "6h"), (flash_dips, "micro"), (flash_crashes, "micro")):
+        for c, d, rel in items:
+            d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(rel), dtype)
+            log_outcome(db, c, dtype, rel, d.get("mkt", 0.0), now)
+    for c, d in premium_dips:
+        d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(d["dip_pct"]), "prem")
+        log_outcome(db, c, "prem", d["dip_pct"], d.get("mkt", 0.0), now)
+    db.commit()
 
     if spikes_on:
         spikes = fresh_spikes(db, spikes, now, "spike")
@@ -976,6 +1165,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
+        resolve_outcomes(db, now)
     except Exception as e:
         notice(f"⚠️ {PLATFORM_LABEL} scan failed: {str(e)[:300]}", dry_run)
         raise
