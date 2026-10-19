@@ -692,8 +692,7 @@ def build_dips(items) -> list[dict]:
         for c, s, pct in band:
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
                          f"{link(c)} {c.rating} {c.kind}")
-            lines.append(f"buy under **{k(c.price)}** · vs **{k(s['ref'])}** {COMPARE_HOURS}h ago · avg {k(s['sales_avg'])} (usual {k(s['usual'])}) "
-                         f"| {k(s['low'])} – {k(s['high'])} | {s['snapshots']} snapshots{_mkt_text(s)}")
+            lines.append(f"buy under **{k(c.price)}** · vs **{k(s['ref'])}** {COMPARE_HOURS}h ago · avg {k(s['sales_avg'])} (usual {k(s['usual'])})")
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
         lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
@@ -751,7 +750,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in dip_items:
             lines.append(f"📉 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible buy window{_mkt_text(f)}"
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible buy window"
                          + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         e = {"title": f"📉 Micro-Dips · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -766,7 +765,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in crash_items:
             lines.append(f"💥 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible dump{_mkt_text(f)}"
+            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** · possible dump"
                          + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         e = {"title": f"💥 Price Crashes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -801,8 +800,7 @@ def build_premium_dips(items) -> list[dict]:
         )
         lines.append(
             f"median **{k(s['sales_median'])}** (avg {k(s['sales_avg'])}) "
-            f"· range {k(s['low'])}–{k(s['high'])} "
-            f"· {s['snapshots']} snapshots{_mkt_text(s)} {liq_bar}"
+            f"{liq_bar}"
         )
         if s.get("score"):
             lines.append(f"↳ {score_text(s)}")
