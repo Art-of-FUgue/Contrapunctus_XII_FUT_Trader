@@ -1093,12 +1093,42 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     return embeds
 
 
+DISCORD_DESC_MAX = 3900          # Discord rejects embed descriptions over 4096 chars
+
+
+def split_embed(e: dict) -> list[dict]:
+    """Split an embed whose description is too long into several, on line breaks."""
+    desc = e.get("description", "")
+    if len(desc) <= DISCORD_DESC_MAX:
+        return [e]
+    chunks, cur = [], ""
+    for line in desc.split("\n"):
+        if cur and len(cur) + len(line) + 1 > DISCORD_DESC_MAX:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n" if cur else "") + line[:DISCORD_DESC_MAX]
+    if cur:
+        chunks.append(cur)
+    out = []
+    for i, ch in enumerate(chunks):
+        part = dict(e, description=ch)
+        if i:
+            part["title"] = f"{e.get('title', '')} (cont. {i + 1}/{len(chunks)})"[:256]
+            part.pop("thumbnail", None)
+        out.append(part)
+    return out
+
+
 def post(embeds: list[dict], dry_run: bool) -> None:
-    for e in embeds:
+    flat = [part for e in embeds for part in split_embed(e)]
+    for e in flat:
         if dry_run:
             print(json.dumps(e, ensure_ascii=False, indent=2))
             continue
         r = requests.post(WEBHOOK_URL, json={"embeds": [e]}, timeout=10)
+        if r.status_code == 400:                      # show what Discord objected to
+            print(f"[error] Discord 400 for '{e.get('title')}': {r.text[:300]} "
+                  f"(description {len(e.get('description', ''))} chars)")
         r.raise_for_status()
         time.sleep(1)
 
