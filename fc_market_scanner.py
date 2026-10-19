@@ -252,6 +252,7 @@ def open_db(path: str) -> sqlite3.Connection:
     db.execute("create table if not exists prices(card_id text, ts real, price int)")
     db.execute("create index if not exists ix on prices(card_id, ts)")
     db.execute("create table if not exists seen(card_id text primary key, first_ts real)")
+    db.execute("create table if not exists watch_auto(card_id text primary key, added_ts real)")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
     return db
 
@@ -298,7 +299,7 @@ SPIKE_REALERT_PCT = 5.0          # ...or climbs this much above the price last a
 # ---- round trips: a dip followed by a spike inside the last 24 h -------------
 CYCLE_HOURS = 24                 # window searched for buy-low / sell-high pairs
 CYCLE_RECENT_HOURS = 4           # the sell peak must be this fresh
-CYCLE_MIN_NET_PCT = float(os.environ.get("FC_CYCLE_MIN_NET_PCT", "5"))  # profit after 5% EA tax
+CYCLE_MIN_NET_PCT = float(os.environ.get("FC_CYCLE_MIN_NET_PCT", "50"))  # profit after 5% EA tax
 EA_TAX = 0.05
 # Standalone spike alerts are off by default (set FC_SPIKE_ALERTS=1 to bring back).
 SPIKE_ALERTS = os.environ.get("FC_SPIKE_ALERTS", "0") == "1"
@@ -359,6 +360,78 @@ def build_cycles(items) -> list[dict]:
     return [e]
 
 
+# ---- auto-watchlist: cards that keep completing round trips -------------------
+AUTO_WATCH_MIN_CYCLES = int(os.environ.get("FC_AUTO_WATCH_MIN_CYCLES", "2"))
+AUTO_WATCH_WINDOW_DAYS = 7       # count round trips inside this window
+AUTO_WATCH_DAYS = 14             # stay watched this long after the last qualifying trip
+CYCLE_GAP_HOURS = 6              # two alerts closer than this count as one round trip
+
+
+def auto_watch_update(db, cards, now: float) -> None:
+    """Add cards that appeared in >= AUTO_WATCH_MIN_CYCLES separate round trips."""
+    for c in cards:
+        stamps = [r[0] for r in db.execute(
+            "select ts from alerts where card_id=? and kind='cycle' and ts>=? order by ts",
+            (c.card_id, now - AUTO_WATCH_WINDOW_DAYS * 86400))]
+        trips, last = 0, None
+        for t in stamps:
+            if last is None or t - last >= CYCLE_GAP_HOURS * 3600:
+                trips += 1
+                last = t
+        if trips >= AUTO_WATCH_MIN_CYCLES:
+            db.execute("insert or replace into watch_auto values (?,?)", (c.card_id, now))
+            print(f"[info] auto-watch: {c.name} ({trips} round trips in {AUTO_WATCH_WINDOW_DAYS}d)")
+    db.commit()
+
+
+def auto_watch_ids(db, now: float) -> set[str]:
+    return {r[0] for r in db.execute(
+        "select card_id from watch_auto where added_ts>=?", (now - AUTO_WATCH_DAYS * 86400,))}
+
+
+def watch_dip(db, card: Card, now: float):
+    """Dip rule for a watched card: 6 h dip (median ref) or micro-dip vs last scan."""
+    best = None
+    s = card_stats(db, card, now)
+    if s and s["ref"] > 0:
+        pct = (card.price - s["ref"]) / s["ref"] * 100
+        if pct <= -DIP_MIN_PCT:
+            best = (pct, f"vs {k(s['ref'])} {COMPARE_HOURS}h ago", s["ref"])
+    f = card_flash_stats(db, card)
+    if f and f["prev_price"] > 0:
+        pct = (card.price - f["prev_price"]) / f["prev_price"] * 100
+        if pct <= -FLASH_DIP_PCT and (best is None or pct < best[0]):
+            best = (pct, f"vs {k(f['prev_price'])} last scan", f["prev_price"])
+    if not best:
+        return None
+    row = db.execute(
+        "select price from alerts where card_id=? and kind='watch' and ts>=? "
+        "order by ts desc limit 1", (card.card_id, now - SPIKE_COOLDOWN_HOURS * 3600)).fetchone()
+    if row and card.price > row[0] * (1 - SPIKE_REALERT_PCT / 100):
+        return None                               # already posted this dip
+    db.execute("insert into alerts values (?,?,?,?)", (card.card_id, "watch", now, card.price))
+    db.commit()
+    return {"pct": best[0], "why": best[1], "ref": best[2]}
+
+
+def build_watch_dips(items, auto: set[str]) -> list[dict]:
+    items = _limit(sorted(items, key=lambda i: i[1]["pct"]))
+    if not items:
+        return []
+    lines = []
+    for c, d in items:
+        tag = " 🔁" if c.card_id in auto else ""
+        lines.append(f"📉 `{d['pct']:+.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}{tag}")
+        lines.append(f"{d['why']}")
+    lines += ["", "🔁 = auto-added after repeated round trips"]
+    e = {"title": f"👁 Watchlist dips · {PLATFORM_LABEL}",
+         "description": "\n".join(lines), "color": 0x9B59B6,
+         "footer": {"text": "Watched cards post only when they dip again"}}
+    if items[0][0].image_url:
+        e["thumbnail"] = {"url": items[0][0].image_url}
+    return [e]
+
+
 def fresh_spikes(db, items, now: float, kind: str):
     """Keep only spike items not already alerted recently; record the kept ones."""
     out = []
@@ -372,7 +445,7 @@ def fresh_spikes(db, items, now: float, kind: str):
             continue                              # same spike, already posted
         out.append(item)
         db.execute("insert into alerts values (?,?,?,?)", (c.card_id, kind, now, c.price))
-    db.execute("delete from alerts where ts < ?", (now - 48 * 3600,))
+    db.execute("delete from alerts where ts < ?", (now - 8 * 86400,))
     db.commit()
     return out
 
@@ -744,8 +817,21 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     premium_dips: list[tuple[Card, dict]] = []   # (card, stats) – own embed
     cards_map = {c.card_id: c for c in cards}
     muted_new = new_card_ids(db, now)
+    watch = watchlist or set()
+    auto = auto_watch_ids(db, now)
+    watch_hits: list = []
 
     for c in cards:
+        if c.card_id in watch:
+            # watched cards skip the price/new-card filters and the normal lists;
+            # they only post when they dip again.
+            d = watch_dip(db, c, now)
+            if d:
+                watch_hits.append((c, d))
+            cy = find_cycle(db, c, now)
+            if cy:
+                cycles.append((c, cy))
+            continue
         if c.card_id in muted_new:
             continue                                  # released in the last few days
         # ── filter cards outside price range of interest ────────────────────
@@ -801,29 +887,18 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     if spikes_on:
         spikes = fresh_spikes(db, spikes, now, "spike")
         flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
+    _cyc = fresh_cycles(db, cycles, now) if run_cycles else []
+    auto_watch_update(db, [c for c, _ in _cyc], now)
     embeds = (
         build_dips(dips)
-        + (build_cycles(fresh_cycles(db, cycles, now)) if run_cycles else [])
+        + (build_cycles(_cyc) if run_cycles else [])
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
         + build_premium_dips(premium_dips)    # 💎 Icon / Hero dips
     )
 
-    # ── watchlist ────────────────────────────────────────────────────────────
-    if watchlist:
-        # first time a watched card shows up with a price (never saved before)
-        if db.execute("select 1 from prices limit 1").fetchone():
-            fresh = [cards_map[cid] for cid in watchlist if cid in cards_map and
-                     not db.execute("select 1 from prices where card_id=? limit 1",
-                                    (cid,)).fetchone()]
-            if fresh:
-                embeds.append({"title": f"🆕 Watched card listed · {PLATFORM_LABEL}",
-                               "description": "\n".join(
-                                   f"🆕 **{k(c.price)}** {link(c)} {c.rating} {c.kind}"
-                                   for c in fresh),
-                               "color": 0x2ECC71,
-                               "footer": {"text": "First listing seen for a watched card"}})
-        embeds += build_watchlist(cards_map, watchlist)
+    # ── watchlist: posts only when a watched card dips again ─────────────────
+    embeds += build_watch_dips(watch_hits, auto)
 
     return embeds
 
@@ -895,6 +970,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
     now = time.time()
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
+        watchlist = (watchlist or set()) | auto_watch_ids(db, now)   # manual + auto
         cards = fetch_market(watchlist)
         register_cards(db, _load_players().keys(), now)
         embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
