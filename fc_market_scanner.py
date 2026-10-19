@@ -468,6 +468,7 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 # card per hour and kept until RETENTION_HOURS (3 days).
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
 RETENTION_HOURS = 72
+OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
 
 
 def compact_history(db, now: float) -> None:
@@ -481,7 +482,7 @@ def compact_history(db, now: float) -> None:
                        [(cid, h, int(statistics.median(v))) for (cid, h), v in buckets.items()])
         db.execute("delete from prices where ts < ?", (cut,))
     db.execute("delete from prices_hourly where hour_ts < ?", (now - RETENTION_HOURS * 3600,))
-    db.execute("delete from outcomes where ts < ?", (now - 60 * 86400,))
+    db.execute("delete from outcomes where ts < ?", (now - OUTCOME_KEEP_DAYS * 86400,))
 
 
 def history_rows(db, card_id: str, since: float) -> list[tuple[float, int]]:
