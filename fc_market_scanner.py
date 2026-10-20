@@ -217,9 +217,12 @@ def _load_ids(manifest: dict, players: dict) -> list[int]:
     return _cache["ids"]
 
 
-def fetch_market(watchlist: set[str] | None = None) -> list[Card]:
+def fetch_market(watchlist: set[str] | None = None, last_hash: str | None = None):
     """Current prices for tracked cards, from fut.gg's static price files."""
     manifest = _get_json(R2 + "manifest.json")      # maps names -> current hashes
+    _cache["dyn_hash"] = manifest.get(f"player-prices-{PRICE_KEY}-dyn")
+    if last_hash and _cache["dyn_hash"] == last_hash:
+        return None                                  # fut.gg has not published new prices
     players = _load_players()
     ids = _load_ids(manifest, players)
     holo = _load_holo(players)
@@ -262,6 +265,7 @@ def open_db(path: str) -> sqlite3.Connection:
     db.execute("create table if not exists market_ret(g text, ts real, ret real)")
     db.execute("create index if not exists mx on market_ret(g, ts)")
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
+    db.execute("create table if not exists meta(k text primary key, v text)")
     db.execute("create table if not exists seen(card_id text primary key, first_ts real)")
     db.execute("create table if not exists watch_auto(card_id text primary key, added_ts real)")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
@@ -300,6 +304,27 @@ def new_card_ids(db, now: float) -> set[str]:
         return set()
     return {r[0] for r in db.execute(
         "select card_id from seen where first_ts > ?", (now - NEW_CARD_DAYS * 86400,))}
+
+
+# Dips: a card stays quiet this long after an alert unless it falls further.
+DIP_COOLDOWN_MIN = float(os.environ.get("FC_DIP_COOLDOWN_MIN", "30"))
+DIP_REALERT_PCT = 3.0            # ...or its price drops this much below the last alert
+
+
+def fresh_dips(db, items, now: float, kind: str):
+    out = []
+    for item in items:
+        c = item[0]
+        row = db.execute(
+            "select price from alerts where card_id=? and kind=? and ts>=? "
+            "order by ts desc limit 1",
+            (c.card_id, kind, now - DIP_COOLDOWN_MIN * 60)).fetchone()
+        if row and c.price > row[0] * (1 - DIP_REALERT_PCT / 100):
+            continue                              # same dip, already posted
+        out.append(item)
+        db.execute("insert into alerts values (?,?,?,?)", (c.card_id, kind, now, c.price))
+    db.commit()
+    return out
 
 
 # A card already alerted as a spike stays quiet this long unless it rises further.
@@ -459,6 +484,16 @@ def fresh_spikes(db, items, now: float, kind: str):
     db.execute("delete from alerts where ts < ?", (now - 8 * 86400,))
     db.commit()
     return out
+
+
+def get_meta(db, key: str):
+    row = db.execute("select v from meta where k=?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_meta(db, key: str, value) -> None:
+    db.execute("insert or replace into meta values (?,?)", (key, str(value)))
+    db.commit()
 
 
 def save_snapshot(db, cards: list[Card], now: float) -> None:
@@ -1150,6 +1185,11 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 elif rel <= -FLASH_DIP_PCT:
                     flash_dips.append((c, f, rel))
 
+    dips = fresh_dips(db, dips, now, "dip")
+    flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
+    flash_crashes = fresh_dips(db, flash_crashes, now, "flashcrash")
+    premium_dips = fresh_dips(db, premium_dips, now, "prem")
+
     # score each dip by how similar past dips turned out, then log it for later scoring
     for items, dtype in ((dips, "6h"), (flash_dips, "micro"), (flash_crashes, "micro")):
         for c, d, rel in items:
@@ -1276,17 +1316,26 @@ def fmt_gap(seconds: float) -> str:
 
 
 def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
-              spikes_on: bool = True) -> None:
+              spikes_on: bool = True, notify: bool = True) -> bool:
+    """One scan. Returns False (and does nothing) if fut.gg has no new prices."""
     now = time.time()
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         watchlist = (watchlist or set()) | auto_watch_ids(db, now)   # manual + auto
-        cards = fetch_market(watchlist)
+        cards = fetch_market(watchlist, last_hash=get_meta(db, "dyn_hash"))
+        if cards is None:
+            print(f"[info] {time.strftime('%H:%M:%S', time.gmtime())} UTC feed unchanged, skipped")
+            return False
         register_cards(db, _load_players().keys(), now)
         embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
         resolve_outcomes(db, now)
+        last_ts = get_meta(db, "dyn_ts")
+        if last_ts:
+            print(f"[info] feed updated {now - float(last_ts):.0f}s after the previous update")
+        set_meta(db, "dyn_hash", _cache.get("dyn_hash"))
+        set_meta(db, "dyn_ts", now)
     except Exception as e:
         notice(f"⚠️ {PLATFORM_LABEL} scan failed: {str(e)[:300]}", dry_run)
         raise
@@ -1295,8 +1344,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
     gap = f" · {fmt_gap(now - prev)} since last scan" if prev else " · first scan"
     via = os.environ.get("GITHUB_EVENT_NAME", "")      # set by GitHub Actions
     via = f" · via {via}" if via else ""
-    notice(f"🔄 {PLATFORM_LABEL} scan ran at {stamp} UTC · {len(cards)} cards · "
-           f"{len(embeds)} alert embed(s){gap}{via}", dry_run)
+    if notify:
+        notice(f"🔄 {PLATFORM_LABEL} scan ran at {stamp} UTC · {len(cards)} cards · "
+               f"{len(embeds)} alert embed(s){gap}{via}", dry_run)
+    return True
 
 
 def main() -> None:
@@ -1308,8 +1359,8 @@ def main() -> None:
                     help="one scan then exit (for GitHub Actions / cron)")
     ap.add_argument("--runs", type=int, default=int(os.environ.get("FC_RUNS", "1")),
                     help="with --once: scan this many times in one launch (default 1)")
-    ap.add_argument("--run-gap", type=float, default=float(os.environ.get("FC_RUN_GAP", "300")),
-                    help="seconds between the scans of one launch (default 300, min 30)")
+    ap.add_argument("--run-gap", type=float, default=float(os.environ.get("FC_RUN_GAP", "60")),
+                    help="seconds between the scans of one launch (default 60, min 30)")
     ap.add_argument("--interval", type=float, default=POLL_SECONDS,
                     help="seconds between scans in loop mode (minimum 30)")
     ap.add_argument("--max-scans", type=int, default=0,
@@ -1355,13 +1406,14 @@ def main() -> None:
         if args.run_gap < 30:
             raise SystemExit("--run-gap must be at least 30 seconds")
         failed = 0
+        first = True          # spike alerts and the status line: first executed scan only
         for i in range(args.runs):
             if i:
                 time.sleep(args.run_gap)
             print(f"[info] run {i + 1}/{args.runs}")
             try:
-                # spike alerts (6h + micro) only on the first scan of a launch
-                run_cycle(db, args.dry_run, watchlist, spikes_on=(i == 0))
+                if run_cycle(db, args.dry_run, watchlist, spikes_on=first, notify=first):
+                    first = False
             except Exception as e:
                 failed += 1
                 print(f"[warn] run {i + 1} failed: {e}")
