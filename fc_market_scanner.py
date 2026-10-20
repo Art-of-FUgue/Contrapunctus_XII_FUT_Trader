@@ -361,7 +361,7 @@ def build_cycles(items) -> list[dict]:
     lines = [f"Dip → spike inside {CYCLE_HOURS} h · profit after 5% EA tax ≥{CYCLE_MIN_NET_PCT:.0f}%", ""]
     for c, cy in items:
         lines.append(f"🔁 `{cy['net']:+.1f}%` net · buy **{k(cy['buy'])}** → sell **{k(cy['sell'])}** "
-                     f"{link(c)} {c.rating} {c.kind}")
+                     f"{link(c)} {c.kind}")
         lines.append(f"low <t:{int(cy['buy_ts'])}:t> · high <t:{int(cy['sell_ts'])}:t> · now {k(c.price)}")
     e = {"title": f"🔁 Round trips (dip → spike) · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0xF1C40F,
@@ -433,7 +433,7 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
     for c, d in items:
         tag = " 🔁" if c.card_id in auto else ""
         lines.append(f"## {k(c.price)} · {link(c)} · {c.kind}{tag}")
-        lines.append(f"📉 `{d['pct']:+.1f}%` · {c.rating} · {d['why']}")
+        lines.append(f"📉 `{d['pct']:+.1f}%` · {d['why']}")
     lines += ["", "🔁 = auto-added after repeated round trips"]
     e = {"title": f"👁 Watchlist dips · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
@@ -691,7 +691,7 @@ def build_dips(items) -> list[dict]:
         lines = [f"**{k(lo)} – {k(hi)}**"]
         for c, s, pct in band:
             lines.append(f"## {k(c.price)} · {link(c)} · {c.kind}")
-            lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · {c.rating} · vs {k(s['ref'])} {COMPARE_HOURS}h ago")
+            lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} {COMPARE_HOURS}h ago")
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
         lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
@@ -713,7 +713,7 @@ def build_spikes(items) -> list[dict]:
     for c, s, pct in items:
         verdict = ("well above usual – sell" if c.price > s["usual"] * 1.3
                    else "above usual – sell")
-        lines.append(f"🔵 `▲{pct:.0f}%` {link(c)} {c.rating} {c.kind} · "
+        lines.append(f"🔵 `▲{pct:.0f}%` {link(c)} {c.kind} · "
                      f"~~{k(s['ref'])}~~ → **{k(c.price)}**")
         lines.append(f"24h high {k(s['high24'])} · **{verdict}**")
     range_label = f" · {k(MIN_PRICE or 15_000)}–{k(MAX_PRICE) if MAX_PRICE else '∞'}"
@@ -734,7 +734,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         spike_items = _limit(sorted(spike_items, key=lambda i: -i[2]))
         lines = [f"{len(spike_items)} card(s) jumped ≥{FLASH_SPIKE_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in spike_items:
-            lines.append(f"⚡ `▲{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
+            lines.append(f"⚡ `▲{pct:.1f}%` **{k(c.price)}** {link(c)} {c.kind}")
             lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}**")
         e = {"title": f"⚡ Micro-Spikes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -749,7 +749,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in dip_items:
             lines.append(f"## ~~{k(f['prev_price'])}~~ → {k(c.price)} · {link(c)} · {c.kind}")
-            lines.append(f"📉 `{pct:.1f}%` · {c.rating}"
+            lines.append(f"📉 `{pct:.1f}%`"
                          + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         e = {"title": f"📉 Micro-Dips · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -764,7 +764,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in crash_items:
             lines.append(f"## ~~{k(f['prev_price'])}~~ → {k(c.price)} · {link(c)} · {c.kind}")
-            lines.append(f"💥 `{pct:.1f}%` · {c.rating}"
+            lines.append(f"💥 `{pct:.1f}%`"
                          + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         e = {"title": f"💥 Price Crashes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -795,7 +795,7 @@ def build_premium_dips(items) -> list[dict]:
         liq_bar = "🔥" * min(max(s["sales_count"] // 3, 1), 5)   # visual liquidity meter
         lines.append(f"## {k(c.price)} · {link(c)} · {c.kind}")
         lines.append(
-            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · {c.rating} · vs median {k(s['sales_median'])}"
+            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · vs median {k(s['sales_median'])}"
         )
         if s.get("score"):
             lines.append(f"↳ {score_text(s)}")
