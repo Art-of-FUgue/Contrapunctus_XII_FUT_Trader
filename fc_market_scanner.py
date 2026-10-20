@@ -432,7 +432,8 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
     lines = []
     for c, d in items:
         tag = " 🔁" if c.card_id in auto else ""
-        lines.append(f"📉 `{d['pct']:+.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}{tag}")
+        lines.append(f"📉 `{d['pct']:+.1f}%` {link(c)} {c.rating} {c.kind}{tag}")
+        lines.append(f"## {k(c.price)}")
         lines.append(f"{d['why']}")
     lines += ["", "🔁 = auto-added after repeated round trips"]
     e = {"title": f"👁 Watchlist dips · {PLATFORM_LABEL}",
@@ -690,8 +691,9 @@ def build_dips(items) -> list[dict]:
             continue
         lines = [f"**{k(lo)} – {k(hi)}**"]
         for c, s, pct in band:
-            lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` **{k(c.price)}** "
+            lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` "
                          f"{link(c)} {c.rating} {c.kind}")
+            lines.append(f"## {k(c.price)}")
             lines.append(f"vs {k(s['ref'])} {COMPARE_HOURS}h ago")
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
@@ -749,8 +751,8 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         dip_items = _limit(sorted(dip_items, key=lambda i: i[2]))   # most negative first
         lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in dip_items:
-            lines.append(f"📉 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** "
+            lines.append(f"📉 `{pct:.1f}%` {link(c)} {c.rating} {c.kind}")
+            lines.append(f"## ~~{k(f['prev_price'])}~~ → {k(c.price)}"
                          + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         e = {"title": f"📉 Micro-Dips · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -764,8 +766,8 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         crash_items = _limit(sorted(crash_items, key=lambda i: i[2]))  # most negative first
         lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
         for c, f, pct in crash_items:
-            lines.append(f"💥 `{pct:.1f}%` **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}** "
+            lines.append(f"💥 `{pct:.1f}%` {link(c)} {c.rating} {c.kind}")
+            lines.append(f"## ~~{k(f['prev_price'])}~~ → {k(c.price)}"
                          + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         e = {"title": f"💥 Price Crashes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
@@ -795,9 +797,10 @@ def build_premium_dips(items) -> list[dict]:
     for c, s in items:
         liq_bar = "🔥" * min(max(s["sales_count"] // 3, 1), 5)   # visual liquidity meter
         lines.append(
-            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` **{k(c.price)}** "
+            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` "
             f"{link(c)} {c.rating} · *{c.kind}*"
         )
+        lines.append(f"## {k(c.price)}")
         lines.append(
             f"vs median {k(s['sales_median'])}"
         )
