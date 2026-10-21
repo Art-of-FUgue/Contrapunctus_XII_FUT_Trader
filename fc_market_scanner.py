@@ -307,7 +307,7 @@ def new_card_ids(db, now: float) -> set[str]:
 
 
 # Dips: a card stays quiet this long after an alert unless it falls further.
-DIP_COOLDOWN_MIN = float(os.environ.get("FC_DIP_COOLDOWN_MIN", "30"))
+DIP_COOLDOWN_MIN = float(os.environ.get("FC_DIP_COOLDOWN_MIN", "15"))
 DIP_REALERT_PCT = 3.0            # ...or its price drops this much below the last alert
 
 
