@@ -16,7 +16,7 @@ jobs:
     timeout-minutes: 17
     env:
       DB_FILE: market_pc.db
-      DATA_BRANCH: data
+      DATA_BRANCH: ${{ github.ref_name == 'main' && 'data' || format('data-{0}', github.ref_name) }}   # other branches get their own DB branch
 
     steps:
       - uses: actions/checkout@v4

@@ -48,6 +48,8 @@ from dataclasses import dataclass
 
 import requests
 
+import sales_model as sm      # sale inference from floor moves + fixed listing durations
+
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -265,6 +267,7 @@ def open_db(path: str) -> sqlite3.Connection:
     db.execute("create table if not exists market_ret(g text, ts real, ret real)")
     db.execute("create index if not exists mx on market_ret(g, ts)")
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
+    sm.init(db)
     db.execute("create table if not exists meta(k text primary key, v text)")
     db.execute("create table if not exists seen(card_id text primary key, first_ts real)")
     db.execute("create table if not exists watch_auto(card_id text primary key, added_ts real)")
@@ -675,6 +678,9 @@ def card_premium_dip_stats(db, card: Card, now: float, mkt_adj: float = 0.0) -> 
     # Mean of the actual traded prices (filtering out stale idle periods)
     sales_avg = int(statistics.mean(sales))
     base = int(statistics.median(sales))         # median is the dip baseline
+    sold = sm.baseline(db, card.card_id, now, PREMIUM_HISTORY_HOURS, SOLD_MIN_N)
+    if sold:                                      # real completed sales beat the floor median
+        base = int(sold)
     if base <= 0:
         return None
 
@@ -687,6 +693,7 @@ def card_premium_dip_stats(db, card: Card, now: float, mkt_adj: float = 0.0) -> 
     return {
         "sales_avg": sales_avg,
         "sales_median": base,
+        "base_kind": "sold" if sold else "median",
         "usual": statistics.median(prices),
         "low": q[0],
         "high": q[2],
@@ -730,7 +737,7 @@ def build_dips(items) -> list[dict]:
         lines = [f"**{k(lo)} – {k(hi)}**"]
         for c, s, pct in band:
             lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
-            lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} {COMPARE_HOURS}h ago{open_link(c)}")
+            lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} {COMPARE_HOURS}h ago{_sell_text(s)}{open_link(c)}")
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
         lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
@@ -834,7 +841,7 @@ def build_premium_dips(items) -> list[dict]:
         liq_bar = "🔥" * min(max(s["sales_count"] // 3, 1), 5)   # visual liquidity meter
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
         lines.append(
-            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · vs median {k(s['sales_median'])}{open_link(c)}"
+            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · vs {s.get('base_kind', 'median')} {k(s['sales_median'])}{_sell_text(s)}{open_link(c)}"
         )
         if s.get("score"):
             lines.append(f"↳ {score_text(s)}")
@@ -891,6 +898,14 @@ def _is_totw_fodder(card: Card) -> bool:
     min-price fluctuation alerts that add noise without actionable signal.
     """
     return _is_totw(card) and card.price < TOTW_MIN_PRICE
+
+
+SOLD_MIN_N = 3                   # inferred sales needed before they replace the floor median
+
+
+def _sell_text(d: dict) -> str:
+    p = d.get("sellp")
+    return f" · {p * 100:.0f}% sell ≤{SCORE_HORIZON}h" if p is not None else ""
 
 
 # ---- market-wide move (peer group) -----------------------------------------
@@ -1196,11 +1211,13 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
             d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(rel), dtype,
                                    time_slot(now))
             d["season"] = season_drift(db, rgroup(c), now, season_cache)
+            d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
             log_outcome(db, c, dtype, rel, d.get("mkt", 0.0), now)
     for c, d in premium_dips:
         d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(d["dip_pct"]), "prem",
                                time_slot(now))
         d["season"] = season_drift(db, rgroup(c), now, season_cache)
+        d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
         log_outcome(db, c, "prem", d["dip_pct"], d.get("mkt", 0.0), now)
     db.commit()
 
@@ -1330,6 +1347,9 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
+        found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards], now)
+        if found:
+            print(f"[info] inferred {found} listing(s) gone (sold or expired)")
         resolve_outcomes(db, now)
         last_ts = get_meta(db, "dyn_ts")
         if last_ts:
