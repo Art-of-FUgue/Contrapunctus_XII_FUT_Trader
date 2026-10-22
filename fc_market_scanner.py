@@ -830,7 +830,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
 
 
 def build_premium_dips(items) -> list[dict]:
-    """Dedicated embed for Icon / Hero dip opportunities.
+    """Dedicated embed for premium-list dip opportunities (Icons/Heroes and pricey promo cards).
 
     Each entry already passed the 24 h median + liquidity gate in
     card_premium_dip_stats(), so everything shown here is a real signal.
@@ -853,7 +853,7 @@ def build_premium_dips(items) -> list[dict]:
             lines.append(f"↳ {score_text(s)}")
     lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
     e = {
-        "title": f"💎 Premium Dips (Icon / Hero) · {PLATFORM_LABEL}",
+        "title": f"💎 Premium Dips · {PLATFORM_LABEL}",
         "description": "\n".join(lines),
         "color": 0x8E44AD,
         "footer": {"text": (
@@ -890,6 +890,20 @@ def _is_premium(card: Card) -> bool:
     """True for Icons and Heroes (matched on words in the rarity name)."""
     kind = card.kind.lower()
     return any(word in kind for word in PREMIUM_WORDS)
+
+
+# Premium list: Icons/Heroes (and their holos) above PREMIUM_ICON_HERO_MIN, plus any other
+# special card (promo, TOTW ... and their holos) above PREMIUM_PROMO_MIN. These cards get the
+# sale-based premium dip detector only and are left out of the other dip posts.
+PREMIUM_ICON_HERO_MIN = parse_price(os.environ.get("FC_PREMIUM_ICON_HERO_MIN", 100_000))
+PREMIUM_PROMO_MIN = parse_price(os.environ.get("FC_PREMIUM_PROMO_MIN", 500_000))
+
+
+def _in_premium_list(card: Card, usual: float | None = None) -> bool:
+    """Judged on the higher of the current price and its 24 h median, so a card that
+    dips below the threshold stays in the premium list instead of dropping out of it."""
+    floor = PREMIUM_ICON_HERO_MIN if _is_premium(card) else PREMIUM_PROMO_MIN
+    return max(card.price, usual or 0) >= floor
 
 
 def _is_totw(card: Card) -> bool:
@@ -1165,13 +1179,14 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         if cy:
             cycles.append((c, cy))
 
-        if _is_premium(c):
+        in_premium = _in_premium_list(c, (stats.get(c.card_id) or {}).get("usual"))
+        if in_premium:
             # ── premium path: dedicated dip detector (24 h, liquidity-gated) ─
             ps = card_premium_dip_stats(db, c, now, adj24.get(rgroup(c), 0.0))
             if ps is not None:
                 premium_dips.append((c, ps))
 
-            # Premium cards still participate in spike and flash alerts.
+            # Premium cards still participate in spike alerts (flash alerts skip them).
             # They are intentionally excluded from the general dip list to
             # avoid duplicate / lower-quality alerts for the same card.
             s = stats.get(c.card_id)
@@ -1192,7 +1207,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     spikes.append((c, s, pct))
 
         # ── micro-spike / dip / crash (last two snapshots) ───────────────────
-        if c.price >= FLASH_MIN_PRICE:
+        if c.price >= FLASH_MIN_PRICE and not in_premium:
             f = card_flash_stats(db, c)
             if f and f["prev_price"] > 0:
                 pct = (c.price - f["prev_price"]) / f["prev_price"] * 100
@@ -1237,7 +1252,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         + (build_cycles(_cyc) if run_cycles else [])
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
-        + build_premium_dips(premium_dips)    # 💎 Icon / Hero dips
+        + build_premium_dips(premium_dips)    # 💎 premium dips
     )
 
     # ── watchlist: posts only when a watched card dips again ─────────────────
