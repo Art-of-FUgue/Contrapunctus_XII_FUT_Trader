@@ -77,7 +77,7 @@ PREMIUM_WORDS = ("icon", "hero")
 # 24 h window: enough history without diluting recent price moves
 PREMIUM_HISTORY_HOURS = 24
 # A premium dip must be this deep vs the 24 h median to be worth alerting
-PREMIUM_DIP_MIN_PCT = 8.0
+PREMIUM_DIP_MIN_PCT = 10.0
 # Liquidity gate: at least this many consecutive-snapshot price changes in 24 h
 # (proxy for active trading – icons that don't move are untradeable at the dip)
 PREMIUM_MIN_PRICE_CHANGES = 4
@@ -782,7 +782,7 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
 PREMIUM_SALE_WINDOW_H = 96       # 4 days of sales
 PREMIUM_HALFLIFE_H = 24          # newer sales count more
 PREMIUM_MIN_SALES = 4            # sales in the window before this rule applies
-PREMIUM_SOLD_MIN_DIP = 10.0      # % below fair value
+PREMIUM_SOLD_MIN_DIP = PREMIUM_DIP_MIN_PCT   # % below fair value (same 10% floor as the fallback rule)
 PREMIUM_SIGMA_K = 2.0            # ...and at least this many sale-price spreads deep
 PREMIUM_MIN_NET = 5.0            # % profit after tax if resold at fair value
 PREMIUM_MIN_P3 = 0.25            # chance of a sale within 3 h (from the card's sale rate)
