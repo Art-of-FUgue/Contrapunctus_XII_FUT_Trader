@@ -568,10 +568,54 @@ OWNED_MIN_NET = float(os.environ.get("FC_OWNED_MIN_NET", "10"))    # % profit af
 OWNED_MIN_FAIR = float(os.environ.get("FC_OWNED_MIN_FAIR", "8"))   # % above the 4-day sold fair value
 
 
+PURCHASED_PROBLEMS: list[str] = []      # entries that matched no card / several cards
+_ALIASES = {"icon": "base icon", "hero": "base hero", "totw": "team of the week",
+            "dfg": "destined for glory", "fs": "future stars", "sp": "star performer",
+            "sf": "squad foundations"}
+
+
+def _norm(t: str) -> str:
+    import unicodedata
+    t = unicodedata.normalize("NFKD", str(t)).encode("ascii", "ignore").decode().lower()
+    return " ".join(t.replace(",", " ").replace("|", " ").replace("-", " ").split())
+
+
+def resolve_card(query: str) -> tuple[str | None, str]:
+    """'Mbappe destined for glory', 'ronaldo icon holo', 'x totw 91' -> (card id, '') or
+    (None, reason). Every word must appear in 'name promo [holo] rating'; 'holo' picks the
+    holographic card, otherwise the normal one is preferred."""
+    players, holo = _load_players(), _load_holo(_load_players())
+    q = _norm(query)
+    want_holo = any(w in ("holo", "holographic") for w in q.split())
+    toks = []
+    for w in q.split():
+        if w in ("holo", "holographic"):
+            continue
+        toks += _ALIASES.get(w, w).split()
+    if not toks:
+        return None, "empty"
+    hits = []
+    for eid, row in players.items():
+        hay = _norm(f"{row['commonName']} {row['cardName']} {row['rarityName']} {row['overall']}")
+        if all(t in hay for t in toks):
+            hits.append((eid, row, eid in holo or bool(row.get("holographicType"))))
+    pool = [h for h in hits if h[2] == want_holo] or ([] if want_holo else hits)
+    if len(pool) == 1:
+        return str(pool[0][0]), ""
+    if not pool:
+        return None, "no card found" + (" (no holo version)" if want_holo and hits else "")
+    pool.sort(key=lambda h: -h[1]["overall"])
+    cands = ", ".join(f"{h[1]['commonName']} {h[1]['overall']} {h[1]['rarityName']}"
+                      f"{' holo' if h[2] else ''}" for h in pool[:5])
+    return None, f"{len(pool)} cards match, add promo/rating/holo: {cands}"
+
+
 def load_purchased(path: str | None = None) -> dict[str, int | None]:
-    """purchased.json: {"<card id>": <buy price or null>, ...}
-    (also accepts a plain list of ids, or {"id": {"price": N}}). Returns {id: price|None}."""
+    """purchased.json: {"<card id or name + promo>": <buy price or null>, ...}, e.g.
+    {"Mbappe destined for glory": "180k", "Ronaldo icon holo": null, "67146440": 150000}.
+    Also accepts a plain list, or {"x": {"price": N}}. Returns {card id: price|None}."""
     path = path or PURCHASED_FILE
+    PURCHASED_PROBLEMS.clear()
     if not os.path.exists(path):
         return {}
     try:
@@ -579,17 +623,27 @@ def load_purchased(path: str | None = None) -> dict[str, int | None]:
             raw = json.load(f)
     except ValueError as e:
         print(f"[warn] purchased.json is not valid JSON, ignored: {e}")
+        PURCHASED_PROBLEMS.append(f"file is not valid JSON: {e}")
         return {}
     items = raw.items() if isinstance(raw, dict) else [(i, None) for i in raw]
     out: dict[str, int | None] = {}
-    for cid, v in items:
+    for key, v in items:
         if isinstance(v, dict):
             v = v.get("price")
         try:
-            out[str(cid)] = int(float(str(v).lower().replace("k", "e3"))) if v else None
+            price = int(float(str(v).lower().replace("k", "e3").replace("m", "e6"))) if v else None
         except ValueError:
-            out[str(cid)] = None
-    print(f"[info] purchased list: {len(out)} card(s)")
+            price = None
+        key = str(key).strip()
+        if key.isdigit():
+            cid = key
+        else:
+            cid, why = resolve_card(key)
+            if not cid:
+                PURCHASED_PROBLEMS.append(f"“{key}”: {why}")
+                continue
+        out[cid] = price
+    print(f"[info] purchased list: {len(out)} card(s), {len(PURCHASED_PROBLEMS)} problem(s)")
     return out
 
 
@@ -1493,6 +1547,13 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
             return False
         register_cards(db, _load_players().keys(), now)
         embeds = scan(db, cards, now, watchlist, spikes_on, purchased=purchased)   # judge against history first
+        sig = "\n".join(PURCHASED_PROBLEMS)                 # tell you once about unusable entries
+        if sig != (get_meta(db, "purchased_warn") or ""):
+            if sig:
+                embeds.append({"title": "⚠️ purchased.json: fix these entries",
+                               "description": "\n".join("• " + x for x in PURCHASED_PROBLEMS),
+                               "color": 0xE67E22})
+            set_meta(db, "purchased_warn", sig)
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
         found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
