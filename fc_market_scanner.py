@@ -564,8 +564,7 @@ def card_flash_stats(db, card: Card):
 
 # ---- purchased list: spike alerts only for cards you hold ------------------------
 PURCHASED_FILE = os.path.join(HERE, "purchased.json")
-OWNED_MIN_NET = float(os.environ.get("FC_OWNED_MIN_NET", "10"))    # % profit after tax vs your buy price
-OWNED_MIN_FAIR = float(os.environ.get("FC_OWNED_MIN_FAIR", "8"))   # % above the 4-day sold fair value
+OWNED_SPIKE_PCT = float(os.environ.get("FC_OWNED_SPIKE_PCT", "15"))   # spike = this % above your buy price
 
 
 PURCHASED_PROBLEMS: list[str] = []      # entries that matched no card / several cards
@@ -648,19 +647,14 @@ def load_purchased(path: str | None = None) -> dict[str, int | None]:
 
 
 def owned_spikes(db, cards_map: dict, purchased: dict, now: float) -> list:
-    """Spike alerts for held cards: net profit vs buy price, or well above sold fair value."""
+    """Held cards whose price is OWNED_SPIKE_PCT or more above the price you paid."""
     out = []
     for cid, buy in purchased.items():
         c = cards_map.get(cid)
-        if not c or c.price <= 0:
-            continue
-        net = (c.price * (1 - EA_TAX) - buy) / buy * 100 if buy else None
-        st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
-        fair = st["fair"] if st and st["n"] >= PREMIUM_MIN_SALES else None
-        over = (c.price - fair) / fair * 100 if fair else None
-        hit_net = net is not None and net >= OWNED_MIN_NET
-        hit_fair = over is not None and over >= OWNED_MIN_FAIR
-        if not (hit_net or hit_fair):
+        if not c or c.price <= 0 or not buy:
+            continue                                  # not listed, or no buy price given
+        up = (c.price - buy) / buy * 100
+        if up < OWNED_SPIKE_PCT:
             continue
         row = db.execute("select price from alerts where card_id=? and kind='owned' and ts>=? "
                          "order by ts desc limit 1",
@@ -668,7 +662,8 @@ def owned_spikes(db, cards_map: dict, purchased: dict, now: float) -> list:
         if row and c.price < row[0] * (1 + DIP_REALERT_PCT / 100):
             continue
         db.execute("insert into alerts values (?,?,?,?)", (cid, "owned", now, c.price))
-        out.append((c, {"buy": buy, "net": net, "fair": fair, "over": over}))
+        net = (c.price * (1 - EA_TAX) - buy) / buy * 100
+        out.append((c, {"buy": buy, "up": up, "net": net}))
     db.commit()
     return out
 
@@ -676,19 +671,16 @@ def owned_spikes(db, cards_map: dict, purchased: dict, now: float) -> list:
 def build_owned_spikes(items) -> list[dict]:
     if not items:
         return []
-    items = sorted(items, key=lambda i: -(i[1]["net"] if i[1]["net"] is not None else i[1]["over"]))
+    items = sorted(items, key=lambda i: -i[1]["up"])
     lines = []
     for c, d in items:
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
-        bits = []
-        if d["net"] is not None:
-            bits.append(f"net `{d['net']:+.1f}%` vs bought {k(d['buy'])}")
-        if d["over"] is not None:
-            bits.append(f"`{d['over']:+.1f}%` vs sold {k(d['fair'])}")
-        lines.append("🚀 " + " · ".join(bits) + open_link(c))
+        lines.append(f"🚀 `{d['up']:+.1f}%` vs bought {k(d['buy'])} · net after tax "
+                     f"`{d['net']:+.1f}%`{open_link(c)}")
     e = {"title": f"💰 Your cards spiked · {PLATFORM_LABEL}", "description": "\n".join(lines),
          "color": 0x2ECC71,
-         "footer": {"text": "Net = profit after 5% EA tax if sold at the current floor"}}
+         "footer": {"text": f"Spike = {OWNED_SPIKE_PCT:.0f}%+ above your buy price · "
+                            "net = after 5% EA tax at the current floor"}}
     if items[0][0].image_url:
         e["thumbnail"] = {"url": items[0][0].image_url}
     return [e]
@@ -1013,7 +1005,6 @@ def build_premium_dips(items) -> list[dict]:
         "",
     ]
     for c, s in items:
-        liq_bar = "🔥" * min(max(s["sales_count"] // 3, 1), 5)   # visual liquidity meter
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
         lines.append(
             f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
