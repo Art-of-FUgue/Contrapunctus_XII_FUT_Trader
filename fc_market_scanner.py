@@ -128,6 +128,7 @@ FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as m
 FLASH_DIP_PCT = 8.0              # drop between last two snapshots to count as micro-dip
 FLASH_CRASH_PCT = 12.0           # drop threshold that escalates a micro-dip to a crash
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
+FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "5"))   # reference = median price of the last N minutes
 
 # ---- watchlist -------------------------------------------------------------
 WATCHLIST_FILE = os.path.join(HERE, "watchlist.json")   # auto-loaded if it exists
@@ -446,7 +447,7 @@ def watch_dip(db, card: Card, now: float):
     if f and f["prev_price"] > 0:
         pct = (card.price - f["prev_price"]) / f["prev_price"] * 100
         if pct <= -FLASH_DIP_PCT and (best is None or pct < best[0]):
-            best = (pct, f"vs {k(f['prev_price'])} last scan", f["prev_price"])
+            best = (pct, f"vs {k(f['prev_price'])} 5 min ago", f["prev_price"])
     if not best:
         return None
     row = db.execute(
@@ -544,22 +545,22 @@ def history_rows(db, card_id: str, since: float) -> list[tuple[float, int]]:
     return old + raw
 
 
-def card_flash_stats(db, card: Card):
-    """Return the previous scan's price and timestamp, or None.
-
-    Used for micro-spike / crash detection: compares only the last two
-    consecutive snapshots, so alerts fire within one scan interval (~15 min)
-    without needing COMPARE_HOURS of history.
-    """
-    # scan() runs BEFORE the current prices are saved, so the newest saved row
-    # is the previous scan, which is the baseline to compare against.
+def card_flash_stats(db, card: Card, now: float | None = None):
+    """Reference price for micro-dip / crash detection: the median of the snapshots from the
+    last FLASH_WINDOW_MIN minutes (or the newest one if it is older than that), so a crash
+    that happens in two steps still adds up. scan() runs BEFORE the current prices are
+    saved, so these rows are all earlier scans."""
+    now = time.time() if now is None else now
     rows = db.execute(
-        "select ts, price from prices where card_id=? order by ts desc limit 1",
-        (card.card_id,)).fetchall()
+        "select ts, price from prices where card_id=? and ts>=? order by ts desc",
+        (card.card_id, now - FLASH_WINDOW_MIN * 60)).fetchall()
+    if not rows:
+        rows = db.execute(
+            "select ts, price from prices where card_id=? order by ts desc limit 1",
+            (card.card_id,)).fetchall()
     if not rows:
         return None
-    prev_ts, prev_price = rows[0]
-    return {"prev_price": prev_price, "prev_ts": prev_ts}
+    return {"prev_price": statistics.median(p for _, p in rows), "prev_ts": rows[0][0]}
 
 
 # ---- purchased list: spike alerts only for cards you hold ------------------------
@@ -944,21 +945,21 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
 
     if spike_items:
         spike_items = _limit(sorted(spike_items, key=lambda i: -i[2]))
-        lines = [f"{len(spike_items)} card(s) jumped ≥{FLASH_SPIKE_PCT:.0f}% in the last scan (~15 min)", ""]
+        lines = [f"{len(spike_items)} card(s) jumped ≥{FLASH_SPIKE_PCT:.0f}% in the last {FLASH_WINDOW_MIN:g} min", ""]
         for c, f, pct in spike_items:
             lines.append(f"⚡ `▲{pct:.1f}%` **{k(c.price)}** {link(c)} {c.kind}")
             lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}**")
         e = {"title": f"⚡ Micro-Spikes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0xF1C40F,
-             "footer": {"text": "Micro-spike (last scan delta)"}}
+             "footer": {"text": "Micro-spike (vs last 5 min)"}}
         if spike_items[0][0].image_url:
             e["thumbnail"] = {"url": spike_items[0][0].image_url}
         embeds.append(e)
 
     if dip_items:
         dip_items = _limit(sorted(dip_items, key=lambda i: i[2]))   # most negative first
-        lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last scan (~15 min)", ""]
+        lines = [f"{len(dip_items)} card(s) dipped ≥{FLASH_DIP_PCT:.0f}% in the last {FLASH_WINDOW_MIN:g} min", ""]
         for c, f, pct in dip_items:
             lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
             lines.append(f"📉 `{pct:.1f}%`{open_link(c)}"
@@ -966,14 +967,14 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         e = {"title": f"📉 Micro-Dips · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0x1ABC9C,
-             "footer": {"text": f"Micro-dip ({FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}% drop, last scan delta)"}}
+             "footer": {"text": f"Micro-dip ({FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}% drop, vs last 5 min)"}}
         if dip_items[0][0].image_url:
             e["thumbnail"] = {"url": dip_items[0][0].image_url}
         embeds.append(e)
 
     if crash_items:
         crash_items = _limit(sorted(crash_items, key=lambda i: i[2]))  # most negative first
-        lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last scan (~15 min)", ""]
+        lines = [f"{len(crash_items)} card(s) crashed ≥{FLASH_CRASH_PCT:.0f}% in the last {FLASH_WINDOW_MIN:g} min", ""]
         for c, f, pct in crash_items:
             lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
             lines.append(f"💥 `{pct:.1f}%`{open_link(c)}"
@@ -981,7 +982,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         e = {"title": f"💥 Price Crashes · {PLATFORM_LABEL}",
              "description": "\n".join(lines),
              "color": 0xE74C3C,
-             "footer": {"text": "Crash (last scan delta)"}}
+             "footer": {"text": "Crash (vs last 5 min)"}}
         if crash_items[0][0].image_url:
             e["thumbnail"] = {"url": crash_items[0][0].image_url}
         embeds.append(e)
