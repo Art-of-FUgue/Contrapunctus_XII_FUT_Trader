@@ -1,10 +1,10 @@
 """
 EA FC market scanner: finds price dips on special cards and posts them to a Discord webhook.
 
-Alert types (each title names the period it compares against):
+Alert types (one post per criterion; inside it cards are grouped by version: Icon, Hero, TOTW,
+holo ...; each title names the period it compares against):
     📉 Dip Alert         · vs 6 h ago        regular cards, price down >=8% vs the 6 h reference
-    ⚡ Quick Dip          · vs 5 min ago      drop of 8-12% against the last 5 minutes
-    💥 Sharp Crash        · vs 5 min ago      drop of 12%+ against the last 5 minutes
+    ⚡ Fast Drop          · vs 5 min ago      down 8%+ against the last 5 minutes (💥 = 12%+)
     💎 Premium Dip        · vs 4-day sold     Icons/Heroes/pricey promo cards vs real sale prices
                                               (thin cards: vs 24 h median)
     🔁 Round Trip         · within 24 h       a card that dipped then recovered (flip profit)
@@ -105,6 +105,37 @@ MAX_PRICE = parse_price(os.environ.get("FC_MAX_PRICE", None))  # None = no upper
 TOTW_MIN_PRICE = 15_000
 # fut.gg's rarity name is "Team of the week" (lower-case w), so match loosely.
 
+DIP_MIN_PCT = 8.0
+# Liquidity gate: at least this many consecutive-snapshot price changes in 24 h
+# (proxy for active trading – icons that don't move are untradeable at the dip)
+PREMIUM_MIN_PRICE_CHANGES = 4
+# Minimum snapshots required in the 24 h window for the liquidity check
+PREMIUM_MIN_SNAPSHOTS_24H = 8
+
+def parse_price(val: str | int | float | None) -> int | None:
+    """Parse an integer or shorthand price string ('15k', '1.5M') into an int."""
+    if val is None or val == "" or str(val).strip().lower() in ("none", "0", "unlimited"):
+        return None
+    if isinstance(val, (int, float)):
+        return int(val)
+    s = str(val).strip().lower().replace(",", "")
+    if s.endswith("m"):
+        return int(float(s[:-1]) * 1_000_000)
+    if s.endswith("k"):
+        return int(float(s[:-1]) * 1_000)
+    return int(float(s))
+
+
+# Price range for cards of interest (set via FC_MIN_PRICE / FC_MAX_PRICE or --min-price / --max-price)
+# Cards outside this range are ignored for alerts. Supports e.g. "15k", "1.5M", 50000.
+MIN_PRICE = parse_price(os.environ.get("FC_MIN_PRICE", 15_000))
+MAX_PRICE = parse_price(os.environ.get("FC_MAX_PRICE", None))  # None = no upper bound
+
+# ---- TOTW fodder filter ----------------------------------------------------
+# TOTW cards below this price produce noisy min-price fluctuations → skip them
+TOTW_MIN_PRICE = 15_000
+# fut.gg's rarity name is "Team of the week" (lower-case w), so match loosely.
+
 DIP_BANDS = [
     (15_000, 100_000),
     (100_000, 500_000),
@@ -114,7 +145,7 @@ DIP_BANDS = [
 DIP_MIN_PCT = 8.0                # drop vs COMPARE_HOURS ago
 SPIKE_BAND = (20_000, 950_000)
 SPIKE_MIN_PCT = 8.0              # jump vs COMPARE_HOURS ago
-MAX_LINES = int(os.environ.get("FC_MAX_LINES", 16))   # per embed (0 = unlimited)
+MAX_LINES = int(os.environ.get("FC_MAX_LINES", 16))   # per card-version group (0 = unlimited)
 
 def _limit(items: list) -> list:
     """Limit the number of cards shown per embed/section, or return all if MAX_LINES <= 0."""
@@ -898,29 +929,48 @@ def open_link(c: Card) -> str:
     return f" · [open]({c.url})" if c.url else ""
 
 
+def _version_order(kind: str):
+    """Icons first, then Heroes, then other promos; normal before holo within a promo."""
+    base = kind.replace(" 🃏 Holo", "")
+    return (0 if "Icon" in base else 1 if "Hero" in base else 2, base, "Holo" in kind)
+
+
+def by_version(items) -> list:
+    """Group (card, ...) items by card version (promo + holo), in a fixed order."""
+    groups: dict[str, list] = {}
+    for it in items:
+        groups.setdefault(it[0].kind, []).append(it)
+    return [(kind, groups[kind]) for kind in sorted(groups, key=_version_order)]
+
+
+def _group_header(kind: str, n: int) -> str:
+    return f"**__{kind}__** · {n}"
+
+
+
 def build_dips(items) -> list[dict]:
-    embeds = []
-    for lo, hi in DIP_BANDS:
-        band = _limit(sorted((i for i in items if lo <= i[0].price < hi),
-                             key=lambda i: _score_key(i[1], i[2])))
-        if not band:
-            continue
-        lines = [f"⏱ Compared with the price **{COMPARE_HOURS} h ago** · **{k(lo)} – {k(hi)}**"]
-        for c, s, pct in band:
-            lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
+    """One post for the 6 h criterion, grouped by card version (Icon, Hero, TOTW, holo ...)."""
+    if not items:
+        return []
+    lines = [f"⏱ Compared with the price **{COMPARE_HOURS} h ago**"]
+    first = None
+    for kind, grp in by_version(items):
+        grp = _limit(sorted(grp, key=lambda i: _score_key(i[1], i[2])))
+        lines += ["", _group_header(kind, len(grp))]
+        for c, s, pct in grp:
+            first = first or c
+            lines.append(f"### {k(c.price)} · {c.name}")
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} **{COMPARE_HOURS} h ago**{_sell_text(s)}{open_link(c)}")
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
-        lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
-        e = {"title": f"📉 Dip Alert · vs {COMPARE_HOURS} h ago · {PLATFORM_LABEL}",
-             "description": "\n".join(lines),
-             "color": 0x2ECC71,
-             "footer": {"text": f"Dip Alert · compared with {COMPARE_HOURS} h ago"}}
-        if band[0][0].image_url:
-            e["thumbnail"] = {"url": band[0][0].image_url}
-        embeds.append(e)
-    return embeds
-
+    lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12% below"]
+    e = {"title": f"📉 Dip Alert · vs {COMPARE_HOURS} h ago · {PLATFORM_LABEL}",
+         "description": "\n".join(lines),
+         "color": 0x2ECC71,
+         "footer": {"text": f"Dip Alert · compared with {COMPARE_HOURS} h ago"}}
+    if first and first.image_url:
+        e["thumbnail"] = {"url": first.image_url}
+    return [e]
 
 def build_spikes(items) -> list[dict]:
     items = _limit(sorted(items, key=lambda i: -i[2]))
@@ -944,80 +994,70 @@ def build_spikes(items) -> list[dict]:
 
 
 def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
-    """Embeds for micro-spikes, micro-dips, and crashes detected between the last two scans."""
+    """5-minute criterion: quick spikes, and quick dips + sharp crashes together, each grouped
+    by card version. (Spikes are off unless FC_SPIKE_ALERTS=1.)"""
     embeds = []
+    w = f"{FLASH_WINDOW_MIN:g} min ago"
 
     if spike_items:
-        spike_items = _limit(sorted(spike_items, key=lambda i: -i[2]))
-        lines = [f"⏱ {len(spike_items)} card(s) up ≥{FLASH_SPIKE_PCT:.0f}% vs **{FLASH_WINDOW_MIN:g} min ago**", ""]
-        for c, f, pct in spike_items:
-            lines.append(f"⚡ `▲{pct:.1f}%` **{k(c.price)}** {link(c)} {c.kind}")
-            lines.append(f"~~{k(f['prev_price'])}~~ → **{k(c.price)}**")
-        e = {"title": f"⚡ Quick Spike · vs {FLASH_WINDOW_MIN:g} min ago · {PLATFORM_LABEL}",
-             "description": "\n".join(lines),
-             "color": 0xF1C40F,
-             "footer": {"text": f"Quick Spike · compared with {FLASH_WINDOW_MIN:g} min ago"}}
+        lines = [f"⏱ Up ≥{FLASH_SPIKE_PCT:.0f}% vs **{w}**"]
+        for kind, grp in by_version(spike_items):
+            grp = _limit(sorted(grp, key=lambda i: -i[2]))
+            lines += ["", _group_header(kind, len(grp))]
+            for c, f, pct in grp:
+                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name}")
+                lines.append(f"⚡ `▲{pct:.1f}%` · vs **{w}**{open_link(c)}")
+        e = {"title": f"⚡ Quick Spike · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
+             "color": 0xF1C40F, "footer": {"text": f"Quick Spike · compared with {w}"}}
         if spike_items[0][0].image_url:
             e["thumbnail"] = {"url": spike_items[0][0].image_url}
         embeds.append(e)
 
-    if dip_items:
-        dip_items = _limit(sorted(dip_items, key=lambda i: i[2]))   # most negative first
-        lines = [f"⏱ {len(dip_items)} card(s) down {FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}% vs **{FLASH_WINDOW_MIN:g} min ago**", ""]
-        for c, f, pct in dip_items:
-            lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
-            lines.append(f"📉 `{pct:.1f}%` · vs **{FLASH_WINDOW_MIN:g} min ago**{open_link(c)}"
-                         + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
-        e = {"title": f"⚡ Quick Dip · vs {FLASH_WINDOW_MIN:g} min ago · {PLATFORM_LABEL}",
-             "description": "\n".join(lines),
-             "color": 0x1ABC9C,
-             "footer": {"text": f"Quick Dip · {FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}% drop vs {FLASH_WINDOW_MIN:g} min ago"}}
-        if dip_items[0][0].image_url:
-            e["thumbnail"] = {"url": dip_items[0][0].image_url}
+    drops = list(dip_items) + list(crash_items)
+    if drops:
+        lines = [f"⏱ Down ≥{FLASH_DIP_PCT:.0f}% vs **{w}**"]
+        for kind, grp in by_version(drops):
+            grp = _limit(sorted(grp, key=lambda i: i[2]))             # deepest first
+            lines += ["", _group_header(kind, len(grp))]
+            for c, f, pct in grp:
+                icon = "💥" if pct <= -FLASH_CRASH_PCT else "📉"
+                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name}")
+                lines.append(f"{icon} `{pct:.1f}%` · vs **{w}**{open_link(c)}"
+                             + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
+        lines += ["", f"💥 {FLASH_CRASH_PCT:.0f}%+ · 📉 {FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}%"]
+        e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
+             "color": 0xE74C3C if crash_items else 0x1ABC9C,
+             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below the price {w}"}}
+        img = next((c.image_url for c, _, _ in drops if c.image_url), None)
+        if img:
+            e["thumbnail"] = {"url": img}
         embeds.append(e)
-
-    if crash_items:
-        crash_items = _limit(sorted(crash_items, key=lambda i: i[2]))  # most negative first
-        lines = [f"⏱ {len(crash_items)} card(s) down ≥{FLASH_CRASH_PCT:.0f}% vs **{FLASH_WINDOW_MIN:g} min ago**", ""]
-        for c, f, pct in crash_items:
-            lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
-            lines.append(f"💥 `{pct:.1f}%` · vs **{FLASH_WINDOW_MIN:g} min ago**{open_link(c)}"
-                         + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
-        e = {"title": f"💥 Sharp Crash · vs {FLASH_WINDOW_MIN:g} min ago · {PLATFORM_LABEL}",
-             "description": "\n".join(lines),
-             "color": 0xE74C3C,
-             "footer": {"text": f"Sharp Crash · {FLASH_CRASH_PCT:.0f}%+ drop vs {FLASH_WINDOW_MIN:g} min ago"}}
-        if crash_items[0][0].image_url:
-            e["thumbnail"] = {"url": crash_items[0][0].image_url}
-        embeds.append(e)
-
     return embeds
 
-
 def build_premium_dips(items) -> list[dict]:
-    """Dedicated embed for premium-list dip opportunities (Icons/Heroes and pricey promo cards).
-
-    Each entry already passed the 24 h median + liquidity gate in
-    card_premium_dip_stats(), so everything shown here is a real signal.
-    """
-    items = _limit(sorted(items, key=lambda i: _score_key(i[1], i[1]["dip_pct"])))
+    """Premium-list dips (Icons/Heroes and pricey promo cards) against real sold prices,
+    grouped by card version. Each entry already passed card_premium_dip_stats()."""
     if not items:
         return []
     lines = [
-        f"⏱ {len(items)} premium card(s) below fair value · compared with **{PREMIUM_SALE_WINDOW_H // 24}-day sold prices**",
+        f"⏱ Compared with **{PREMIUM_SALE_WINDOW_H // 24}-day sold prices**",
         f"(cards with under {PREMIUM_MIN_SALES} sales: vs **{PREMIUM_HISTORY_HOURS} h median** floor price)",
-        "",
     ]
-    for c, s in items:
-        lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
-        lines.append(
-            f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
-            f"vs {_premium_ref(s)} {k(s['sales_median'])}"
-            f"{' · net %+.1f%%' % s['net'] if 'net' in s else ''}"
-            f"{_sell_text(s)}{open_link(c)}"
-        )
-        if s.get("score"):
-            lines.append(f"↳ {score_text(s)}")
+    first = None
+    for kind, grp in by_version(items):
+        grp = _limit(sorted(grp, key=lambda i: _score_key(i[1], i[1]["dip_pct"])))
+        lines += ["", _group_header(kind, len(grp))]
+        for c, s in grp:
+            first = first or c
+            lines.append(f"### {k(c.price)} · {c.name}")
+            lines.append(
+                f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
+                f"vs {_premium_ref(s)} {k(s['sales_median'])}"
+                f"{' · net %+.1f%%' % s['net'] if 'net' in s else ''}"
+                f"{_sell_text(s)}{open_link(c)}"
+            )
+            if s.get("score"):
+                lines.append(f"↳ {score_text(s)}")
     legend = []
     if any("net" in x for _, x in items):
         legend.append("vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%")
@@ -1033,10 +1073,9 @@ def build_premium_dips(items) -> list[dict]:
             f"≥{PREMIUM_SOLD_MIN_DIP:.0f}% and ≥{PREMIUM_SIGMA_K:.0f} spreads deep"
         )},
     }
-    if items[0][0].image_url:
-        e["thumbnail"] = {"url": items[0][0].image_url}
+    if first and first.image_url:
+        e["thumbnail"] = {"url": first.image_url}
     return [e]
-
 
 def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dict]:
     """Embed showing current price for every card on the watchlist."""
