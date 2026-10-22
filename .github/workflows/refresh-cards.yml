@@ -1,9 +1,12 @@
 name: Refresh card list
 
-# Started by userscript/fut_card_refresh.user.js after it uploads bundle.json to the
-# "card-data" branch (or start it by hand in the Actions tab). Rebuilds players.json and
-# holo_ids.json, commits them to main, and posts the new cards to Discord.
+# Runs when bundle.json (made by userscript/fut_card_refresh.user.js) is committed to main.
+# Rebuilds players.json and holo_ids.json, commits them to main, deletes bundle.json again,
+# and posts the new cards to Discord.
 on:
+  push:
+    branches: [main]
+    paths: [bundle.json]
   workflow_dispatch:
 
 concurrency: refresh-cards
@@ -26,10 +29,9 @@ jobs:
 
       - run: pip install requests
 
-      - name: Get the bundle
+      - name: Unpack the bundle
         run: |
-          git fetch --depth=1 origin card-data
-          git show FETCH_HEAD:bundle.json > bundle.json
+          test -f bundle.json || { echo "bundle.json not found in the repo root"; exit 1; }
           python apply_bundle.py bundle.json
 
       - name: Rebuild
@@ -43,21 +45,21 @@ jobs:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
       - name: Commit to main
-        if: steps.report.outcome == 'success'
+        if: always() && hashFiles('bundle.json') != ''
         run: |
           git config user.name "fc-scanner"
           git config user.email "fc-scanner@users.noreply.github.com"
-          git add players.json holo_ids.json
+          git rm -q --cached bundle.json                 # the bundle is not kept in the repo
+          if [ "${{ steps.report.outcome }}" = "success" ]; then
+            git add players.json holo_ids.json
+          fi
           if git diff --cached --quiet; then
-            echo "players.json / holo_ids.json unchanged"
+            echo "nothing to commit"
           else
-            git commit -m "Refresh card list (userscript bundle)"
+            git commit -m "Refresh card list (bundle.json)"
+            git pull --rebase --autostash -q origin main
             git push origin HEAD:main
           fi
-
-      - name: Remove the carrier branch
-        if: always()
-        run: git push origin --delete card-data || true
 
       - name: Fail if the rebuild was refused
         if: steps.report.outcome != 'success'

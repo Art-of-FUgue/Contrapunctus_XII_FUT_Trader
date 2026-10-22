@@ -2,14 +2,10 @@
 // @name         FUT card list refresh
 // @namespace    contrapunctus-xii
 // @version      1.0
-// @description  One click on fut.gg: saves the special-card list pages, looks up holo/untradable info, uploads it to GitHub and starts the rebuild workflow.
+// @description  One click on fut.gg: saves the special-card list pages, looks up holo/untradable info and downloads bundle.json (commit it to the repo; GitHub rebuilds the card list).
 // @match        https://www.fut.gg/*
 // @grant        GM_xmlhttpRequest
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @grant        GM_registerMenuCommand
 // @connect      r2.fut.gg
-// @connect      api.github.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -17,9 +13,6 @@
   "use strict";
 
   // ---- settings -------------------------------------------------------------
-  const REPO = "Art-of-FUgue/Contrapunctus_XII_FUT_Trader";
-  const BRANCH_DATA = "card-data";          // temporary branch that carries the bundle
-  const WORKFLOW = "refresh-cards.yml";
   const LIST_URL = "https://www.fut.gg/api/fut/players/v2/27/?page={p}&quality_id=10&response_format=card-image";
   const DEF_URL = "https://www.fut.gg/api/fut/players/v2/definition-data/?game=27&slugs=";
   const R2 = "https://r2.fut.gg/27/";
@@ -79,39 +72,6 @@
     return JSON.parse(r.text);
   }
 
-  function b64(str) {                              // utf-8 safe, no stack overflow on big input
-    const bytes = new TextEncoder().encode(str);
-    let bin = "";
-    for (let i = 0; i < bytes.length; i += 0x8000) {
-      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-    }
-    return btoa(bin);
-  }
-
-  async function token() {
-    let t = GM_getValue("gh_token", "");
-    if (!t) {
-      t = (prompt("GitHub fine-grained token for " + REPO +
-        "\n(Contents: read/write and Actions: read/write). Stored only in Tampermonkey.") || "").trim();
-      if (t) GM_setValue("gh_token", t);
-    }
-    if (!t) throw new Error("no GitHub token set");
-    return t;
-  }
-
-  async function gh(method, path, tok, body) {
-    const r = await gm(method, "https://api.github.com/repos/" + REPO + path, {
-      headers: {
-        Authorization: "Bearer " + tok, Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28", "Content-Type": "application/json",
-      },
-      body: body ? JSON.stringify(body) : undefined,
-    });
-    let json = null;
-    try { json = r.text ? JSON.parse(r.text) : null; } catch (_) { /* empty body */ }
-    return { status: r.status, json, text: r.text };
-  }
-
   // ---- the three stages ----------------------------------------------------------
   async function fetchListPages() {
     const pages = [];
@@ -157,29 +117,15 @@
     return out;
   }
 
-  async function upload(bundle) {
-    const tok = await token();
-    // 1. make sure the carrier branch exists (created from main)
-    let ref = await gh("GET", "/git/ref/heads/" + BRANCH_DATA, tok);
-    if (ref.status === 401 || ref.status === 403) { GM_setValue("gh_token", ""); throw new Error("GitHub rejected the token (" + ref.status + "): re-run to enter a new one"); }
-    if (ref.status === 404) {
-      const main = await gh("GET", "/git/ref/heads/main", tok);
-      if (main.status !== 200) throw new Error("cannot read main: " + main.status);
-      const mk = await gh("POST", "/git/refs", tok, { ref: "refs/heads/" + BRANCH_DATA, sha: main.json.object.sha });
-      if (mk.status !== 201) throw new Error("cannot create branch: " + mk.status + " " + mk.text.slice(0, 150));
-    }
-    // 2. put bundle.json on it
-    const cur = await gh("GET", "/contents/bundle.json?ref=" + BRANCH_DATA, tok);
-    const put = await gh("PUT", "/contents/bundle.json", tok, {
-      message: "card refresh bundle " + new Date().toISOString(),
-      content: b64(JSON.stringify(bundle)), branch: BRANCH_DATA,
-      ...(cur.status === 200 && cur.json.sha ? { sha: cur.json.sha } : {}),
-    });
-    if (put.status !== 200 && put.status !== 201) throw new Error("upload failed: " + put.status + " " + put.text.slice(0, 200));
-    // 3. start the rebuild
-    const run = await gh("POST", "/actions/workflows/" + WORKFLOW + "/dispatches", tok, { ref: "main" });
-    if (run.status !== 204) throw new Error("uploaded, but could not start the workflow (" + run.status +
-      "): start 'Refresh card list' by hand in GitHub Actions. " + run.text.slice(0, 120));
+  function download(bundle) {
+    const blob = new Blob([JSON.stringify(bundle)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "bundle.json";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    return blob.size;
   }
 
   async function refresh() {
@@ -201,9 +147,11 @@
       const defs = await lookupDefs(ids);
       log(`lookup done: ${defs.length} records`);
 
-      log("4/4 uploading to GitHub and starting the rebuild…");
-      await upload({ created: new Date().toISOString(), pages, defs, asked: ids.length });
-      log("✅ Done. The rebuild runs in GitHub Actions (~1 min); the result is posted to Discord.");
+      log("4/4 saving bundle.json…");
+      const size = download({ created: new Date().toISOString(), pages, defs, asked: ids.length });
+      log(`✅ bundle.json downloaded (${(size / 1048576).toFixed(1)} MB).\n` +
+          "Now upload it to the repo root on github.com (Add file → Upload files → Commit to main). " +
+          "GitHub rebuilds the card list and posts the new cards to Discord.");
     } catch (e) {
       log("❌ " + e.message);
     } finally {
@@ -212,9 +160,4 @@
   }
 
   btn.addEventListener("click", refresh);
-  GM_registerMenuCommand("Set GitHub token", () => {
-    const t = (prompt("GitHub fine-grained token (Contents + Actions read/write):") || "").trim();
-    if (t) { GM_setValue("gh_token", t); alert("Saved."); }
-  });
-  GM_registerMenuCommand("Clear GitHub token", () => { GM_setValue("gh_token", ""); alert("Cleared."); });
 })();
