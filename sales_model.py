@@ -24,6 +24,7 @@ LISTING_HOURS = tuple(float(x) for x in os.environ.get("FC_LISTING_HOURS", "1,3,
 TOL = float(os.environ.get("FC_SALE_TOL_SECONDS", "90"))   # extra slack around each duration
 MAX_GAP = 1200                     # seconds; a longer gap between scans resets a card's state
 STACK_MAX = 12
+MAX_WINDOW = 1800                  # seconds; wider age windows are not used for sell chance
 KEEP_DAYS = 14
 
 
@@ -52,10 +53,11 @@ def step(state, price: int, now: float):
     events are (kind, price, age_lo, age_hi) for the listing that vanished.
     """
     if not state or now - state["ts"] > MAX_GAP:
-        return {"p": price, "ts": now, "stack": [{"p": price, "t0": None, "lo": None}]}, []
+        return {"p": price, "ts": now,
+                "stack": [{"p": price, "t0": None, "lo": None, "seen": now}]}, []
     stack, events, prev, s = state["stack"], [], state["p"], state["ts"]
     if price < prev:                                    # a new, cheaper listing appeared
-        stack.append({"p": price, "t0": now, "lo": s})
+        stack.append({"p": price, "t0": now, "lo": s, "seen": now})
     elif price > prev:                                  # the floor listing vanished
         top = stack.pop() if stack else None
         if top and top["p"] == prev:
@@ -66,10 +68,17 @@ def step(state, price: int, now: float):
             else:
                 events.append(("inherited", prev, None, None))
         while stack and stack[-1]["p"] < price:         # hidden listings that also went
-            stack.pop()
+            h = stack.pop()
+            if h["t0"] is not None and h.get("seen") is not None:
+                # it was last seen as the floor at h["seen"] and is gone by now: its
+                # age window is wide, but if no duration fits it, it was sold
+                age_lo = max(0.0, h["seen"] - h["t0"])
+                events.append((classify(age_lo, now - h["lo"]), h["p"], age_lo, now - h["lo"]))
         if not stack or stack[-1]["p"] != price:        # new floor we had not seen
-            stack.append({"p": price, "t0": None, "lo": None})
+            stack.append({"p": price, "t0": None, "lo": None, "seen": now})
     del stack[:-STACK_MAX]
+    if stack:
+        stack[-1]["seen"] = now                         # the floor listing is present right now
     return {"p": price, "ts": now, "stack": stack}, events
 
 
@@ -130,6 +139,7 @@ def sell_prob(db, g: str, band: str, horizon_h: float, now: float, min_n: int = 
             f"select kind, age_lo, age_hi from sales_inferred where {where} and ts>=?",
             (*args, now - KEEP_DAYS * 86400)).fetchall()
         if len(rows) >= min_n:
-            pts = [(((lo + hi) / 2) / 3600, 1 if kind == "sale" else 0) for kind, lo, hi in rows]
+            pts = [(((lo + hi) / 2) / 3600, 1 if kind == "sale" else 0)
+                   for kind, lo, hi in rows if hi - lo <= MAX_WINDOW]   # wide windows are too vague
             return _km(pts, horizon_h)
     return None
