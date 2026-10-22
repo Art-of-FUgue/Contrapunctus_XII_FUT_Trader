@@ -53,9 +53,26 @@ def step(state, price: int, now: float):
     events are (kind, price, age_lo, age_hi) for the listing that vanished.
     """
     if not state or now - state["ts"] > MAX_GAP:
-        return {"p": price, "ts": now,
-                "stack": [{"p": price, "t0": None, "lo": None, "seen": now}]}, []
+        stack = [{"p": price, "t0": None, "lo": None, "seen": now}] if price > 0 else []
+        return {"p": price, "ts": now, "stack": stack}, []
     stack, events, prev, s = state["stack"], [], state["p"], state["ts"]
+    if price <= 0:                                      # nothing is listed any more
+        if prev > 0:                                    # every known listing is gone
+            top = stack.pop() if stack else None
+            if top and top["p"] == prev and top["t0"] is not None:
+                age_lo = max(0.0, s - top["t0"])
+                events.append((classify(age_lo, now - top["lo"]), prev, age_lo, now - top["lo"]))
+            elif top and top["p"] == prev:
+                events.append(("inherited", prev, None, None))
+            while stack:
+                h = stack.pop()
+                if h["t0"] is not None and h.get("seen") is not None:
+                    age_lo = max(0.0, h["seen"] - h["t0"])
+                    events.append((classify(age_lo, now - h["lo"]), h["p"], age_lo, now - h["lo"]))
+        return {"p": 0, "ts": now, "stack": []}, events
+    if prev <= 0:                                       # empty market: this is a new listing
+        stack = [{"p": price, "t0": now, "lo": s, "seen": now}]
+        return {"p": price, "ts": now, "stack": stack}, events
     if price < prev:                                    # a new, cheaper listing appeared
         stack.append({"p": price, "t0": now, "lo": s, "seen": now})
     elif price > prev:                                  # the floor listing vanished
@@ -82,8 +99,9 @@ def step(state, price: int, now: float):
     return {"p": price, "ts": now, "stack": stack}, events
 
 
-def update(db, rows, now: float) -> int:
-    """rows: iterable of (card_id, price, group, band). Records inferred sales."""
+def update(db, rows, now: float, band_fn=None) -> int:
+    """rows: iterable of (card_id, price, group, band); price 0 means nothing is listed
+    (band may be None, then band_fn(price of the gone listing) is used)."""
     n = 0
     for cid, price, g, band in rows:
         r = db.execute("select state from floor_state where card_id=?", (cid,)).fetchone()
@@ -92,7 +110,7 @@ def update(db, rows, now: float) -> int:
         for kind, p, lo, hi in events:
             if kind in ("sale", "ambiguous"):
                 db.execute("insert into sales_inferred values (?,?,?,?,?,?,?,?)",
-                           (cid, now, p, g, band, kind, lo, hi))
+                           (cid, now, p, g, band or (band_fn(p) if band_fn else ""), kind, lo, hi))
                 n += 1
     db.execute("delete from sales_inferred where ts < ?", (now - KEEP_DAYS * 86400,))
     db.commit()

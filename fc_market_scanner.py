@@ -131,6 +131,7 @@ FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
 
 # ---- watchlist -------------------------------------------------------------
 WATCHLIST_FILE = os.path.join(HERE, "watchlist.json")   # auto-loaded if it exists
+EMPTY_MARKET: list = []   # known cards with nothing listed right now (price 0)
 UNLISTED: list = []   # watchlist cards with no current listing (filled by fetch_market)
 
 
@@ -233,12 +234,17 @@ def fetch_market(watchlist: set[str] | None = None, last_hash: str | None = None
         raise RuntimeError(f"{len(prices)} prices vs {len(ids)} ids - files out of sync")
     cards = []
     UNLISTED.clear()
+    EMPTY_MARKET.clear()
     watch = watchlist or set()
     for ea_id, price in zip(ids, prices):
         meta = players.get(ea_id)
         if meta is None:
             continue                                 # unknown card
         watched = str(ea_id) in watch
+        if price <= 0:
+            EMPTY_MARKET.append(Card(str(ea_id), meta["commonName"], meta["overall"],
+                                     meta["rarityName"] + (" 🃏 Holo" if ea_id in holo else ""),
+                                     0, "", ""))     # nothing listed: lets the sales model see listings vanish
         if price < MIN_TRACK_PRICE and not watched:
             continue                                 # no price or cheap
         kind = meta["rarityName"] + (" 🃏 Holo" if ea_id in holo else "")
@@ -1347,7 +1353,9 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
-        found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards], now)
+        found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
+                          + [(c.card_id, 0, rgroup(c), None) for c in EMPTY_MARKET],
+                          now, band_fn=price_band)
         if found:
             print(f"[info] inferred {found} listing(s) gone (sold or expired)")
         resolve_outcomes(db, now)
