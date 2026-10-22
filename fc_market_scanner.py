@@ -562,6 +562,84 @@ def card_flash_stats(db, card: Card):
     return {"prev_price": prev_price, "prev_ts": prev_ts}
 
 
+# ---- purchased list: spike alerts only for cards you hold ------------------------
+PURCHASED_FILE = os.path.join(HERE, "purchased.json")
+OWNED_MIN_NET = float(os.environ.get("FC_OWNED_MIN_NET", "10"))    # % profit after tax vs your buy price
+OWNED_MIN_FAIR = float(os.environ.get("FC_OWNED_MIN_FAIR", "8"))   # % above the 4-day sold fair value
+
+
+def load_purchased(path: str | None = None) -> dict[str, int | None]:
+    """purchased.json: {"<card id>": <buy price or null>, ...}
+    (also accepts a plain list of ids, or {"id": {"price": N}}). Returns {id: price|None}."""
+    path = path or PURCHASED_FILE
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except ValueError as e:
+        print(f"[warn] purchased.json is not valid JSON, ignored: {e}")
+        return {}
+    items = raw.items() if isinstance(raw, dict) else [(i, None) for i in raw]
+    out: dict[str, int | None] = {}
+    for cid, v in items:
+        if isinstance(v, dict):
+            v = v.get("price")
+        try:
+            out[str(cid)] = int(float(str(v).lower().replace("k", "e3"))) if v else None
+        except ValueError:
+            out[str(cid)] = None
+    print(f"[info] purchased list: {len(out)} card(s)")
+    return out
+
+
+def owned_spikes(db, cards_map: dict, purchased: dict, now: float) -> list:
+    """Spike alerts for held cards: net profit vs buy price, or well above sold fair value."""
+    out = []
+    for cid, buy in purchased.items():
+        c = cards_map.get(cid)
+        if not c or c.price <= 0:
+            continue
+        net = (c.price * (1 - EA_TAX) - buy) / buy * 100 if buy else None
+        st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+        fair = st["fair"] if st and st["n"] >= PREMIUM_MIN_SALES else None
+        over = (c.price - fair) / fair * 100 if fair else None
+        hit_net = net is not None and net >= OWNED_MIN_NET
+        hit_fair = over is not None and over >= OWNED_MIN_FAIR
+        if not (hit_net or hit_fair):
+            continue
+        row = db.execute("select price from alerts where card_id=? and kind='owned' and ts>=? "
+                         "order by ts desc limit 1",
+                         (cid, now - float(DIP_COOLDOWN_MIN) * 60)).fetchone()
+        if row and c.price < row[0] * (1 + DIP_REALERT_PCT / 100):
+            continue
+        db.execute("insert into alerts values (?,?,?,?)", (cid, "owned", now, c.price))
+        out.append((c, {"buy": buy, "net": net, "fair": fair, "over": over}))
+    db.commit()
+    return out
+
+
+def build_owned_spikes(items) -> list[dict]:
+    if not items:
+        return []
+    items = sorted(items, key=lambda i: -(i[1]["net"] if i[1]["net"] is not None else i[1]["over"]))
+    lines = []
+    for c, d in items:
+        lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
+        bits = []
+        if d["net"] is not None:
+            bits.append(f"net `{d['net']:+.1f}%` vs bought {k(d['buy'])}")
+        if d["over"] is not None:
+            bits.append(f"`{d['over']:+.1f}%` vs sold {k(d['fair'])}")
+        lines.append("🚀 " + " · ".join(bits) + open_link(c))
+    e = {"title": f"💰 Your cards spiked · {PLATFORM_LABEL}", "description": "\n".join(lines),
+         "color": 0x2ECC71,
+         "footer": {"text": "Net = profit after 5% EA tax if sold at the current floor"}}
+    if items[0][0].image_url:
+        e["thumbnail"] = {"url": items[0][0].image_url}
+    return [e]
+
+
 def load_watchlist(path: str | None) -> set[str]:
     """Load a JSON file containing a list of EA card IDs to always track.
 
@@ -1176,7 +1254,8 @@ def _mkt_text(d: dict) -> str:
 
 
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
-         spikes_on: bool = True, run_cycles: bool = True) -> list[dict]:
+         spikes_on: bool = True, run_cycles: bool = True,
+         purchased: dict | None = None) -> list[dict]:
     dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
     cycles: list = []
     spikes_on = spikes_on and SPIKE_ALERTS
@@ -1301,6 +1380,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     # ── watchlist: posts only when a watched card dips again ─────────────────
     embeds += build_watch_dips(watch_hits, auto)
 
+    # ── purchased list: spikes only for cards you hold ───────────────────────
+    if purchased:
+        embeds += build_owned_spikes(owned_spikes(db, cards_map, purchased, now))
+
     return embeds
 
 
@@ -1403,12 +1486,13 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         watchlist = (watchlist or set()) | auto_watch_ids(db, now)   # manual + auto
-        cards = fetch_market(watchlist, last_hash=get_meta(db, "dyn_hash"))
+        purchased = load_purchased()                  # re-read each scan: edits apply at once
+        cards = fetch_market(watchlist | set(purchased), last_hash=get_meta(db, "dyn_hash"))
         if cards is None:
             print(f"[info] {time.strftime('%H:%M:%S', time.gmtime())} UTC feed unchanged, skipped")
             return False
         register_cards(db, _load_players().keys(), now)
-        embeds = scan(db, cards, now, watchlist, spikes_on)   # judge against history first
+        embeds = scan(db, cards, now, watchlist, spikes_on, purchased=purchased)   # judge against history first
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
         found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
