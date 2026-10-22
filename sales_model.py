@@ -17,6 +17,7 @@ listing was created since the previous scan. Listings that were already there
 State per card is a small stack of known listings, cheapest on top.
 """
 import json
+import math
 import os
 import statistics
 
@@ -161,3 +162,32 @@ def sell_prob(db, g: str, band: str, horizon_h: float, now: float, min_n: int = 
                    for kind, lo, hi in rows if hi - lo <= MAX_WINDOW]   # wide windows are too vague
             return _km(pts, horizon_h)
     return None
+
+
+def _weighted_median(values, weights) -> float:
+    pairs = sorted(zip(values, weights))
+    half = sum(w for _, w in pairs) / 2
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= half:
+            return v
+    return pairs[-1][0]
+
+
+def sale_stats(db, card_id: str, now: float, window_h: float = 96, halflife_h: float = 24):
+    """Fair value and noise from the real (inferred) sales in the last window_h hours."""
+    rows = db.execute("select ts, price from sales_inferred where card_id=? and kind='sale' "
+                      "and ts>=? order by ts", (card_id, now - window_h * 3600)).fetchall()
+    if not rows:
+        return None
+    prices = [p for _, p in rows]
+    weights = [0.5 ** ((now - t) / 3600 / halflife_h) for t, _ in rows]
+    med = statistics.median(prices)
+    mad = statistics.median(abs(p - med) for p in prices)
+    n24 = sum(1 for t, _ in rows if t >= now - 24 * 3600)
+    rate = n24 / 24                                    # sales per hour (a lower bound)
+    return {"n": len(rows), "n24": n24, "fair": _weighted_median(prices, weights),
+            "sigma_pct": 1.4826 * mad / med * 100 if med else 0.0,
+            "last3": statistics.median(prices[-3:]),
+            "p3": 1 - math.exp(-3 * rate)}

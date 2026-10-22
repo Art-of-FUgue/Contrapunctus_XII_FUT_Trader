@@ -513,9 +513,9 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 
 
 # Raw snapshots are kept RAW_HOURS; older data is squeezed into one median per
-# card per hour and kept until RETENTION_HOURS (3 days).
+# card per hour and kept until RETENTION_HOURS (5 days).
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
-RETENTION_HOURS = 72
+RETENTION_HOURS = 120
 OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
 
 
@@ -652,6 +652,35 @@ def card_stats(db, card: Card, now: float, history_hours: int = HISTORY_HOURS):
     }
 
 
+# Premium dips judged on real (inferred) sales: fair value = recency-weighted median of the
+# sold prices over PREMIUM_SALE_WINDOW_H.
+PREMIUM_SALE_WINDOW_H = 96       # 4 days of sales
+PREMIUM_HALFLIFE_H = 24          # newer sales count more
+PREMIUM_MIN_SALES = 4            # sales in the window before this rule applies
+PREMIUM_SOLD_MIN_DIP = 10.0      # % below fair value
+PREMIUM_SIGMA_K = 2.0            # ...and at least this many sale-price spreads deep
+PREMIUM_MIN_NET = 5.0            # % profit after tax if resold at fair value
+PREMIUM_MIN_P3 = 0.25            # chance of a sale within 3 h (from the card's sale rate)
+
+
+def _premium_from_sales(card, st: dict):
+    fair = st["fair"]
+    if fair <= 0:
+        return None
+    dip = (fair - card.price) / fair * 100
+    if dip < max(PREMIUM_SOLD_MIN_DIP, PREMIUM_SIGMA_K * st["sigma_pct"]):
+        return None
+    if st["n"] >= 6 and (fair - st["last3"]) / fair * 100 >= 0.5 * dip:
+        return None                                  # recent sales already fell: market sliding
+    net = (fair * (1 - EA_TAX) - card.price) / card.price * 100
+    if net < PREMIUM_MIN_NET or st["p3"] < PREMIUM_MIN_P3:
+        return None
+    return {"sales_avg": int(fair), "sales_median": int(fair), "base_kind": "sold",
+            "usual": fair, "low": card.price, "high": fair, "dip_pct": -dip, "raw_pct": -dip,
+            "mkt": 0.0, "sales_count": st["n24"], "snapshots": 0,
+            "net": net, "p3": st["p3"], "sellp": st["p3"], "rank": net * st["p3"]}
+
+
 def card_premium_dip_stats(db, card: Card, now: float, mkt_adj: float = 0.0) -> dict | None:
     """Specialised stats for premium-card dip detection using recent sales history.
 
@@ -665,6 +694,11 @@ def card_premium_dip_stats(db, card: Card, now: float, mkt_adj: float = 0.0) -> 
 
     Returns a dict with stats, or None if any gate fails.
     """
+    st = sm.sale_stats(db, card.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+    if st and st["n"] >= PREMIUM_MIN_SALES:
+        return _premium_from_sales(card, st)     # enough real sales: judge on them alone
+
+    # fallback while sales are thin: floor-based rule over 24 h
     rows = db.execute(
         "select ts, price from prices where card_id=? and ts>=? order by ts",
         (card.card_id, now - PREMIUM_HISTORY_HOURS * 3600)).fetchall()
@@ -684,9 +718,7 @@ def card_premium_dip_stats(db, card: Card, now: float, mkt_adj: float = 0.0) -> 
     # Mean of the actual traded prices (filtering out stale idle periods)
     sales_avg = int(statistics.mean(sales))
     base = int(statistics.median(sales))         # median is the dip baseline
-    sold = sm.baseline(db, card.card_id, now, PREMIUM_HISTORY_HOURS, SOLD_MIN_N)
-    if sold:                                      # real completed sales beat the floor median
-        base = int(sold)
+    sold = None
     if base <= 0:
         return None
 
@@ -723,6 +755,10 @@ def k(n: float) -> str:
 def tier_emoji(pct: float) -> str:
     a = abs(pct)
     return "🔴" if a >= 15 else "🟠" if a >= 12 else "🟢"
+
+
+def net_tier(net: float) -> str:
+    return "🔴" if net >= 20 else "🟠" if net >= 10 else "🟢"
 
 
 def link(c: Card) -> str:
@@ -839,26 +875,30 @@ def build_premium_dips(items) -> list[dict]:
     if not items:
         return []
     lines = [
-        f"{len(items)} premium card(s) dipped ≥{PREMIUM_DIP_MIN_PCT:.0f}% vs 24 h median",
-        f"Liquidity gate: ≥{PREMIUM_MIN_PRICE_CHANGES} price changes in last 24 h · {PREMIUM_HISTORY_HOURS}h window",
+        f"{len(items)} premium card(s) below fair value",
+        f"Fair value = {PREMIUM_SALE_WINDOW_H // 24}-day weighted median of real sales "
+        f"(≥{PREMIUM_MIN_SALES} sales; thinner cards use the 24 h floor median)",
         "",
     ]
     for c, s in items:
         liq_bar = "🔥" * min(max(s["sales_count"] // 3, 1), 5)   # visual liquidity meter
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
         lines.append(
-            f"{tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · vs {s.get('base_kind', 'median')} {k(s['sales_median'])}{_sell_text(s)}{open_link(c)}"
+            f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
+            f"vs {s.get('base_kind', 'median')} {k(s['sales_median'])}"
+            f"{' · net %+.1f%%' % s['net'] if 'net' in s else ''}"
+            f"{_sell_text(s)}{open_link(c)}"
         )
         if s.get("score"):
             lines.append(f"↳ {score_text(s)}")
-    lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12%"]
+    lines += ["", "🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%"]
     e = {
         "title": f"💎 Premium Dips · {PLATFORM_LABEL}",
         "description": "\n".join(lines),
         "color": 0x8E44AD,
         "footer": {"text": (
-            f"24 h median · ≥{PREMIUM_DIP_MIN_PCT:.0f}% dip · "
-            f"≥{PREMIUM_MIN_PRICE_CHANGES} price changes"
+            f"Net = profit after 5% tax if resold at fair value · "
+            f"≥{PREMIUM_SOLD_MIN_DIP:.0f}% and ≥{PREMIUM_SIGMA_K:.0f} spreads deep"
         )},
     }
     if items[0][0].image_url:
@@ -1122,6 +1162,8 @@ def score_text(d: dict) -> str:
 
 
 def _score_key(d: dict, depth: float):
+    if d.get("rank") is not None:                         # sale-based premium dips
+        return (-1, -d["rank"])
     sc = d.get("score")
     if sc and sc["status"] == "ok":
         return (0, -(sc["mean"] + (d.get("season") or 0.0)))   # expected net incl. seasonal drift
@@ -1238,7 +1280,8 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(d["dip_pct"]), "prem",
                                time_slot(now))
         d["season"] = season_drift(db, rgroup(c), now, season_cache)
-        d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
+        if d.get("sellp") is None:
+            d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
         log_outcome(db, c, "prem", d["dip_pct"], d.get("mkt", 0.0), now)
     db.commit()
 
