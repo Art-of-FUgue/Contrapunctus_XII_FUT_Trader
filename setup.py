@@ -14,7 +14,8 @@ What it does, in order
                fresh id list inside. Paste that script into the browser console on any
                fut.gg page; it downloads defs_01.json; put that file in defs/.
   4. Builds players.json and holo_ids.json (via build_players.py) from pages/ + defs/.
-  5. Prints a status summary and the next step.
+  5. Prints a status summary, the NEW CARDS added by this run (compared with the previous
+     players.json / holo_ids.json), and the next step.
 
 Run it once to get the console script, then again after saving defs_01.json.
 
@@ -143,6 +144,62 @@ def coverage_report(candidates: list[int], defs: list[str]) -> None:
                   f"https://www.fut.gg{r.get('url', '')}")
 
 
+def snapshot() -> dict:
+    """What players.json / holo_ids.json hold right now (to diff against after a rebuild)."""
+    rows, holo = {}, set()
+    try:
+        with open(bp.OUT, encoding="utf-8") as f:
+            rows = {r["eaId"]: r for r in json.load(f)["data"]}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        with open(bp.HOLO_OUT, encoding="utf-8") as f:
+            holo = {int(i) for i in json.load(f)}
+    except (OSError, ValueError, TypeError):
+        pass
+    return {"rows": rows, "holo": holo, "existed": bool(rows)}
+
+
+def new_cards_report(before: dict) -> None:
+    """List every card that is in the rebuilt files but was not in the previous ones."""
+    try:
+        with open(bp.OUT, encoding="utf-8") as f:
+            now_rows = {r["eaId"]: r for r in json.load(f)["data"]}
+        with open(bp.HOLO_OUT, encoding="utf-8") as f:
+            now_holo = {int(i) for i in json.load(f)}
+    except (OSError, ValueError, KeyError, TypeError):
+        return
+    print("\n---- new cards ----")
+    if not before["existed"]:
+        print(f"first build: {len(now_rows)} cards, {len(now_holo)} holo (nothing to compare with)")
+        return
+    new_ids = sorted(set(now_rows) - set(before["rows"]),
+                     key=lambda i: (now_rows[i].get("rarityName") or "", -now_rows[i].get("overall", 0)))
+    gone = set(before["rows"]) - set(now_rows)
+    new_holo_only = sorted((now_holo - before["holo"]) & set(before["rows"]))
+    if len(gone) > max(5, len(before["rows"]) // 20):
+        print(f"!! WARNING: {len(gone)} cards from the previous players.json are missing now. "
+              "pages/ or defs/ is probably incomplete - do NOT commit these files; restore them "
+              "with: git checkout players.json holo_ids.json")
+    if not new_ids and not new_holo_only:
+        print("no new cards since the last run" + (f" ({len(gone)} removed)" if gone else ""))
+        return
+    holo_new = sum(1 for i in new_ids if i in now_holo)
+    print(f"{len(new_ids)} new card(s) ({holo_new} holo)" + (f", {len(gone)} removed" if gone else ""))
+    last = None
+    for i in new_ids:
+        r = now_rows[i]
+        if r.get("rarityName") != last:
+            last = r.get("rarityName")
+            print(f"\n  {last}")
+        print(f"    {r.get('overall', '?'):>3}  {r.get('commonName')}{'  🃏 Holo' if i in now_holo else ''}"
+              f"   (id {i})")
+    if new_holo_only:
+        print(f"\n  existing cards that are now marked holo: {len(new_holo_only)}")
+        for i in new_holo_only:
+            print(f"    {before['rows'][i].get('commonName')} (id {i})")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--download", action="store_true", help="fetch the fut.gg list pages (opt-in)")
@@ -181,8 +238,10 @@ def main() -> None:
               f"{'keeping the existing' if os.path.exists(CONSOLE_JS) else 'no'} holo lookup script")
 
     # 4. build players.json + holo_ids.json
+    before = snapshot()
     print()
     bp.merge()
+    new_cards_report(before)
 
     # 5. coverage report
     coverage_report(candidates, defs)
