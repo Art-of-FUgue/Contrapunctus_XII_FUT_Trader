@@ -1,0 +1,64 @@
+name: Refresh card list
+
+# Started by userscript/fut_card_refresh.user.js after it uploads bundle.json to the
+# "card-data" branch (or start it by hand in the Actions tab). Rebuilds players.json and
+# holo_ids.json, commits them to main, and posts the new cards to Discord.
+on:
+  workflow_dispatch:
+
+concurrency: refresh-cards
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Get the bundle
+        run: |
+          git fetch --depth=1 origin card-data
+          git show FETCH_HEAD:bundle.json > bundle.json
+          python apply_bundle.py bundle.json
+
+      - name: Rebuild
+        run: python setup.py 2>&1 | tee setup_output.txt
+
+      - name: Check and report
+        id: report
+        continue-on-error: true
+        run: python report_refresh.py setup_output.txt
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+      - name: Commit to main
+        if: steps.report.outcome == 'success'
+        run: |
+          git config user.name "fc-scanner"
+          git config user.email "fc-scanner@users.noreply.github.com"
+          git add players.json holo_ids.json
+          if git diff --cached --quiet; then
+            echo "players.json / holo_ids.json unchanged"
+          else
+            git commit -m "Refresh card list (userscript bundle)"
+            git push origin HEAD:main
+          fi
+
+      - name: Remove the carrier branch
+        if: always()
+        run: git push origin --delete card-data || true
+
+      - name: Fail if the rebuild was refused
+        if: steps.report.outcome != 'success'
+        run: exit 1
