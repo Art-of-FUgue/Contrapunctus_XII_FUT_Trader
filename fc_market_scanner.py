@@ -11,7 +11,7 @@ holo ...; each title names the period it compares against):
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
     👁 Watchlist Dip      · vs 6 h / 5 min    watched cards dipping again
     👁 Watchlist Prices   · now               current price of every watched card
-    📊 Market Index       · 4-day trend       whole-market index by segment, posted every 3 h (FC_INDEX_POST_HOURS)
+    📊 Market Index       · 24 h trend        whole-market index by segment, posted every 3 h (FC_INDEX_POST_HOURS)
     (🚀 Rise Alert and ⚡ Quick Spike exist but are off unless FC_SPIKE_ALERTS=1)
 
     fut.gg's data has no holo flag, so holo cards are labelled from holo_ids.json.
@@ -1099,11 +1099,11 @@ def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dic
 
 # ---- market index: how the whole market is moving -------------------------------
 INDEX_POST_HOURS = float(os.environ.get("FC_INDEX_POST_HOURS", "3"))   # 0 = never post the index
-INDEX_DAYS = 4                       # the index is 100 at the start of this window
+INDEX_HOURS = 24                     # the index is 100 at the start of this window
 INDEX_MIN_PRICE = 10_000             # cards cheaper than this are too noisy for the basket
 INDEX_MIN_CARDS = 5                  # a segment needs this many cards in a step to move
 INDEX_SEGMENTS = ["All specials", "Icons", "Heroes", "TOTW", "Other promos", "Holos"]
-INDEX_WINDOWS = [("1 h", 1), ("6 h", 6), ("24 h", 24), ("4 d", INDEX_DAYS * 24)]
+INDEX_WINDOWS = [("1 h", 1), ("6 h", 6), ("12 h", 12), ("24 h", INDEX_HOURS)]
 
 
 def _index_segment(kind: str) -> str:
@@ -1123,10 +1123,10 @@ def market_index(db, now: float) -> dict:
 
     Hourly price per card (median of its snapshots in that hour); each step the segment moves by
     the trimmed mean of its cards' price changes since the previous hour, so cards entering or
-    leaving the basket never make the index jump. 100 = INDEX_DAYS days ago.
+    leaving the basket never make the index jump. 100 = INDEX_HOURS hours ago.
     Returns {"series": {segment: [(hour_ts, value), ...]}, "cards": {segment: n}}.
     """
-    since = now - INDEX_DAYS * 86400
+    since = now - INDEX_HOURS * 3600
     players, holo = _load_players(), _load_holo(_load_players())
     seg_of = {}
     for eid, row in players.items():
@@ -1198,7 +1198,7 @@ def build_market_index(idx: dict, now: float) -> list[dict]:
     series, cards = idx["series"], idx["cards"]
     if not series["All specials"] or series["All specials"][-1][0] - series["All specials"][0][0] < 3 * 3600:
         return []                                         # not enough history yet
-    head = f"{'':13}{'now':>6}" + "".join(f"{n:>8}" for n, _ in INDEX_WINDOWS) + "  trend (4 d)"
+    head = f"{'':13}{'now':>6}" + "".join(f"{n:>8}" for n, _ in INDEX_WINDOWS) + f"  trend ({INDEX_HOURS} h)"
     rows = [head]
     for seg in INDEX_SEGMENTS:
         pts = series[seg]
@@ -1207,18 +1207,19 @@ def build_market_index(idx: dict, now: float) -> list[dict]:
         cells = []
         for _, hrs in INDEX_WINDOWS:
             ch = _index_change(pts, hrs, now)
-            cells.append(f"{'–':>8}" if ch is None else f"{('▲' if ch >= 0 else '▼') + f'{abs(ch):.1f}%':>8}")
+            cells.append(f"{'–':>8}" if ch is None else
+                         f"{('▬' if round(ch, 1) == 0 else '▲' if ch > 0 else '▼') + f'{abs(ch):.1f}%':>8}")
         rows.append(f"{seg:13}{pts[-1][1]:6.1f}" + "".join(cells) + "  " + _spark([v for _, v in pts]))
     allpts = series["All specials"]
-    ch24 = _index_change(allpts, 24, now)
-    mood = "" if ch24 is None else (" 🟢 market rising" if ch24 > 1 else " 🔴 market falling" if ch24 < -1 else " ⚪ market flat")
-    lines = [f"⏱ Index = 100 **{INDEX_DAYS} days ago** · changes over **1 h · 6 h · 24 h · 4 d**{mood}",
+    ch6 = _index_change(allpts, 6, now)
+    mood = "" if ch6 is None else (" 🟢 market rising" if ch6 > 0.5 else " 🔴 market falling" if ch6 < -0.5 else " ⚪ market flat")
+    lines = [f"⏱ Index = 100 **{INDEX_HOURS} h ago** · changes over **1 h · 6 h · 12 h · 24 h**{mood}",
              "```", *rows, "```",
              "Basket: " + " · ".join(f"{seg} {cards[seg]}" for seg in INDEX_SEGMENTS if cards[seg])]
-    return [{"title": f"📊 Market Index · {INDEX_DAYS}-day trend · {PLATFORM_LABEL}",
+    return [{"title": f"📊 Market Index · {INDEX_HOURS} h trend · {PLATFORM_LABEL}",
              "description": "\n".join(lines), "color": 0x3498DB,
              "footer": {"text": "Equal-weighted basket of tracked special cards ≥10k, chained hourly · "
-                                "new cards included from their first price"}}]
+                                "mood = last 6 h"}}]
 
 
 def maybe_post_index(db, now: float, dry_run: bool) -> None:
