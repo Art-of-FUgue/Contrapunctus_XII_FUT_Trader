@@ -959,7 +959,7 @@ def build_dips(items) -> list[dict]:
         lines += ["", _group_header(kind, len(grp))]
         for c, s, pct in grp:
             first = first or c
-            lines.append(f"### {k(c.price)} · {c.name}")
+            lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} **{COMPARE_HOURS} h ago**{_sell_text(s)}{open_link(c)}")
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
@@ -1005,7 +1005,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
             grp = _limit(sorted(grp, key=lambda i: -i[2]))
             lines += ["", _group_header(kind, len(grp))]
             for c, f, pct in grp:
-                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name}")
+                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
                 lines.append(f"⚡ `▲{pct:.1f}%` · vs **{w}**{open_link(c)}")
         e = {"title": f"⚡ Quick Spike · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
              "color": 0xF1C40F, "footer": {"text": f"Quick Spike · compared with {w}"}}
@@ -1021,7 +1021,7 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
             lines += ["", _group_header(kind, len(grp))]
             for c, f, pct in grp:
                 icon = "💥" if pct <= -FLASH_CRASH_PCT else "📉"
-                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name}")
+                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
                 lines.append(f"{icon} `{pct:.1f}%` · vs **{w}**{open_link(c)}"
                              + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
         lines += ["", f"💥 {FLASH_CRASH_PCT:.0f}%+ · 📉 {FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}%"]
@@ -1049,7 +1049,7 @@ def build_premium_dips(items) -> list[dict]:
         lines += ["", _group_header(kind, len(grp))]
         for c, s in grp:
             first = first or c
-            lines.append(f"### {k(c.price)} · {c.name}")
+            lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
             lines.append(
                 f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
                 f"vs {_premium_ref(s)} {k(s['sales_median'])}"
