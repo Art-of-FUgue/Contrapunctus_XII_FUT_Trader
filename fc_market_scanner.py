@@ -11,6 +11,7 @@ holo ...; each title names the period it compares against):
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
     👁 Watchlist Dip      · vs 6 h / 5 min    watched cards dipping again
     👁 Watchlist Prices   · now               current price of every watched card
+    📊 Market Index       · 4-day trend       whole-market index by segment, posted every 3 h (FC_INDEX_POST_HOURS)
     (🚀 Rise Alert and ⚡ Quick Spike exist but are off unless FC_SPIKE_ALERTS=1)
 
     fut.gg's data has no holo flag, so holo cards are labelled from holo_ids.json.
@@ -1096,6 +1097,143 @@ def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dic
     return [e]
 
 
+# ---- market index: how the whole market is moving -------------------------------
+INDEX_POST_HOURS = float(os.environ.get("FC_INDEX_POST_HOURS", "3"))   # 0 = never post the index
+INDEX_DAYS = 4                       # the index is 100 at the start of this window
+INDEX_MIN_PRICE = 10_000             # cards cheaper than this are too noisy for the basket
+INDEX_MIN_CARDS = 5                  # a segment needs this many cards in a step to move
+INDEX_SEGMENTS = ["All specials", "Icons", "Heroes", "TOTW", "Other promos", "Holos"]
+INDEX_WINDOWS = [("1 h", 1), ("6 h", 6), ("24 h", 24), ("4 d", INDEX_DAYS * 24)]
+
+
+def _index_segment(kind: str) -> str:
+    if "Holo" in kind:
+        return "Holos"
+    if "Icon" in kind:
+        return "Icons"
+    if "Hero" in kind:
+        return "Heroes"
+    if "Team of the week" in kind:
+        return "TOTW"
+    return "Other promos"
+
+
+def market_index(db, now: float) -> dict:
+    """Chain-linked, equal-weighted price index per segment, built from the saved history.
+
+    Hourly price per card (median of its snapshots in that hour); each step the segment moves by
+    the trimmed mean of its cards' price changes since the previous hour, so cards entering or
+    leaving the basket never make the index jump. 100 = INDEX_DAYS days ago.
+    Returns {"series": {segment: [(hour_ts, value), ...]}, "cards": {segment: n}}.
+    """
+    since = now - INDEX_DAYS * 86400
+    players, holo = _load_players(), _load_holo(_load_players())
+    seg_of = {}
+    for eid, row in players.items():
+        kind = row["rarityName"] + (" 🃏 Holo" if eid in holo else "")
+        seg_of[str(eid)] = _index_segment(kind)
+
+    per: dict[str, dict[int, list]] = {}                 # card -> hour -> [prices]
+    for cid, h, price in db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts>=?",
+                                    (since - 3600,)):
+        per.setdefault(cid, {}).setdefault(int(h // 3600), []).append(price)
+    raw: dict[str, dict[int, list]] = {}
+    for cid, ts, price in db.execute("select card_id, ts, price from prices where ts>=?", (since - 3600,)):
+        raw.setdefault(cid, {}).setdefault(int(ts // 3600), []).append(price)
+    for cid, hrs in raw.items():                        # raw snapshots win over old hourly medians
+        per.setdefault(cid, {}).update(hrs)
+    px = {cid: {h: statistics.median(v) for h, v in hrs.items()} for cid, hrs in per.items()
+          if cid in seg_of}
+
+    hours = sorted({h for hrs in px.values() for h in hrs})
+    series = {seg: [] for seg in INDEX_SEGMENTS}
+    value = {seg: 100.0 for seg in INDEX_SEGMENTS}
+    for i, h in enumerate(hours):
+        if i:
+            prev = hours[i - 1]
+            rets = {seg: [] for seg in INDEX_SEGMENTS}
+            for cid, hrs in px.items():
+                a, b = hrs.get(prev), hrs.get(h)
+                if a and b and a >= INDEX_MIN_PRICE and b >= INDEX_MIN_PRICE:
+                    r = max(-0.4, min(0.4, b / a - 1))
+                    rets["All specials"].append(r)
+                    rets[seg_of[cid]].append(r)
+            for seg, rs in rets.items():
+                if len(rs) >= INDEX_MIN_CARDS:
+                    rs.sort()
+                    cut = len(rs) // 10                      # drop the top and bottom 10%
+                    rs = rs[cut:len(rs) - cut] or rs
+                    value[seg] *= 1 + statistics.mean(rs)
+        for seg in INDEX_SEGMENTS:
+            series[seg].append((h * 3600, value[seg]))
+    cards = {seg: 0 for seg in INDEX_SEGMENTS}
+    last = hours[-1] if hours else None
+    for cid, hrs in px.items():
+        if last in hrs and hrs[last] >= INDEX_MIN_PRICE:
+            cards["All specials"] += 1
+            cards[seg_of[cid]] += 1
+    return {"series": series, "cards": cards}
+
+
+def _index_change(pts: list, hours: float, now: float):
+    """% change of the index over the last `hours`, or None if the history is too short."""
+    target = now - hours * 3600
+    old = [v for t, v in pts if t <= target]
+    if not old or not pts:
+        return None
+    return (pts[-1][1] / old[-1] - 1) * 100
+
+
+def _spark(vals: list, width: int = 16) -> str:
+    if len(vals) < 2:
+        return ""
+    step = (len(vals) - 1) / (width - 1)
+    pick = [vals[round(i * step)] for i in range(width)]
+    lo, hi = min(pick), max(pick)
+    bars = "▁▂▃▄▅▆▇█"
+    return "".join(bars[round((v - lo) / (hi - lo) * 7)] if hi > lo else bars[3] for v in pick)
+
+
+def build_market_index(idx: dict, now: float) -> list[dict]:
+    series, cards = idx["series"], idx["cards"]
+    if not series["All specials"] or series["All specials"][-1][0] - series["All specials"][0][0] < 3 * 3600:
+        return []                                         # not enough history yet
+    head = f"{'':13}{'now':>6}" + "".join(f"{n:>8}" for n, _ in INDEX_WINDOWS) + "  trend (4 d)"
+    rows = [head]
+    for seg in INDEX_SEGMENTS:
+        pts = series[seg]
+        if not pts:
+            continue
+        cells = []
+        for _, hrs in INDEX_WINDOWS:
+            ch = _index_change(pts, hrs, now)
+            cells.append(f"{'–':>8}" if ch is None else f"{('▲' if ch >= 0 else '▼') + f'{abs(ch):.1f}%':>8}")
+        rows.append(f"{seg:13}{pts[-1][1]:6.1f}" + "".join(cells) + "  " + _spark([v for _, v in pts]))
+    allpts = series["All specials"]
+    ch24 = _index_change(allpts, 24, now)
+    mood = "" if ch24 is None else (" 🟢 market rising" if ch24 > 1 else " 🔴 market falling" if ch24 < -1 else " ⚪ market flat")
+    lines = [f"⏱ Index = 100 **{INDEX_DAYS} days ago** · changes over **1 h · 6 h · 24 h · 4 d**{mood}",
+             "```", *rows, "```",
+             "Basket: " + " · ".join(f"{seg} {cards[seg]}" for seg in INDEX_SEGMENTS if cards[seg])]
+    return [{"title": f"📊 Market Index · {INDEX_DAYS}-day trend · {PLATFORM_LABEL}",
+             "description": "\n".join(lines), "color": 0x3498DB,
+             "footer": {"text": "Equal-weighted basket of tracked special cards ≥10k, chained hourly · "
+                                "new cards included from their first price"}}]
+
+
+def maybe_post_index(db, now: float, dry_run: bool) -> None:
+    """Post the market index every INDEX_POST_HOURS hours."""
+    if INDEX_POST_HOURS <= 0:
+        return
+    last = get_meta(db, "index_post_ts")
+    if last and now - float(last) < INDEX_POST_HOURS * 3600 - 120:
+        return
+    embeds = build_market_index(market_index(db, now), now)
+    if embeds:
+        post(embeds, dry_run)
+        set_meta(db, "index_post_ts", now)
+
+
 # ------------------------------------------------------------------- scan --
 def _is_premium(card: Card) -> bool:
     """True for Icons and Heroes (matched on words in the rarity name)."""
@@ -1595,6 +1733,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
             set_meta(db, "purchased_warn", sig)
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
+        try:
+            maybe_post_index(db, now, dry_run)                 # market index, every few hours
+        except Exception as e:                                 # never let the index break a scan
+            print(f"[warn] market index failed: {e}")
         found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
                           + [(c.card_id, 0, rgroup(c), None) for c in EMPTY_MARKET],
                           now, band_fn=price_band)
