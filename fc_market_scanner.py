@@ -1381,6 +1381,20 @@ def season_drift(db, g: str, now: float, cache: dict, horizon_h: int | None = No
     return total if used else None
 
 
+TIMEZONE = os.environ.get("FC_TIMEZONE", "America/Chicago")   # Austin; shown in notices and logs
+
+
+def local_stamp(ts: float | None = None) -> str:
+    """Clock time like '01:47:02 CDT' in TIMEZONE (UTC if the zone data is missing)."""
+    try:
+        from zoneinfo import ZoneInfo
+        import datetime as _dt
+        return _dt.datetime.fromtimestamp(time.time() if ts is None else ts,
+                                          ZoneInfo(TIMEZONE)).strftime("%H:%M:%S %Z")
+    except Exception:
+        return time.strftime("%H:%M:%S", time.gmtime(ts)) + " UTC"
+
+
 def time_slot(ts: float) -> str:
     t = time.gmtime(ts)
     return ("wkend " if t.tm_wday >= 5 else "wkday ") + ("00-06", "06-12", "12-18", "18-24")[t.tm_hour // 6] + "Z"
@@ -1721,7 +1735,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         purchased = load_purchased()                  # re-read each scan: edits apply at once
         cards = fetch_market(watchlist | set(purchased), last_hash=get_meta(db, "dyn_hash"))
         if cards is None:
-            print(f"[info] {time.strftime('%H:%M:%S', time.gmtime())} UTC feed unchanged, skipped")
+            print(f"[info] {local_stamp()} feed unchanged, skipped")
             return False
         register_cards(db, _load_players().keys(), now)
         embeds = scan(db, cards, now, watchlist, spikes_on, purchased=purchased)   # judge against history first
@@ -1752,13 +1766,13 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
     except Exception as e:
         notice(f"⚠️ {PLATFORM_LABEL} scan failed: {str(e)[:300]}", dry_run)
         raise
-    stamp = time.strftime("%H:%M:%S", time.gmtime())
-    print(f"[info] {stamp} UTC scanned {len(cards)} cards, posted {len(embeds)} embed(s)")
+    stamp = local_stamp()
+    print(f"[info] {stamp} scanned {len(cards)} cards, posted {len(embeds)} embed(s)")
     gap = f" · {fmt_gap(now - prev)} since last scan" if prev else " · first scan"
     via = os.environ.get("GITHUB_EVENT_NAME", "")      # set by GitHub Actions
     via = f" · via {via}" if via else ""
     if notify:
-        notice(f"🔄 {PLATFORM_LABEL} scan ran at {stamp} UTC · {len(cards)} cards · "
+        notice(f"🔄 {PLATFORM_LABEL} scan ran at {stamp} · {len(cards)} cards · "
                f"{len(embeds)} alert embed(s){gap}{via}", dry_run)
     return True
 
