@@ -464,42 +464,67 @@ def auto_watch_ids(db, now: float) -> set[str]:
         "select card_id from watch_auto where added_ts>=?", (now - AUTO_WATCH_DAYS * 86400,))}
 
 
-def watch_dip(db, card: Card, now: float):
-    """Dip rule for a watched card: 6 h dip (median ref) or quick dip vs the last 5 min."""
-    best = None
-    s = card_stats(db, card, now)
-    if s and s["ref"] > 0:
-        pct = (card.price - s["ref"]) / s["ref"] * 100
-        if pct <= -DIP_MIN_PCT:
-            best = (pct, f"vs {k(s['ref'])} **{COMPARE_HOURS} h ago**", s["ref"])
-    f = card_flash_stats(db, card)
+WATCH_PREMIUM_CRASH_PCT = 50.0   # premium watchlist cards: alert on a drop this big within FLASH_WINDOW_MIN
+
+
+def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float = 0.0):
+    """Dip rule for a watched card.
+
+    Regular cards: 6 h dip (median ref) or quick dip vs the last 5 min.
+    Premium cards: the premium rule (4-day sold price, or 24 h median when sales are thin),
+    plus a crash alert when the price falls WATCH_PREMIUM_CRASH_PCT or more within 5 min.
+    """
+    best, kind, extra = None, "watch", ""
+    if premium:
+        ps = card_premium_dip_stats(db, card, now, mkt_adj)
+        if ps:
+            best = (ps["dip_pct"], f"vs {_premium_ref(ps)} {k(ps['sales_median'])}", ps["sales_median"])
+            extra = f" · net {ps['net']:+.1f}%" if "net" in ps else ""
+        flash_pct = WATCH_PREMIUM_CRASH_PCT
+    else:
+        s = card_stats(db, card, now)
+        if s and s["ref"] > 0:
+            pct = (card.price - s["ref"]) / s["ref"] * 100
+            if pct <= -DIP_MIN_PCT:
+                best = (pct, f"vs {k(s['ref'])} **{COMPARE_HOURS} h ago**", s["ref"])
+        flash_pct = FLASH_DIP_PCT
+    f = card_flash_stats(db, card, now)
     if f and f["prev_price"] > 0:
         pct = (card.price - f["prev_price"]) / f["prev_price"] * 100
-        if pct <= -FLASH_DIP_PCT and (best is None or pct < best[0]):
+        if pct <= -flash_pct and (best is None or pct < best[0]):
             best = (pct, f"vs {k(f['prev_price'])} **{FLASH_WINDOW_MIN:g} min ago**", f["prev_price"])
+            extra = ""
+            if premium:
+                kind = "watchcrash"
     if not best:
         return None
+    if kind == "watchcrash":                      # crash: short cooldown, re-alert on a further drop
+        cool, realert = DIP_COOLDOWN_MIN * 60, DIP_REALERT_PCT
+    else:
+        cool, realert = SPIKE_COOLDOWN_HOURS * 3600, SPIKE_REALERT_PCT
     row = db.execute(
-        "select price from alerts where card_id=? and kind='watch' and ts>=? "
-        "order by ts desc limit 1", (card.card_id, now - SPIKE_COOLDOWN_HOURS * 3600)).fetchone()
-    if row and card.price > row[0] * (1 - SPIKE_REALERT_PCT / 100):
+        "select price from alerts where card_id=? and kind=? and ts>=? "
+        "order by ts desc limit 1", (card.card_id, kind, now - cool)).fetchone()
+    if row and card.price > row[0] * (1 - realert / 100):
         return None                               # already posted this dip
-    db.execute("insert into alerts values (?,?,?,?)", (card.card_id, "watch", now, card.price))
+    db.execute("insert into alerts values (?,?,?,?)", (card.card_id, kind, now, card.price))
     db.commit()
-    return {"pct": best[0], "why": best[1], "ref": best[2]}
+    return {"pct": best[0], "why": best[1], "ref": best[2], "extra": extra,
+            "icon": "💥" if kind == "watchcrash" else "📉"}
 
 
 def build_watch_dips(items, auto: set[str]) -> list[dict]:
     items = _limit(sorted(items, key=lambda i: i[1]["pct"]))
     if not items:
         return []
-    lines = []
+    lines = [f"⏱ Regular cards: vs **{COMPARE_HOURS} h ago** · premium cards: vs **{PREMIUM_SALE_WINDOW_H // 24}-day sold** · "
+             f"💥 premium crash ≥{WATCH_PREMIUM_CRASH_PCT:.0f}% vs **{FLASH_WINDOW_MIN:g} min ago**", ""]
     for c, d in items:
         tag = " 🔁" if c.card_id in auto else ""
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}{tag}")
-        lines.append(f"📉 `{d['pct']:+.1f}%` · {d['why']}{open_link(c)}")
+        lines.append(f"{d.get('icon', '📉')} `{d['pct']:+.1f}%` · {d['why']}{d.get('extra', '')}{open_link(c)}")
     lines += ["", "🔁 = auto-added after repeated round trips"]
-    e = {"title": f"👁 Watchlist Dip · vs {COMPARE_HOURS} h / {FLASH_WINDOW_MIN:g} min ago · {PLATFORM_LABEL}",
+    e = {"title": f"👁 Watchlist Dip · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
          "footer": {"text": "Watched cards post only when they dip again"}}
     if items[0][0].image_url:
@@ -1523,7 +1548,9 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         if c.card_id in watch:
             # watched cards skip the price/new-card filters and the normal lists;
             # they only post when they dip again.
-            d = watch_dip(db, c, now)
+            ws = card_stats(db, c, now)
+            d = watch_dip(db, c, now, _in_premium_list(c, ws["usual"] if ws else None),
+                          adj24.get(rgroup(c), 0.0))
             if d:
                 watch_hits.append((c, d))
             cy = find_cycle(db, c, now)
