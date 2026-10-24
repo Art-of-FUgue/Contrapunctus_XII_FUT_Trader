@@ -577,12 +577,12 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 
 
 # Raw snapshots are kept RAW_HOURS; older data is squeezed into one median per card per hour
-# and kept HOURLY_KEEP_DAYS (2 weeks); older hours are rolled up into one row per card per day
+# and kept HOURLY_KEEP_DAYS (4 weeks); older hours are rolled up into one row per card per day
 # (prices_daily) that is kept HISTORY_DAYS (8 weeks). The hourly market index per segment and per
 # behaviour type (index_ret), the daily sales summaries and the dip-event ledger also keep 8 weeks.
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
 HISTORY_DAYS = 56                # one history length (8 weeks) for every long-term table
-HOURLY_KEEP_DAYS = 14            # per-card hourly prices; older hours roll up to daily rows
+HOURLY_KEEP_DAYS = 28            # per-card hourly prices (Active/Mixed); older hours roll up to daily rows
 QUIET_HOURLY_KEEP_DAYS = 0       # Quiet cards barely move: hourly rows only for the current day, then daily rows
 RETENTION_HOURS = HOURLY_KEEP_DAYS * 24
 DAILY_KEEP_DAYS = HISTORY_DAYS
