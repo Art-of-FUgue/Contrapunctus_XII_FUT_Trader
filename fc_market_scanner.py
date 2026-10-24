@@ -11,6 +11,7 @@ holo ...; each title names the period it compares against):
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
     👁 Watchlist Dip      · vs 6 h / 5 min    watched cards dipping again
     👁 Watchlist Prices   · now               current price of every watched card
+    🕒 Buy Windows        · next 24 h         cheapest and best-entry hours per card type, daily (FC_WINDOWS_POST_HOURS)
     📊 Market Index       · 24 h trend        whole-market index by segment, posted every 3 h (FC_INDEX_POST_HOURS)
     (🚀 Rise Alert and ⚡ Quick Spike exist but are off unless FC_SPIKE_ALERTS=1)
 
@@ -302,6 +303,14 @@ def open_db(path: str) -> sqlite3.Connection:
         db.execute("alter table outcomes add column slot text")
     db.execute("create table if not exists market_ret(g text, ts real, ret real)")
     db.execute("create index if not exists mx on market_ret(g, ts)")
+    db.execute("create table if not exists prices_daily(card_id text, day integer, open int, high int, "
+               "low int, med int, close int, hours integer, moves integer, primary key(card_id, day))")
+    db.execute("create table if not exists dip_events(id integer primary key autoincrement, card_id text, "
+               "ts real, price int, usual int, dip real, mkt real, typ text, seg text, band text, "
+               "persist int, fair int, sale_near int, wd int, hr int, x3 real, x6 real, x12 real)")
+    db.execute("create index if not exists dx on dip_events(card_id, ts)")
+    db.execute("create table if not exists index_ret(seg text, hour_ts integer, ret real, n integer, "
+               "primary key(seg, hour_ts))")                    # permanent hourly index returns
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
     sm.init(db)
     db.execute("create table if not exists meta(k text primary key, v text)")
@@ -568,9 +577,13 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 
 
 # Raw snapshots are kept RAW_HOURS; older data is squeezed into one median per
-# card per hour and kept until RETENTION_HOURS (5 days).
+# card per hour and kept until RETENTION_HOURS (8 weeks); older hours are rolled up into one
+# row per card per day (prices_daily) that is kept DAILY_KEEP_DAYS. Hourly index returns
+# (index_ret), daily sales summaries (sales_daily) and the dip-event ledger are kept longer still.
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
-RETENTION_HOURS = 120
+HISTORY_DAYS = 56                # one history length (8 weeks) for every long-term table
+RETENTION_HOURS = HISTORY_DAYS * 24
+DAILY_KEEP_DAYS = HISTORY_DAYS
 OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
 
 
@@ -584,8 +597,31 @@ def compact_history(db, now: float) -> None:
         db.executemany("insert or replace into prices_hourly values (?,?,?)",
                        [(cid, h, int(statistics.median(v))) for (cid, h), v in buckets.items()])
         db.execute("delete from prices where ts < ?", (cut,))
-    db.execute("delete from prices_hourly where hour_ts < ?", (now - RETENTION_HOURS * 3600,))
+    roll_up_old_hours(db, now)
     db.execute("delete from outcomes where ts < ?", (now - OUTCOME_KEEP_DAYS * 86400,))
+
+
+def roll_up_old_hours(db, now: float) -> None:
+    """Hourly medians older than RETENTION_HOURS (whole UTC days) become one row per card per day:
+    open, high, low, median, close, hours present and hour-to-hour price changes. Also squeezes
+    old inferred sales. Runs at most once an hour."""
+    last = get_meta(db, "rollup_ts")
+    if last and now - float(last) < 3600:
+        return
+    cut = int((now - RETENTION_HOURS * 3600) // 86400) * 86400
+    rows = db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts < ? "
+                      "order by card_id, hour_ts", (cut,)).fetchall()
+    by: dict = {}
+    for cid, h, p in rows:
+        by.setdefault((cid, int(h // 86400)), []).append(p)
+    if by:
+        db.executemany("insert or replace into prices_daily values (?,?,?,?,?,?,?,?,?)",
+                       [(cid, day, v[0], max(v), min(v), int(statistics.median(v)), v[-1], len(v),
+                         sum(1 for a, b in zip(v, v[1:]) if a != b)) for (cid, day), v in by.items()])
+        db.execute("delete from prices_hourly where hour_ts < ?", (cut,))
+    db.execute("delete from prices_daily where day < ?", (int((now - DAILY_KEEP_DAYS * 86400) // 86400),))
+    sm.compact_sales(db, now)
+    set_meta(db, "rollup_ts", now)
 
 
 def history_rows(db, card_id: str, since: float) -> list[tuple[float, int]]:
@@ -1260,6 +1296,266 @@ def maybe_post_index(db, now: float, dry_run: bool) -> None:
         set_meta(db, "index_post_ts", now)
 
 
+# ---- card behaviour types + weekly/daily rhythm -> buy windows ----------------------
+BEHAVIOURS = ["Active", "Mixed", "Quiet"]
+BEH_ACTIVE_MAX_STAY = 0.30           # floor unchanged in <=30% of updates -> Active
+BEH_QUIET_MIN_STAY = 0.60            # floor unchanged in >=60% of updates -> Quiet
+BEH_MIN_SNAPSHOTS = 40
+RHYTHM_SEGMENTS = ["All specials"] + BEHAVIOURS
+INDEX_RET_KEEP_DAYS = HISTORY_DAYS
+WINDOWS_POST_HOURS = float(os.environ.get("FC_WINDOWS_POST_HOURS", "0"))   # 0 = never post (data is still collected)
+RHYTHM_WEEKLY_MIN_DAYS = 21          # data span before the hour-of-week pattern is used
+RHYTHM_MIN_OBS = 3                   # observations per hour bin
+
+
+def card_behaviour(db, now: float) -> dict:
+    """Active = floor changes almost every update (busy, thin pile); Quiet = floor holds
+    (deep pile or little trading); Mixed in between. From the raw snapshots of the last 26 h."""
+    out, cur, ps = {}, None, []
+
+    def flush():
+        if cur is not None and len(ps) >= BEH_MIN_SNAPSHOTS and statistics.median(ps) >= INDEX_MIN_PRICE:
+            same = sum(1 for a, b in zip(ps, ps[1:]) if a == b) / (len(ps) - 1)
+            out[cur] = ("Active" if same <= BEH_ACTIVE_MAX_STAY
+                        else "Quiet" if same >= BEH_QUIET_MIN_STAY else "Mixed")
+    for cid, price in db.execute("select card_id, price from prices where ts>=? order by card_id, ts",
+                                 (now - RAW_HOURS * 3600,)):
+        if cid != cur:
+            flush()
+            cur, ps = cid, []
+        ps.append(price)
+    flush()
+    return out
+
+
+def _hourly_px(db, since: float) -> dict:
+    """card -> {hour number: median price in that hour}, from raw snapshots over hourly medians."""
+    per: dict = {}
+    for cid, h, price in db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts>=?", (since,)):
+        per.setdefault(cid, {}).setdefault(int(h // 3600), []).append(price)
+    raw: dict = {}
+    for cid, ts, price in db.execute("select card_id, ts, price from prices where ts>=?", (since,)):
+        raw.setdefault(cid, {}).setdefault(int(ts // 3600), []).append(price)
+    for cid, hrs in raw.items():
+        per.setdefault(cid, {}).update(hrs)
+    return {cid: {h: statistics.median(v) for h, v in hrs.items()} for cid, hrs in per.items()}
+
+
+def record_index_hours(db, now: float) -> int:
+    """Append the hourly return of every segment and behaviour type for each finished hour not
+    recorded yet (the first call back-fills what the price history holds). Permanent, tiny."""
+    cur_hour = int(now // 3600)
+    last = db.execute("select max(hour_ts) from index_ret").fetchone()[0]
+    first = int(last // 3600) + 1 if last else cur_hour - 118
+    if first >= cur_hour:
+        return 0
+    players, holo = _load_players(), _load_holo(_load_players())
+    seg_of = {str(eid): _index_segment(row["rarityName"] + (" 🃏 Holo" if eid in holo else ""))
+              for eid, row in players.items()}
+    beh = card_behaviour(db, now)
+    px = {c: h for c, h in _hourly_px(db, (first - 1) * 3600).items() if c in seg_of}
+    rows = []
+    for h in range(first, cur_hour):
+        prev = h - 1
+        rets = {seg: [] for seg in INDEX_SEGMENTS + BEHAVIOURS}
+        for cid, hrs in px.items():
+            a, b = hrs.get(prev), hrs.get(h)
+            if a and b and a >= INDEX_MIN_PRICE and b >= INDEX_MIN_PRICE:
+                r = max(-0.4, min(0.4, b / a - 1))
+                rets["All specials"].append(r)
+                rets[seg_of[cid]].append(r)
+                if cid in beh:
+                    rets[beh[cid]].append(r)
+        for seg, rs in rets.items():
+            if len(rs) >= INDEX_MIN_CARDS:
+                rs.sort()
+                cut = len(rs) // 10
+                rs = rs[cut:len(rs) - cut] or rs
+                rows.append((seg, h * 3600, statistics.mean(rs), len(rs)))
+    db.executemany("insert or ignore into index_ret values (?,?,?,?)", rows)
+    db.execute("delete from index_ret where hour_ts < ?", (now - INDEX_RET_KEEP_DAYS * 86400,))
+    db.commit()
+    return len(rows)
+
+
+def rhythm(db, seg: str, now: float):
+    """Typical detrended % move per hour of the day (or of the week once there are 3 weeks),
+    in Austin time. Returns None with too little history."""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    tz = ZoneInfo(TIMEZONE)
+    rows = db.execute("select hour_ts, ret from index_ret where seg=? order by hour_ts", (seg,)).fetchall()
+    if len(rows) < 48:
+        return None
+    span_days = (rows[-1][0] - rows[0][0]) / 86400
+    overall = statistics.mean(r for _, r in rows)
+    weekly = span_days >= RHYTHM_WEEKLY_MIN_DAYS
+    bins: dict = {}
+    for t, r in rows:
+        d = _dt.datetime.fromtimestamp(t, tz)
+        key = (d.weekday(), d.hour) if weekly else (0, d.hour)
+        bins.setdefault(key, []).append((r - overall) * 100)
+    if weekly and any(len(v) < RHYTHM_MIN_OBS for v in bins.values()):
+        weekly = False                                    # fall back to the daily pattern
+        bins = {}
+        for t, r in rows:
+            d = _dt.datetime.fromtimestamp(t, tz)
+            bins.setdefault((0, d.hour), []).append((r - overall) * 100)
+    mean = {k_: statistics.mean(v) for k_, v in bins.items()}
+    se = {k_: (statistics.stdev(v) / len(v) ** 0.5 if len(v) > 1 else 9.9) for k_, v in bins.items()}
+    n = {k_: len(v) for k_, v in bins.items()}
+    return {"weekly": weekly, "mean": mean, "se": se, "n": n, "days": span_days}
+
+
+def buy_windows(db, seg: str, now: float):
+    """For the next 24 local hours: cheapest hour (lowest point of the typical cycle) and the
+    best entry hour (largest typical gain over the following 3 h), with how sure the data is."""
+    prof = rhythm(db, seg, now)
+    if not prof:
+        return None
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    tz = ZoneInfo(TIMEZONE)
+    start = _dt.datetime.fromtimestamp(now, tz).replace(minute=0, second=0, microsecond=0)
+    hours = [start + _dt.timedelta(hours=i) for i in range(1, 49)]      # 48 h so we can look ahead
+
+    def key(d):
+        return (d.weekday(), d.hour) if prof["weekly"] else (0, d.hour)
+    m = [prof["mean"].get(key(d), 0.0) for d in hours]
+    e = [prof["se"].get(key(d), 9.9) for d in hours]
+    level, acc = [], 0.0
+    for x in m[:24]:
+        acc += x
+        level.append(acc)
+    low_i = min(range(24), key=lambda i: level[i])
+    gains = [(sum(m[i + 1:i + 4]), (sum(x * x for x in e[i + 1:i + 4])) ** 0.5, i) for i in range(24)]
+    g, se_g, gi = max(gains)
+    return {"low": hours[low_i], "entry": hours[gi], "gain": g, "gain_se": se_g,
+            "weekly": prof["weekly"], "days": prof["days"], "swing": max(level) - min(level)}
+
+
+def _hr(d) -> str:
+    return d.strftime("%a ") + d.strftime("%I %p").lstrip("0").lower()
+
+
+def build_buy_windows(db, now: float) -> list[dict]:
+    rows, conf = [], None
+    for seg in RHYTHM_SEGMENTS:
+        w = buy_windows(db, seg, now)
+        if not w:
+            continue
+        conf = conf or w
+        sure = "" if w["gain_se"] and abs(w["gain"]) >= 2.5 * w["gain_se"] else " (weak)"
+        rows.append(f"{seg:13}{_hr(w['low']):>10}   {_hr(w['entry']):>10}  {w['gain']:+.2f}%{sure}")
+    if not rows:
+        return []
+    beh = card_behaviour(db, now)
+    counts = {b: sum(1 for v in beh.values() if v == b) for b in BEHAVIOURS}
+    kind = (f"weekly pattern, {conf['days'] / 7:.1f} weeks of data" if conf["weekly"]
+            else f"daily pattern only, {conf['days']:.1f} days of data - preliminary, the weekly pattern needs 3+ weeks")
+    lines = [f"⏱ Next 24 h in **Austin time** · based on the {kind}", "```",
+             f"{'':13}{'cheapest':>10}   {'best entry':>10}  gain over next 3 h", *rows, "```",
+             "Active = floor moves almost every update (busy) · Quiet = floor holds (deep pile or little trading) · "
+             "Mixed in between",
+             "Cards: " + " · ".join(f"{b} {counts[b]}" for b in BEHAVIOURS)]
+    return [{"title": f"🕒 Buy Windows · next 24 h · {PLATFORM_LABEL}", "description": "\n".join(lines),
+             "color": 0x1ABC9C,
+             "footer": {"text": "Typical hourly drift per card type, trend removed · a guide to timing, not a signal; "
+                                "(weak) = within the noise"}}]
+
+
+def maybe_post_buy_windows(db, now: float, dry_run: bool) -> None:
+    if WINDOWS_POST_HOURS <= 0:
+        return
+    last = get_meta(db, "windows_post_ts")
+    if last and now - float(last) < WINDOWS_POST_HOURS * 3600 - 120:
+        return
+    embeds = build_buy_windows(db, now)
+    if embeds:
+        post(embeds, dry_run)
+        set_meta(db, "windows_post_ts", now)
+
+
+# ---- dip-event ledger: every candidate dip + what happened next (the long record) ----------
+EVENT_DIP_PCT = 8.0              # price this far below the card's 24 h median opens an event
+EVENT_COOLDOWN_H = 6             # one event per card per episode
+EVENT_MIN_PRICE = 10_000
+EVENT_HORIZONS = (3, 6, 12)      # hours after the event at which the net result is measured
+EVENT_KEEP_DAYS = HISTORY_DAYS
+
+
+def _behaviour_cached(db, now: float) -> dict:
+    hour = int(now // 3600)
+    c = _cache.get("beh")
+    if not c or c[0] != hour:
+        _cache["beh"] = (hour, card_behaviour(db, now))
+    return _cache["beh"][1]
+
+
+def record_dip_events(db, cards, stats: dict, adj24: dict, skip: set, now: float) -> int:
+    """Log each card that sits EVENT_DIP_PCT+ below its 24 h median, once per episode, with the
+    situation at that moment (type, depth, market move, whether the dip persisted for two
+    updates, sold fair value, a nearby inferred sale). Outcomes are filled in later."""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    beh = _behaviour_cached(db, now)
+    prev_ts = db.execute("select max(ts) from prices").fetchone()[0]
+    prev = dict(db.execute("select card_id, price from prices where ts=?", (prev_ts,))) if prev_ts else {}
+    loc = _dt.datetime.fromtimestamp(now, ZoneInfo(TIMEZONE))
+    n = 0
+    for c in cards:
+        if c.card_id in skip or c.price < EVENT_MIN_PRICE:
+            continue
+        s_ = stats.get(c.card_id)
+        if not s_ or s_["usual"] <= 0:
+            continue
+        dip = (c.price / s_["usual"] - 1) * 100
+        if dip > -EVENT_DIP_PCT:
+            continue
+        persist = 1 if prev.get(c.card_id, 10 ** 12) <= s_["usual"] * (1 - EVENT_DIP_PCT / 100) else 0
+        last = db.execute("select ts, persist from dip_events where card_id=? order by ts desc limit 1",
+                          (c.card_id,)).fetchone()
+        if last and now - last[0] < EVENT_COOLDOWN_H * 3600 and not (persist and not last[1]):
+            continue                                   # same episode (unless it now persisted)
+        st = sm.sale_stats(db, c.card_id, now, 96, 24)
+        fair = int(st["fair"]) if st and st["n"] >= 4 else None
+        near = db.execute("select count(*) from sales_inferred where card_id=? and kind='sale' "
+                          "and ts>=? and price<=?", (c.card_id, now - 1800, c.price * 1.01)).fetchone()[0]
+        db.execute("insert into dip_events(card_id, ts, price, usual, dip, mkt, typ, seg, band, persist, "
+                   "fair, sale_near, wd, hr) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (c.card_id, now, c.price, int(s_["usual"]), dip, adj24.get(rgroup(c), 0.0),
+                    beh.get(c.card_id, "?"), _index_segment(c.kind), price_band(c.price), persist,
+                    fair, near, loc.weekday(), loc.hour))
+        n += 1
+    db.execute("delete from dip_events where ts < ?", (now - EVENT_KEEP_DAYS * 86400,))
+    db.commit()
+    return n
+
+
+def resolve_dip_events(db, now: float) -> int:
+    """Fill in the net result (after 5% tax and the exit haircut, in %) once each horizon has passed.
+    999 marks a horizon whose price could not be found."""
+    done = 0
+    for hz in EVENT_HORIZONS:
+        col = f"x{hz}"
+        rows = db.execute(f"select id, card_id, ts, price from dip_events where {col} is null "
+                          f"and ts + ? <= ?", (hz * 3600 + 1200, now)).fetchall()
+        for eid, cid, ts, price in rows:
+            t = ts + hz * 3600
+            px = [r[0] for r in db.execute("select price from prices where card_id=? and ts between ? and ?",
+                                           (cid, t - 1200, t + 1200))]
+            if px:
+                val = (statistics.median(px) * (1 - EA_TAX) / price - 1) * 100 - EXIT_HAIRCUT_PCT
+            elif now - t > 2 * 3600:
+                val = 999.0                                # no snapshot near that time, give up
+            else:
+                continue
+            db.execute(f"update dip_events set {col}=? where id=?", (val, eid))
+            done += 1
+    db.commit()
+    return done
+
+
 # ------------------------------------------------------------------- scan --
 def _is_premium(card: Card) -> bool:
     """True for Icons and Heroes (matched on words in the rarity name)."""
@@ -1339,7 +1635,7 @@ def market_moves(db, cards, stats: dict, skip: set):
 
 
 # ---- seasonality: hour-of-week drift of each peer group ---------------------
-SEASON_KEEP_DAYS = 56            # market-return history kept for the profile
+SEASON_KEEP_DAYS = HISTORY_DAYS           # market-return history kept for the profile
 SEASON_MIN_WEEKS = 3             # weeks of data before an hour-of-week bin is used
 SEASON_MIN_DAYS = 7              # days of data before the time-of-day fallback is used
 SEASON_SHRINK = 2.0              # bins with few observations are shrunk toward 0
@@ -1543,6 +1839,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     if prev_ts and now - prev_ts <= SEASON_MAX_GAP:       # feed the seasonal profile
         record_market_returns(db, mret, now)
     season_cache: dict = {}
+    try:
+        record_dip_events(db, cards, stats, adj24, muted_new | watch, now)   # long-term dip ledger
+    except Exception as e:                                                    # never break a scan
+        print(f"[warn] dip ledger failed: {e}")
 
     for c in cards:
         if c.card_id in watch:
@@ -1776,7 +2076,9 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
         try:
+            record_index_hours(db, now)                        # permanent hourly index record
             maybe_post_index(db, now, dry_run)                 # market index, every few hours
+            maybe_post_buy_windows(db, now, dry_run)           # buy windows, once a day
         except Exception as e:                                 # never let the index break a scan
             print(f"[warn] market index failed: {e}")
         found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
@@ -1785,6 +2087,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         if found:
             print(f"[info] inferred {found} listing(s) gone (sold or expired)")
         resolve_outcomes(db, now)
+        try:
+            resolve_dip_events(db, now)
+        except Exception as e:
+            print(f"[warn] dip ledger resolve failed: {e}")
         last_ts = get_meta(db, "dyn_ts")
         if last_ts:
             print(f"[info] feed updated {now - float(last_ts):.0f}s after the previous update")
