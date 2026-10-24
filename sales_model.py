@@ -26,7 +26,8 @@ TOL = float(os.environ.get("FC_SALE_TOL_SECONDS", "90"))   # extra slack around 
 MAX_GAP = 1200                     # seconds; a longer gap between scans resets a card's state
 STACK_MAX = 12
 MAX_WINDOW = 1800                  # seconds; wider age windows are not used for sell chance
-KEEP_DAYS = 14
+SALES_RAW_DAYS = int(os.environ.get("FC_SALES_RAW_DAYS", "4"))   # individual inferred sales kept this long
+SALES_DAILY_KEEP_DAYS = 400                  # per-card daily sales summary kept this long
 
 
 def init(db) -> None:
@@ -34,6 +35,8 @@ def init(db) -> None:
     db.execute("create table if not exists sales_inferred(card_id text, ts real, price int, "
                "g text, band text, kind text, age_lo real, age_hi real)")
     db.execute("create index if not exists sx on sales_inferred(card_id, ts)")
+    db.execute("create table if not exists sales_daily(card_id text, day integer, n_sale integer, "
+               "n_amb integer, med int, lo int, hi int, primary key(card_id, day))")
 
 
 def classify(age_lo: float, age_hi: float) -> str:
@@ -113,9 +116,31 @@ def update(db, rows, now: float, band_fn=None) -> int:
                 db.execute("insert into sales_inferred values (?,?,?,?,?,?,?,?)",
                            (cid, now, p, g, band or (band_fn(p) if band_fn else ""), kind, lo, hi))
                 n += 1
-    db.execute("delete from sales_inferred where ts < ?", (now - KEEP_DAYS * 86400,))
     db.commit()
     return n
+
+
+def compact_sales(db, now: float) -> int:
+    """Squeeze inferred sales older than SALES_RAW_DAYS (whole UTC days only) into one summary
+    row per card per day, then drop the individual rows. Returns the rows removed."""
+    cut = int((now - SALES_RAW_DAYS * 86400) // 86400) * 86400
+    rows = db.execute("select card_id, ts, price, kind from sales_inferred where ts < ?", (cut,)).fetchall()
+    if not rows:
+        return 0
+    by: dict = {}
+    for cid, ts, price, kind in rows:
+        by.setdefault((cid, int(ts // 86400)), []).append((price, kind))
+    out = []
+    for (cid, day), v in by.items():
+        sold = [p for p, k in v if k == "sale"]
+        out.append((cid, day, len(sold), len(v) - len(sold),
+                    int(statistics.median(sold)) if sold else None,
+                    min(sold) if sold else None, max(sold) if sold else None))
+    db.executemany("insert or replace into sales_daily values (?,?,?,?,?,?,?)", out)
+    db.execute("delete from sales_inferred where ts < ?", (cut,))
+    db.execute("delete from sales_daily where day < ?", (int((now - SALES_DAILY_KEEP_DAYS * 86400) // 86400),))
+    db.commit()
+    return len(rows)
 
 
 def sale_prices(db, card_id: str, since: float) -> list[int]:
@@ -156,7 +181,7 @@ def sell_prob(db, g: str, band: str, horizon_h: float, now: float, min_n: int = 
     for where, args in (("g=? and band=?", (g, band)), ("g=?", (g,)), ("1=1", ())):
         rows = db.execute(
             f"select kind, age_lo, age_hi from sales_inferred where {where} and ts>=?",
-            (*args, now - KEEP_DAYS * 86400)).fetchall()
+            (*args, now - SALES_RAW_DAYS * 86400)).fetchall()
         if len(rows) >= min_n:
             pts = [(((lo + hi) / 2) / 3600, 1 if kind == "sale" else 0)
                    for kind, lo, hi in rows if hi - lo <= MAX_WINDOW]   # wide windows are too vague

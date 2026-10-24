@@ -303,6 +303,12 @@ def open_db(path: str) -> sqlite3.Connection:
         db.execute("alter table outcomes add column slot text")
     db.execute("create table if not exists market_ret(g text, ts real, ret real)")
     db.execute("create index if not exists mx on market_ret(g, ts)")
+    db.execute("create table if not exists prices_daily(card_id text, day integer, open int, high int, "
+               "low int, med int, close int, hours integer, moves integer, primary key(card_id, day))")
+    db.execute("create table if not exists dip_events(id integer primary key autoincrement, card_id text, "
+               "ts real, price int, usual int, dip real, mkt real, typ text, seg text, band text, "
+               "persist int, fair int, sale_near int, wd int, hr int, x3 real, x6 real, x12 real)")
+    db.execute("create index if not exists dx on dip_events(card_id, ts)")
     db.execute("create table if not exists index_ret(seg text, hour_ts integer, ret real, n integer, "
                "primary key(seg, hour_ts))")                    # permanent hourly index returns
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
@@ -571,9 +577,12 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 
 
 # Raw snapshots are kept RAW_HOURS; older data is squeezed into one median per
-# card per hour and kept until RETENTION_HOURS (5 days).
+# card per hour and kept until RETENTION_HOURS (28 days); older hours are rolled up into one
+# row per card per day (prices_daily) that is kept DAILY_KEEP_DAYS. Hourly index returns
+# (index_ret), daily sales summaries (sales_daily) and the dip-event ledger are kept longer still.
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
-RETENTION_HOURS = 120
+RETENTION_HOURS = 28 * 24
+DAILY_KEEP_DAYS = 400
 OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
 
 
@@ -587,8 +596,31 @@ def compact_history(db, now: float) -> None:
         db.executemany("insert or replace into prices_hourly values (?,?,?)",
                        [(cid, h, int(statistics.median(v))) for (cid, h), v in buckets.items()])
         db.execute("delete from prices where ts < ?", (cut,))
-    db.execute("delete from prices_hourly where hour_ts < ?", (now - RETENTION_HOURS * 3600,))
+    roll_up_old_hours(db, now)
     db.execute("delete from outcomes where ts < ?", (now - OUTCOME_KEEP_DAYS * 86400,))
+
+
+def roll_up_old_hours(db, now: float) -> None:
+    """Hourly medians older than RETENTION_HOURS (whole UTC days) become one row per card per day:
+    open, high, low, median, close, hours present and hour-to-hour price changes. Also squeezes
+    old inferred sales. Runs at most once an hour."""
+    last = get_meta(db, "rollup_ts")
+    if last and now - float(last) < 3600:
+        return
+    cut = int((now - RETENTION_HOURS * 3600) // 86400) * 86400
+    rows = db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts < ? "
+                      "order by card_id, hour_ts", (cut,)).fetchall()
+    by: dict = {}
+    for cid, h, p in rows:
+        by.setdefault((cid, int(h // 86400)), []).append(p)
+    if by:
+        db.executemany("insert or replace into prices_daily values (?,?,?,?,?,?,?,?,?)",
+                       [(cid, day, v[0], max(v), min(v), int(statistics.median(v)), v[-1], len(v),
+                         sum(1 for a, b in zip(v, v[1:]) if a != b)) for (cid, day), v in by.items()])
+        db.execute("delete from prices_hourly where hour_ts < ?", (cut,))
+    db.execute("delete from prices_daily where day < ?", (int((now - DAILY_KEEP_DAYS * 86400) // 86400),))
+    sm.compact_sales(db, now)
+    set_meta(db, "rollup_ts", now)
 
 
 def history_rows(db, card_id: str, since: float) -> list[tuple[float, int]]:
@@ -1443,6 +1475,86 @@ def maybe_post_buy_windows(db, now: float, dry_run: bool) -> None:
         set_meta(db, "windows_post_ts", now)
 
 
+# ---- dip-event ledger: every candidate dip + what happened next (the long record) ----------
+EVENT_DIP_PCT = 8.0              # price this far below the card's 24 h median opens an event
+EVENT_COOLDOWN_H = 6             # one event per card per episode
+EVENT_MIN_PRICE = 10_000
+EVENT_HORIZONS = (3, 6, 12)      # hours after the event at which the net result is measured
+EVENT_KEEP_DAYS = 400
+
+
+def _behaviour_cached(db, now: float) -> dict:
+    hour = int(now // 3600)
+    c = _cache.get("beh")
+    if not c or c[0] != hour:
+        _cache["beh"] = (hour, card_behaviour(db, now))
+    return _cache["beh"][1]
+
+
+def record_dip_events(db, cards, stats: dict, adj24: dict, skip: set, now: float) -> int:
+    """Log each card that sits EVENT_DIP_PCT+ below its 24 h median, once per episode, with the
+    situation at that moment (type, depth, market move, whether the dip persisted for two
+    updates, sold fair value, a nearby inferred sale). Outcomes are filled in later."""
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    beh = _behaviour_cached(db, now)
+    prev_ts = db.execute("select max(ts) from prices").fetchone()[0]
+    prev = dict(db.execute("select card_id, price from prices where ts=?", (prev_ts,))) if prev_ts else {}
+    loc = _dt.datetime.fromtimestamp(now, ZoneInfo(TIMEZONE))
+    n = 0
+    for c in cards:
+        if c.card_id in skip or c.price < EVENT_MIN_PRICE:
+            continue
+        s_ = stats.get(c.card_id)
+        if not s_ or s_["usual"] <= 0:
+            continue
+        dip = (c.price / s_["usual"] - 1) * 100
+        if dip > -EVENT_DIP_PCT:
+            continue
+        persist = 1 if prev.get(c.card_id, 10 ** 12) <= s_["usual"] * (1 - EVENT_DIP_PCT / 100) else 0
+        last = db.execute("select ts, persist from dip_events where card_id=? order by ts desc limit 1",
+                          (c.card_id,)).fetchone()
+        if last and now - last[0] < EVENT_COOLDOWN_H * 3600 and not (persist and not last[1]):
+            continue                                   # same episode (unless it now persisted)
+        st = sm.sale_stats(db, c.card_id, now, 96, 24)
+        fair = int(st["fair"]) if st and st["n"] >= 4 else None
+        near = db.execute("select count(*) from sales_inferred where card_id=? and kind='sale' "
+                          "and ts>=? and price<=?", (c.card_id, now - 1800, c.price * 1.01)).fetchone()[0]
+        db.execute("insert into dip_events(card_id, ts, price, usual, dip, mkt, typ, seg, band, persist, "
+                   "fair, sale_near, wd, hr) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (c.card_id, now, c.price, int(s_["usual"]), dip, adj24.get(rgroup(c), 0.0),
+                    beh.get(c.card_id, "?"), _index_segment(c.kind), price_band(c.price), persist,
+                    fair, near, loc.weekday(), loc.hour))
+        n += 1
+    db.execute("delete from dip_events where ts < ?", (now - EVENT_KEEP_DAYS * 86400,))
+    db.commit()
+    return n
+
+
+def resolve_dip_events(db, now: float) -> int:
+    """Fill in the net result (after 5% tax and the exit haircut, in %) once each horizon has passed.
+    999 marks a horizon whose price could not be found."""
+    done = 0
+    for hz in EVENT_HORIZONS:
+        col = f"x{hz}"
+        rows = db.execute(f"select id, card_id, ts, price from dip_events where {col} is null "
+                          f"and ts + ? <= ?", (hz * 3600 + 1200, now)).fetchall()
+        for eid, cid, ts, price in rows:
+            t = ts + hz * 3600
+            px = [r[0] for r in db.execute("select price from prices where card_id=? and ts between ? and ?",
+                                           (cid, t - 1200, t + 1200))]
+            if px:
+                val = (statistics.median(px) * (1 - EA_TAX) / price - 1) * 100 - EXIT_HAIRCUT_PCT
+            elif now - t > 2 * 3600:
+                val = 999.0                                # no snapshot near that time, give up
+            else:
+                continue
+            db.execute(f"update dip_events set {col}=? where id=?", (val, eid))
+            done += 1
+    db.commit()
+    return done
+
+
 # ------------------------------------------------------------------- scan --
 def _is_premium(card: Card) -> bool:
     """True for Icons and Heroes (matched on words in the rarity name)."""
@@ -1726,6 +1838,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     if prev_ts and now - prev_ts <= SEASON_MAX_GAP:       # feed the seasonal profile
         record_market_returns(db, mret, now)
     season_cache: dict = {}
+    try:
+        record_dip_events(db, cards, stats, adj24, muted_new | watch, now)   # long-term dip ledger
+    except Exception as e:                                                    # never break a scan
+        print(f"[warn] dip ledger failed: {e}")
 
     for c in cards:
         if c.card_id in watch:
@@ -1970,6 +2086,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         if found:
             print(f"[info] inferred {found} listing(s) gone (sold or expired)")
         resolve_outcomes(db, now)
+        try:
+            resolve_dip_events(db, now)
+        except Exception as e:
+            print(f"[warn] dip ledger resolve failed: {e}")
         last_ts = get_meta(db, "dyn_ts")
         if last_ts:
             print(f"[info] feed updated {now - float(last_ts):.0f}s after the previous update")
