@@ -1303,7 +1303,7 @@ BEH_QUIET_MIN_STAY = 0.60            # floor unchanged in >=60% of updates -> Qu
 BEH_MIN_SNAPSHOTS = 40
 RHYTHM_SEGMENTS = ["All specials"] + BEHAVIOURS
 INDEX_RET_KEEP_DAYS = HISTORY_DAYS
-WINDOWS_POST_HOURS = float(os.environ.get("FC_WINDOWS_POST_HOURS", "24"))   # 0 = never post
+WINDOWS_POST_HOURS = float(os.environ.get("FC_WINDOWS_POST_HOURS", "0"))   # 0 = never post (data is still collected)
 RHYTHM_WEEKLY_MIN_DAYS = 21          # data span before the hour-of-week pattern is used
 RHYTHM_MIN_OBS = 3                   # observations per hour bin
 
