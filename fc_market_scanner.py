@@ -583,7 +583,7 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
 HISTORY_DAYS = 56                # one history length (8 weeks) for every long-term table
 HOURLY_KEEP_DAYS = 14            # per-card hourly prices; older hours roll up to daily rows
-QUIET_HOURLY_KEEP_DAYS = 3       # Quiet cards barely move, so they roll up to daily rows sooner
+QUIET_HOURLY_KEEP_DAYS = 0       # Quiet cards barely move: hourly rows only for the current day, then daily rows
 RETENTION_HOURS = HOURLY_KEEP_DAYS * 24
 DAILY_KEEP_DAYS = HISTORY_DAYS
 OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
