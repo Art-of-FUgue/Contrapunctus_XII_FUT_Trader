@@ -27,7 +27,7 @@ MAX_GAP = 1200                     # seconds; a longer gap between scans resets 
 STACK_MAX = 12
 MAX_WINDOW = 1800                  # seconds; wider age windows are not used for sell chance
 SALES_RAW_DAYS = int(os.environ.get("FC_SALES_RAW_DAYS", "4"))   # individual inferred sales kept this long
-SALES_DAILY_KEEP_DAYS = 400                  # per-card daily sales summary kept this long
+SALES_DAILY_KEEP_DAYS = 56                  # per-card daily sales summary kept this long
 
 
 def init(db) -> None:

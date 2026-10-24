@@ -577,12 +577,13 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 
 
 # Raw snapshots are kept RAW_HOURS; older data is squeezed into one median per
-# card per hour and kept until RETENTION_HOURS (28 days); older hours are rolled up into one
+# card per hour and kept until RETENTION_HOURS (8 weeks); older hours are rolled up into one
 # row per card per day (prices_daily) that is kept DAILY_KEEP_DAYS. Hourly index returns
 # (index_ret), daily sales summaries (sales_daily) and the dip-event ledger are kept longer still.
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
-RETENTION_HOURS = 28 * 24
-DAILY_KEEP_DAYS = 400
+HISTORY_DAYS = 56                # one history length (8 weeks) for every long-term table
+RETENTION_HOURS = HISTORY_DAYS * 24
+DAILY_KEEP_DAYS = HISTORY_DAYS
 OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
 
 
@@ -1301,7 +1302,7 @@ BEH_ACTIVE_MAX_STAY = 0.30           # floor unchanged in <=30% of updates -> Ac
 BEH_QUIET_MIN_STAY = 0.60            # floor unchanged in >=60% of updates -> Quiet
 BEH_MIN_SNAPSHOTS = 40
 RHYTHM_SEGMENTS = ["All specials"] + BEHAVIOURS
-INDEX_RET_KEEP_DAYS = 400
+INDEX_RET_KEEP_DAYS = HISTORY_DAYS
 WINDOWS_POST_HOURS = float(os.environ.get("FC_WINDOWS_POST_HOURS", "24"))   # 0 = never post
 RHYTHM_WEEKLY_MIN_DAYS = 21          # data span before the hour-of-week pattern is used
 RHYTHM_MIN_OBS = 3                   # observations per hour bin
@@ -1480,7 +1481,7 @@ EVENT_DIP_PCT = 8.0              # price this far below the card's 24 h median o
 EVENT_COOLDOWN_H = 6             # one event per card per episode
 EVENT_MIN_PRICE = 10_000
 EVENT_HORIZONS = (3, 6, 12)      # hours after the event at which the net result is measured
-EVENT_KEEP_DAYS = 400
+EVENT_KEEP_DAYS = HISTORY_DAYS
 
 
 def _behaviour_cached(db, now: float) -> dict:
@@ -1634,7 +1635,7 @@ def market_moves(db, cards, stats: dict, skip: set):
 
 
 # ---- seasonality: hour-of-week drift of each peer group ---------------------
-SEASON_KEEP_DAYS = 56            # market-return history kept for the profile
+SEASON_KEEP_DAYS = HISTORY_DAYS           # market-return history kept for the profile
 SEASON_MIN_WEEKS = 3             # weeks of data before an hour-of-week bin is used
 SEASON_MIN_DAYS = 7              # days of data before the time-of-day fallback is used
 SEASON_SHRINK = 2.0              # bins with few observations are shrunk toward 0
