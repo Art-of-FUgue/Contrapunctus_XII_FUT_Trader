@@ -583,6 +583,7 @@ def save_snapshot(db, cards: list[Card], now: float) -> None:
 RAW_HOURS = max(HISTORY_HOURS, PREMIUM_HISTORY_HOURS) + 2
 HISTORY_DAYS = 56                # one history length (8 weeks) for every long-term table
 HOURLY_KEEP_DAYS = 14            # per-card hourly prices; older hours roll up to daily rows
+QUIET_HOURLY_KEEP_DAYS = 3       # Quiet cards barely move, so they roll up to daily rows sooner
 RETENTION_HOURS = HOURLY_KEEP_DAYS * 24
 DAILY_KEEP_DAYS = HISTORY_DAYS
 OUTCOME_KEEP_DAYS = 30           # dip outcomes older than this are dropped
@@ -603,23 +604,31 @@ def compact_history(db, now: float) -> None:
 
 
 def roll_up_old_hours(db, now: float) -> None:
-    """Hourly medians older than RETENTION_HOURS (whole UTC days) become one row per card per day:
+    """Hourly medians older than RETENTION_HOURS (Quiet cards: QUIET_HOURLY_KEEP_DAYS; whole UTC days) become one row per card per day:
     open, high, low, median, close, hours present and hour-to-hour price changes. Also squeezes
     old inferred sales. Runs at most once an hour."""
     last = get_meta(db, "rollup_ts")
     if last and now - float(last) < 3600:
         return
     cut = int((now - RETENTION_HOURS * 3600) // 86400) * 86400
+    cut_quiet = int((now - QUIET_HOURLY_KEEP_DAYS * 86400) // 86400) * 86400
+    try:
+        quiet = {c for c, t in _behaviour_cached(db, now).items() if t == "Quiet"}
+    except Exception:
+        quiet = set()
     rows = db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts < ? "
-                      "order by card_id, hour_ts", (cut,)).fetchall()
+                      "order by card_id, hour_ts", (max(cut, cut_quiet),)).fetchall()
     by: dict = {}
     for cid, h, p in rows:
-        by.setdefault((cid, int(h // 86400)), []).append(p)
+        if h < (cut_quiet if cid in quiet else cut):      # Quiet cards roll up to daily sooner
+            by.setdefault((cid, int(h // 86400)), []).append(p)
     if by:
         db.executemany("insert or replace into prices_daily values (?,?,?,?,?,?,?,?,?)",
                        [(cid, day, v[0], max(v), min(v), int(statistics.median(v)), v[-1], len(v),
                          sum(1 for a, b in zip(v, v[1:]) if a != b)) for (cid, day), v in by.items()])
         db.execute("delete from prices_hourly where hour_ts < ?", (cut,))
+        db.executemany("delete from prices_hourly where card_id=? and hour_ts < ?",
+                       [(c, cut_quiet) for c in quiet])
     db.execute("delete from prices_daily where day < ?", (int((now - DAILY_KEEP_DAYS * 86400) // 86400),))
     try:                                          # hourly sale summaries for Mixed/Quiet cards: their floor
         beh = _behaviour_cached(db, now)          # hardly moves, so sales are the only sign of activity
