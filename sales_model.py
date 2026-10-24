@@ -28,7 +28,7 @@ STACK_MAX = 12
 MAX_WINDOW = 1800                  # seconds; wider age windows are not used for sell chance
 SALES_RAW_DAYS = int(os.environ.get("FC_SALES_RAW_DAYS", "4"))   # individual inferred sales kept this long
 SALES_DAILY_KEEP_DAYS = 56
-SALES_HOURLY_KEEP_DAYS = 56                 # per-card hourly sales summary (Active/Mixed) kept this long
+SALES_HOURLY_KEEP_DAYS = 42                 # per-card hourly sales summary (all cards) kept this long
 
 
 def init(db) -> None:
@@ -125,11 +125,9 @@ def update(db, rows, now: float, band_fn=None) -> int:
 
 def roll_sales_hourly(db, now: float, cards) -> int:
     """One summary row per card per full hour (sales count, ambiguous count, median and lowest sale)
-    for the given cards, built before the raw rows age out. Hours more than 2 h old are rolled once,
+    for the given cards (None = all), built before the raw rows age out. Hours more than 2 h old are rolled once,
     tracked by a watermark in meta. Returns the hours-rows written."""
-    cards = set(cards or ())
-    if not cards:
-        return 0
+    cards = set(cards) if cards is not None else None      # None = every card
     last = int(now // 3600) - 2
     r = db.execute("select v from meta where k='sales_hourly_h'").fetchone()
     if r:
@@ -145,7 +143,7 @@ def roll_sales_hourly(db, now: float, cards) -> int:
     for cid, ts, price, kind in db.execute(
             "select card_id, ts, price, kind from sales_inferred where ts>=? and ts<?",
             (start * 3600, last * 3600)):
-        if cid in cards:
+        if cards is None or cid in cards:
             by.setdefault((cid, int(ts // 3600)), []).append((price, kind))
     out = []
     for (cid, hr), v in by.items():

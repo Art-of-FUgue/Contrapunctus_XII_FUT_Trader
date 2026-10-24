@@ -630,9 +630,8 @@ def roll_up_old_hours(db, now: float) -> None:
         db.executemany("delete from prices_hourly where card_id=? and hour_ts < ?",
                        [(c, cut_quiet) for c in quiet])
     db.execute("delete from prices_daily where day < ?", (int((now - DAILY_KEEP_DAYS * 86400) // 86400),))
-    try:                                          # hourly sale summaries for Mixed/Quiet cards: their floor
-        beh = _behaviour_cached(db, now)          # hardly moves, so sales are the only sign of activity
-        sm.roll_sales_hourly(db, now, [c for c, t in beh.items() if t in ("Mixed", "Quiet")])
+    try:                                          # hourly sale summaries, every card, built before the
+        sm.roll_sales_hourly(db, now, None)       # raw rows age out (Active ones are trimmed after ~26 h)
     except Exception as e:
         print(f"[warn] hourly sales summary failed: {e}")
     sm.compact_sales(db, now)
