@@ -620,9 +620,9 @@ def roll_up_old_hours(db, now: float) -> None:
                          sum(1 for a, b in zip(v, v[1:]) if a != b)) for (cid, day), v in by.items()])
         db.execute("delete from prices_hourly where hour_ts < ?", (cut,))
     db.execute("delete from prices_daily where day < ?", (int((now - DAILY_KEEP_DAYS * 86400) // 86400),))
-    try:                                          # hourly sale summaries for Active/Mixed cards
-        beh = _behaviour_cached(db, now)
-        sm.roll_sales_hourly(db, now, [c for c, t in beh.items() if t in ("Active", "Mixed")])
+    try:                                          # hourly sale summaries for Mixed/Quiet cards: their floor
+        beh = _behaviour_cached(db, now)          # hardly moves, so sales are the only sign of activity
+        sm.roll_sales_hourly(db, now, [c for c, t in beh.items() if t in ("Mixed", "Quiet")])
     except Exception as e:
         print(f"[warn] hourly sales summary failed: {e}")
     sm.compact_sales(db, now)
