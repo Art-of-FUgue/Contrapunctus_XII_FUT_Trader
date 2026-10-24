@@ -27,7 +27,8 @@ MAX_GAP = 1200                     # seconds; a longer gap between scans resets 
 STACK_MAX = 12
 MAX_WINDOW = 1800                  # seconds; wider age windows are not used for sell chance
 SALES_RAW_DAYS = int(os.environ.get("FC_SALES_RAW_DAYS", "4"))   # individual inferred sales kept this long
-SALES_DAILY_KEEP_DAYS = 56                  # per-card daily sales summary kept this long
+SALES_DAILY_KEEP_DAYS = 56
+SALES_HOURLY_KEEP_DAYS = 56                 # per-card hourly sales summary (Active/Mixed) kept this long
 
 
 def init(db) -> None:
@@ -37,6 +38,8 @@ def init(db) -> None:
     db.execute("create index if not exists sx on sales_inferred(card_id, ts)")
     db.execute("create table if not exists sales_daily(card_id text, day integer, n_sale integer, "
                "n_amb integer, med int, lo int, hi int, primary key(card_id, day))")
+    db.execute("create table if not exists sales_hourly(card_id text, hour integer, n_sale integer, "
+               "n_amb integer, med int, lo int, primary key(card_id, hour))")
 
 
 def classify(age_lo: float, age_hi: float) -> str:
@@ -118,6 +121,42 @@ def update(db, rows, now: float, band_fn=None) -> int:
                 n += 1
     db.commit()
     return n
+
+
+def roll_sales_hourly(db, now: float, cards) -> int:
+    """One summary row per card per full hour (sales count, ambiguous count, median and lowest sale)
+    for the given cards, built before the raw rows age out. Hours more than 2 h old are rolled once,
+    tracked by a watermark in meta. Returns the hours-rows written."""
+    cards = set(cards or ())
+    if not cards:
+        return 0
+    last = int(now // 3600) - 2
+    r = db.execute("select v from meta where k='sales_hourly_h'").fetchone()
+    if r:
+        start = int(float(r[0]))
+    else:
+        m = db.execute("select min(ts) from sales_inferred").fetchone()[0]
+        if m is None:
+            return 0
+        start = int(m // 3600)
+    if start >= last:
+        return 0
+    by: dict = {}
+    for cid, ts, price, kind in db.execute(
+            "select card_id, ts, price, kind from sales_inferred where ts>=? and ts<?",
+            (start * 3600, last * 3600)):
+        if cid in cards:
+            by.setdefault((cid, int(ts // 3600)), []).append((price, kind))
+    out = []
+    for (cid, hr), v in by.items():
+        sold = [p for p, k in v if k == "sale"]
+        out.append((cid, hr, len(sold), len(v) - len(sold),
+                    int(statistics.median(sold)) if sold else None, min(sold) if sold else None))
+    db.executemany("insert or replace into sales_hourly values (?,?,?,?,?,?)", out)
+    db.execute("delete from sales_hourly where hour < ?", (int(now // 3600) - SALES_HOURLY_KEEP_DAYS * 24,))
+    db.execute("insert or replace into meta values ('sales_hourly_h', ?)", (str(last),))
+    db.commit()
+    return len(out)
 
 
 def compact_sales(db, now: float) -> int:

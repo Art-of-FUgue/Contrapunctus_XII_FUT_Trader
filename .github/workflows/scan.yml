@@ -36,10 +36,15 @@ jobs:
           if git ls-remote --exit-code --heads origin "$DATA_BRANCH" > /dev/null 2>&1; then
             echo "Data branch found – fetching price history…"
             git fetch --depth=1 origin "$DATA_BRANCH"
-            if git show FETCH_HEAD:"$DB_FILE" > "$DB_FILE" 2>/dev/null; then
-              echo "Restored $(du -h "$DB_FILE" | cut -f1) price history database."
+            # The DB is stored gzip-compressed (about a third of the size); older runs stored it plain.
+            if git show FETCH_HEAD:"$DB_FILE.gz" > "$DB_FILE.gz" 2>/dev/null && gzip -t "$DB_FILE.gz"; then
+              gunzip -f "$DB_FILE.gz"
+              echo "Restored $(du -h "$DB_FILE" | cut -f1) price history database (from .gz)."
+            elif git show FETCH_HEAD:"$DB_FILE" > "$DB_FILE" 2>/dev/null; then
+              rm -f "$DB_FILE.gz"
+              echo "Restored $(du -h "$DB_FILE" | cut -f1) price history database (plain)."
             else
-              rm -f "$DB_FILE"
+              rm -f "$DB_FILE" "$DB_FILE.gz"
               echo "Branch exists but DB file not found – starting fresh."
             fi
           else
@@ -75,12 +80,14 @@ jobs:
           fi
           echo "Saving $(du -h "$DB_FILE" | cut -f1) price history database…"
           OUT=$(mktemp -d)
-          cp "$DB_FILE" "$OUT/"
+          gzip -6 -c "$DB_FILE" > "$OUT/$DB_FILE.gz"
+          gzip -t "$OUT/$DB_FILE.gz" || { echo "Compression check failed – not saving."; exit 1; }
+          echo "Compressed to $(du -h "$OUT/$DB_FILE.gz" | cut -f1)."
           cd "$OUT"
           git init -q -b "$DATA_BRANCH"
           git config user.name "fc-scanner"
           git config user.email "fc-scanner@users.noreply.github.com"
-          git add "$DB_FILE"
+          git add "$DB_FILE.gz"
           git commit -q -m "price history $(date -u +%Y-%m-%dT%H:%M:%SZ)"
           git remote add origin "$REPO_URL"
           git push -q --force origin "$DATA_BRANCH"
