@@ -11,7 +11,6 @@ holo ...; each title names the period it compares against):
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
     👁 Watchlist Dip      · vs 6 h / 5 min    watched cards dipping again
     👁 Watchlist Prices   · now               current price of every watched card
-    🕒 Buy Windows        · next 24 h         cheapest and best-entry hours per card type, daily (FC_WINDOWS_POST_HOURS)
     📊 Market Index       · 24 h trend        whole-market index by segment, posted every 3 h (FC_INDEX_POST_HOURS)
     (🚀 Rise Alert and ⚡ Quick Spike exist but are off unless FC_SPIKE_ALERTS=1)
 
@@ -303,8 +302,6 @@ def open_db(path: str) -> sqlite3.Connection:
         db.execute("alter table outcomes add column slot text")
     db.execute("create table if not exists market_ret(g text, ts real, ret real)")
     db.execute("create index if not exists mx on market_ret(g, ts)")
-    db.execute("create table if not exists index_ret(seg text, hour_ts integer, ret real, n integer, "
-               "primary key(seg, hour_ts))")                    # permanent hourly index returns
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
     sm.init(db)
     db.execute("create table if not exists meta(k text primary key, v text)")
@@ -1263,186 +1260,6 @@ def maybe_post_index(db, now: float, dry_run: bool) -> None:
         set_meta(db, "index_post_ts", now)
 
 
-# ---- card behaviour types + weekly/daily rhythm -> buy windows ----------------------
-BEHAVIOURS = ["Active", "Mixed", "Quiet"]
-BEH_ACTIVE_MAX_STAY = 0.30           # floor unchanged in <=30% of updates -> Active
-BEH_QUIET_MIN_STAY = 0.60            # floor unchanged in >=60% of updates -> Quiet
-BEH_MIN_SNAPSHOTS = 40
-RHYTHM_SEGMENTS = ["All specials"] + BEHAVIOURS
-INDEX_RET_KEEP_DAYS = 400
-WINDOWS_POST_HOURS = float(os.environ.get("FC_WINDOWS_POST_HOURS", "24"))   # 0 = never post
-RHYTHM_WEEKLY_MIN_DAYS = 21          # data span before the hour-of-week pattern is used
-RHYTHM_MIN_OBS = 3                   # observations per hour bin
-
-
-def card_behaviour(db, now: float) -> dict:
-    """Active = floor changes almost every update (busy, thin pile); Quiet = floor holds
-    (deep pile or little trading); Mixed in between. From the raw snapshots of the last 26 h."""
-    out, cur, ps = {}, None, []
-
-    def flush():
-        if cur is not None and len(ps) >= BEH_MIN_SNAPSHOTS and statistics.median(ps) >= INDEX_MIN_PRICE:
-            same = sum(1 for a, b in zip(ps, ps[1:]) if a == b) / (len(ps) - 1)
-            out[cur] = ("Active" if same <= BEH_ACTIVE_MAX_STAY
-                        else "Quiet" if same >= BEH_QUIET_MIN_STAY else "Mixed")
-    for cid, price in db.execute("select card_id, price from prices where ts>=? order by card_id, ts",
-                                 (now - RAW_HOURS * 3600,)):
-        if cid != cur:
-            flush()
-            cur, ps = cid, []
-        ps.append(price)
-    flush()
-    return out
-
-
-def _hourly_px(db, since: float) -> dict:
-    """card -> {hour number: median price in that hour}, from raw snapshots over hourly medians."""
-    per: dict = {}
-    for cid, h, price in db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts>=?", (since,)):
-        per.setdefault(cid, {}).setdefault(int(h // 3600), []).append(price)
-    raw: dict = {}
-    for cid, ts, price in db.execute("select card_id, ts, price from prices where ts>=?", (since,)):
-        raw.setdefault(cid, {}).setdefault(int(ts // 3600), []).append(price)
-    for cid, hrs in raw.items():
-        per.setdefault(cid, {}).update(hrs)
-    return {cid: {h: statistics.median(v) for h, v in hrs.items()} for cid, hrs in per.items()}
-
-
-def record_index_hours(db, now: float) -> int:
-    """Append the hourly return of every segment and behaviour type for each finished hour not
-    recorded yet (the first call back-fills what the price history holds). Permanent, tiny."""
-    cur_hour = int(now // 3600)
-    last = db.execute("select max(hour_ts) from index_ret").fetchone()[0]
-    first = int(last // 3600) + 1 if last else cur_hour - 118
-    if first >= cur_hour:
-        return 0
-    players, holo = _load_players(), _load_holo(_load_players())
-    seg_of = {str(eid): _index_segment(row["rarityName"] + (" 🃏 Holo" if eid in holo else ""))
-              for eid, row in players.items()}
-    beh = card_behaviour(db, now)
-    px = {c: h for c, h in _hourly_px(db, (first - 1) * 3600).items() if c in seg_of}
-    rows = []
-    for h in range(first, cur_hour):
-        prev = h - 1
-        rets = {seg: [] for seg in INDEX_SEGMENTS + BEHAVIOURS}
-        for cid, hrs in px.items():
-            a, b = hrs.get(prev), hrs.get(h)
-            if a and b and a >= INDEX_MIN_PRICE and b >= INDEX_MIN_PRICE:
-                r = max(-0.4, min(0.4, b / a - 1))
-                rets["All specials"].append(r)
-                rets[seg_of[cid]].append(r)
-                if cid in beh:
-                    rets[beh[cid]].append(r)
-        for seg, rs in rets.items():
-            if len(rs) >= INDEX_MIN_CARDS:
-                rs.sort()
-                cut = len(rs) // 10
-                rs = rs[cut:len(rs) - cut] or rs
-                rows.append((seg, h * 3600, statistics.mean(rs), len(rs)))
-    db.executemany("insert or ignore into index_ret values (?,?,?,?)", rows)
-    db.execute("delete from index_ret where hour_ts < ?", (now - INDEX_RET_KEEP_DAYS * 86400,))
-    db.commit()
-    return len(rows)
-
-
-def rhythm(db, seg: str, now: float):
-    """Typical detrended % move per hour of the day (or of the week once there are 3 weeks),
-    in Austin time. Returns None with too little history."""
-    from zoneinfo import ZoneInfo
-    import datetime as _dt
-    tz = ZoneInfo(TIMEZONE)
-    rows = db.execute("select hour_ts, ret from index_ret where seg=? order by hour_ts", (seg,)).fetchall()
-    if len(rows) < 48:
-        return None
-    span_days = (rows[-1][0] - rows[0][0]) / 86400
-    overall = statistics.mean(r for _, r in rows)
-    weekly = span_days >= RHYTHM_WEEKLY_MIN_DAYS
-    bins: dict = {}
-    for t, r in rows:
-        d = _dt.datetime.fromtimestamp(t, tz)
-        key = (d.weekday(), d.hour) if weekly else (0, d.hour)
-        bins.setdefault(key, []).append((r - overall) * 100)
-    if weekly and any(len(v) < RHYTHM_MIN_OBS for v in bins.values()):
-        weekly = False                                    # fall back to the daily pattern
-        bins = {}
-        for t, r in rows:
-            d = _dt.datetime.fromtimestamp(t, tz)
-            bins.setdefault((0, d.hour), []).append((r - overall) * 100)
-    mean = {k_: statistics.mean(v) for k_, v in bins.items()}
-    se = {k_: (statistics.stdev(v) / len(v) ** 0.5 if len(v) > 1 else 9.9) for k_, v in bins.items()}
-    n = {k_: len(v) for k_, v in bins.items()}
-    return {"weekly": weekly, "mean": mean, "se": se, "n": n, "days": span_days}
-
-
-def buy_windows(db, seg: str, now: float):
-    """For the next 24 local hours: cheapest hour (lowest point of the typical cycle) and the
-    best entry hour (largest typical gain over the following 3 h), with how sure the data is."""
-    prof = rhythm(db, seg, now)
-    if not prof:
-        return None
-    from zoneinfo import ZoneInfo
-    import datetime as _dt
-    tz = ZoneInfo(TIMEZONE)
-    start = _dt.datetime.fromtimestamp(now, tz).replace(minute=0, second=0, microsecond=0)
-    hours = [start + _dt.timedelta(hours=i) for i in range(1, 49)]      # 48 h so we can look ahead
-
-    def key(d):
-        return (d.weekday(), d.hour) if prof["weekly"] else (0, d.hour)
-    m = [prof["mean"].get(key(d), 0.0) for d in hours]
-    e = [prof["se"].get(key(d), 9.9) for d in hours]
-    level, acc = [], 0.0
-    for x in m[:24]:
-        acc += x
-        level.append(acc)
-    low_i = min(range(24), key=lambda i: level[i])
-    gains = [(sum(m[i + 1:i + 4]), (sum(x * x for x in e[i + 1:i + 4])) ** 0.5, i) for i in range(24)]
-    g, se_g, gi = max(gains)
-    return {"low": hours[low_i], "entry": hours[gi], "gain": g, "gain_se": se_g,
-            "weekly": prof["weekly"], "days": prof["days"], "swing": max(level) - min(level)}
-
-
-def _hr(d) -> str:
-    return d.strftime("%a ") + d.strftime("%I %p").lstrip("0").lower()
-
-
-def build_buy_windows(db, now: float) -> list[dict]:
-    rows, conf = [], None
-    for seg in RHYTHM_SEGMENTS:
-        w = buy_windows(db, seg, now)
-        if not w:
-            continue
-        conf = conf or w
-        sure = "" if w["gain_se"] and abs(w["gain"]) >= 2.5 * w["gain_se"] else " (weak)"
-        rows.append(f"{seg:13}{_hr(w['low']):>10}   {_hr(w['entry']):>10}  {w['gain']:+.2f}%{sure}")
-    if not rows:
-        return []
-    beh = card_behaviour(db, now)
-    counts = {b: sum(1 for v in beh.values() if v == b) for b in BEHAVIOURS}
-    kind = (f"weekly pattern, {conf['days'] / 7:.1f} weeks of data" if conf["weekly"]
-            else f"daily pattern only, {conf['days']:.1f} days of data - preliminary, the weekly pattern needs 3+ weeks")
-    lines = [f"⏱ Next 24 h in **Austin time** · based on the {kind}", "```",
-             f"{'':13}{'cheapest':>10}   {'best entry':>10}  gain over next 3 h", *rows, "```",
-             "Active = floor moves almost every update (busy) · Quiet = floor holds (deep pile or little trading) · "
-             "Mixed in between",
-             "Cards: " + " · ".join(f"{b} {counts[b]}" for b in BEHAVIOURS)]
-    return [{"title": f"🕒 Buy Windows · next 24 h · {PLATFORM_LABEL}", "description": "\n".join(lines),
-             "color": 0x1ABC9C,
-             "footer": {"text": "Typical hourly drift per card type, trend removed · a guide to timing, not a signal; "
-                                "(weak) = within the noise"}}]
-
-
-def maybe_post_buy_windows(db, now: float, dry_run: bool) -> None:
-    if WINDOWS_POST_HOURS <= 0:
-        return
-    last = get_meta(db, "windows_post_ts")
-    if last and now - float(last) < WINDOWS_POST_HOURS * 3600 - 120:
-        return
-    embeds = build_buy_windows(db, now)
-    if embeds:
-        post(embeds, dry_run)
-        set_meta(db, "windows_post_ts", now)
-
-
 # ------------------------------------------------------------------- scan --
 def _is_premium(card: Card) -> bool:
     """True for Icons and Heroes (matched on words in the rarity name)."""
@@ -1959,9 +1776,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
         try:
-            record_index_hours(db, now)                        # permanent hourly index record
             maybe_post_index(db, now, dry_run)                 # market index, every few hours
-            maybe_post_buy_windows(db, now, dry_run)           # buy windows, once a day
         except Exception as e:                                 # never let the index break a scan
             print(f"[warn] market index failed: {e}")
         found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
