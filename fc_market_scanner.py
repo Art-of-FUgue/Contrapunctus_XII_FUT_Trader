@@ -1497,6 +1497,27 @@ def _behaviour_cached(db, now: float) -> dict:
     return _cache["beh"][1]
 
 
+def prune_active_sales(db, cards, now: float) -> int:
+    """Active cards that are not Icons/Heroes keep inferred sales only as long as the raw floor
+    snapshots (RAW_HOURS); their floor path already tells the story. Premium cards and Mixed/Quiet
+    cards keep the full SALES_RAW_DAYS. Runs at most once an hour."""
+    last = get_meta(db, "active_prune_ts")
+    if last and now - float(last) < 3600:
+        return 0
+    beh = _behaviour_cached(db, now)
+    ids = [c.card_id for c in cards if beh.get(c.card_id) == "Active" and not _is_premium(c)]
+    n = 0
+    cut = now - RAW_HOURS * 3600
+    for i in range(0, len(ids), 500):
+        part = ids[i:i + 500]
+        marks = ",".join("?" * len(part))
+        n += db.execute(f"delete from sales_inferred where ts < ? and card_id in ({marks})",
+                        (cut, *part)).rowcount
+    db.commit()
+    set_meta(db, "active_prune_ts", now)
+    return n
+
+
 def record_dip_events(db, cards, stats: dict, adj24: dict, skip: set, now: float) -> int:
     """Log each card that sits EVENT_DIP_PCT+ below its 24 h median, once per episode, with the
     situation at that moment (type, depth, market move, whether the dip persisted for two
@@ -1848,6 +1869,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         record_dip_events(db, cards, stats, adj24, muted_new | watch, now)   # long-term dip ledger
     except Exception as e:                                                    # never break a scan
         print(f"[warn] dip ledger failed: {e}")
+    try:
+        prune_active_sales(db, cards, now)
+    except Exception as e:
+        print(f"[warn] active sales prune failed: {e}")
 
     for c in cards:
         if c.card_id in watch:
