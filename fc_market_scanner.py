@@ -469,27 +469,66 @@ def build_cycles(items) -> list[dict]:
     return [e]
 
 
-# ---- auto-watchlist: cards that keep completing round trips -------------------
-AUTO_WATCH_MIN_CYCLES = int(os.environ.get("FC_AUTO_WATCH_MIN_CYCLES", "2"))
-AUTO_WATCH_WINDOW_DAYS = 7       # count round trips inside this window
-AUTO_WATCH_DAYS = 14             # stay watched this long after the last qualifying trip
-CYCLE_GAP_HOURS = 6              # two alerts closer than this count as one round trip
+# ---- auto-watchlist: liquid cards whose dips have paid back ------------------------------
+# Every AUTO_REFRESH_H hours the last AUTO_LOOKBACK_DAYS of hourly prices are replayed for each
+# liquid card: buy when the hourly price is AUTO_DIP_PCT below its trailing 24 h median (at most one
+# buy per 6 h), sell AUTO_HOLD_H hours later, net of the 5% tax and the exit haircut.
+# Cards whose dips averaged more than AUTO_MIN_MEAN % and won in at least AUTO_MIN_WIN of the trades
+# are watched. New cards are left out (their prices are still finding a level).
+AUTO_DIP_PCT = 6.0
+AUTO_HOLD_H = 6
+AUTO_GAP_H = 6                   # at most one replayed buy per card per this many hours
+AUTO_MIN_EVENTS = int(os.environ.get("FC_AUTO_MIN_EVENTS", "4"))
+AUTO_MIN_MEAN = 2.0
+AUTO_MIN_WIN = 0.6
+AUTO_MIN_SALES = 30              # inferred sales in 4 days (liquidity)
+AUTO_MIN_PRICE = 30_000
+AUTO_MAX = int(os.environ.get("FC_AUTO_MAX", "20"))
+AUTO_LOOKBACK_DAYS = 7
+AUTO_REFRESH_H = 6
+AUTO_WATCH_DAYS = 3              # stay watched this long after last qualifying (avoids flicker)
 
 
-def auto_watch_update(db, cards, now: float) -> None:
-    """Add cards that appeared in >= AUTO_WATCH_MIN_CYCLES separate round trips."""
+def dip_replay(series: dict, thr_pct: float = AUTO_DIP_PCT, hold_h: int = AUTO_HOLD_H) -> list[float]:
+    """Net % (after tax and haircut) of each replayed dip-buy in one card's hourly price series."""
+    out, last_h = [], -10 ** 9
+    for h in sorted(series):
+        if h - last_h < AUTO_GAP_H or series[h] < AUTO_MIN_PRICE:
+            continue
+        win = [series[x] for x in range(h - 24, h) if x in series]
+        if len(win) < 12 or series[h] > statistics.median(win) * (1 - thr_pct / 100):
+            continue
+        if (h + hold_h) in series:
+            out.append((series[h + hold_h] * (1 - EA_TAX) / series[h] - 1) * 100 - EXIT_HAIRCUT_PCT)
+            last_h = h
+    return out
+
+
+def auto_watch_update(db, cards, now: float, skip: set | None = None) -> None:
+    """Refresh the auto-watchlist (see above). Runs at most every AUTO_REFRESH_H hours."""
+    last = get_meta(db, "auto_watch_ts")
+    if last and now - float(last) < AUTO_REFRESH_H * 3600 - 120:
+        return
+    skip = skip or set()
+    sales = dict(db.execute("select card_id, count(*) from sales_inferred where kind='sale' and ts>=? "
+                            "group by card_id", (now - 96 * 3600,)))
+    px = _hourly_px(db, now - AUTO_LOOKBACK_DAYS * 86400)
+    picks = []
     for c in cards:
-        stamps = [r[0] for r in db.execute(
-            "select ts from alerts where card_id=? and kind='cycle' and ts>=? order by ts",
-            (c.card_id, now - AUTO_WATCH_WINDOW_DAYS * 86400))]
-        trips, last = 0, None
-        for t in stamps:
-            if last is None or t - last >= CYCLE_GAP_HOURS * 3600:
-                trips += 1
-                last = t
-        if trips >= AUTO_WATCH_MIN_CYCLES:
-            db.execute("insert or replace into watch_auto values (?,?)", (c.card_id, now))
-            print(f"[info] auto-watch: {c.name} ({trips} round trips in {AUTO_WATCH_WINDOW_DAYS}d)")
+        if c.card_id in skip or c.price < AUTO_MIN_PRICE or sales.get(c.card_id, 0) < AUTO_MIN_SALES:
+            continue
+        ev = dip_replay(px.get(c.card_id, {}))
+        if len(ev) < AUTO_MIN_EVENTS:
+            continue
+        mean, win = statistics.mean(ev), sum(1 for x in ev if x > 0) / len(ev)
+        if mean > AUTO_MIN_MEAN and win >= AUTO_MIN_WIN:
+            picks.append((mean * win, c, len(ev), mean, win))
+    picks.sort(key=lambda r: -r[0])
+    for _, c, n, mean, win in picks[:AUTO_MAX]:
+        db.execute("insert or replace into watch_auto values (?,?)", (c.card_id, now))
+        print(f"[info] auto-watch: {c.name} ({n} dips, avg net {mean:+.1f}% @{AUTO_HOLD_H}h, {win * 100:.0f}% won)")
+    db.execute("delete from watch_auto where added_ts < ?", (now - AUTO_WATCH_DAYS * 86400,))
+    set_meta(db, "auto_watch_ts", now)
     db.commit()
 
 
@@ -559,7 +598,7 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
         tag = " 🔁" if c.card_id in auto else ""
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}{tag}")
         lines.append(f"{d.get('icon', '📉')} `{d['pct']:+.1f}%` · {d['why']}{d.get('extra', '')}{open_link(c)}")
-    lines += ["", "🔁 = auto-added after repeated round trips"]
+    lines += ["", "🔁 = auto-watched: liquid card whose recent dips paid back after tax"]
     e = {"title": f"👁 Watchlist Dip · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
          "footer": {"text": "Watched cards post only when they dip again"}}
@@ -2185,7 +2224,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         spikes = fresh_spikes(db, spikes, now, "spike")
         flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
     _cyc = fresh_cycles(db, cycles, now) if run_cycles else []
-    auto_watch_update(db, [c for c, _ in _cyc], now)
+    auto_watch_update(db, cards, now, muted_new | watch)
     embeds = (
         build_dips(dips)
         + (build_cycles(_cyc) if run_cycles else [])
