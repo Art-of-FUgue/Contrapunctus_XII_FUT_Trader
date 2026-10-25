@@ -1784,7 +1784,7 @@ def _is_premium(card: Card) -> bool:
 # special card (promo, TOTW ... and their holos) above PREMIUM_PROMO_MIN. These cards get the
 # sale-based premium dip detector only and are left out of the other dip posts.
 PREMIUM_ICON_HERO_MIN = parse_price(os.environ.get("FC_PREMIUM_ICON_HERO_MIN", 100_000))
-PREMIUM_PROMO_MIN = parse_price(os.environ.get("FC_PREMIUM_PROMO_MIN", 500_000))
+PREMIUM_PROMO_MIN = parse_price(os.environ.get("FC_PREMIUM_PROMO_MIN", 300_000))
 
 
 def _in_premium_list(card: Card, usual: float | None = None) -> bool:
