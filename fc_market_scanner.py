@@ -1110,22 +1110,27 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
         embeds.append(e)
     return embeds
 
-def build_premium_dips(items) -> list[dict]:
-    """Premium-list dips (Icons/Heroes and pricey promo cards) against real sold prices,
-    grouped by card version. Each entry already passed card_premium_dip_stats()."""
+def build_premium_dips(items, hot: bool = False) -> list[dict]:
+    """Premium-list dips (Icons/Heroes and pricey promo cards), grouped by card version.
+    hot=True: the cards that fell below their 4-day SOLD price (the strongest signal) in their own
+    red embed; hot=False: the rest, judged against the 24 h median floor while sales are thin."""
+    items = [(c, s) for c, s in (items or []) if ("net" in s) == hot]
     if not items:
         return []
-    lines = [
-        f"⏱ Compared with **{PREMIUM_SALE_WINDOW_H // 24}-day sold prices**",
-        f"(cards with under {PREMIUM_MIN_SALES} sales: vs **{PREMIUM_HISTORY_HOURS} h median** floor price)",
-    ]
+    if hot:
+        lines = [f"⏱ Below the **{PREMIUM_SALE_WINDOW_H // 24}-day sold price** · "
+                 f"≥{PREMIUM_SOLD_MIN_DIP:.0f}% and ≥{PREMIUM_SIGMA_K:.0f} spreads deep"]
+    else:
+        lines = [f"⏱ Under {PREMIUM_MIN_SALES} sales in {PREMIUM_SALE_WINDOW_H // 24} days · "
+                 f"compared with the **{PREMIUM_HISTORY_HOURS} h median** floor price"]
     first = None
     for kind, grp in by_version(items):
         grp = _limit(sorted(grp, key=lambda i: _score_key(i[1], i[1]["dip_pct"])))
         lines += ["", _group_header(kind, len(grp))]
         for c, s in grp:
             first = first or c
-            lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
+            head = f"{k(c.price)} · {c.name} · {c.kind}"
+            lines.append(f"### 🚨 **{head}**" if hot else f"### {head}")
             lines.append(
                 f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
                 f"vs {_premium_ref(s)} {k(s['sales_median'])}"
@@ -1134,24 +1139,23 @@ def build_premium_dips(items) -> list[dict]:
             )
             if s.get("score"):
                 lines.append(f"↳ {score_text(s)}")
-    legend = []
-    if any("net" in x for _, x in items):
-        legend.append("vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%")
-    if any("net" not in x for _, x in items):
-        legend.append("vs median: 🔴 15%+ · 🟠 12–15% · 🟢 8–12% below")
-    lines += [""] + legend
+    if hot:
+        lines += ["", "vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%"]
+    else:
+        lines += ["", "vs median: 🔴 15%+ · 🟠 12–15% · 🟢 8–12% below"]
     e = {
-        "title": f"💎 Premium Dip · vs {PREMIUM_SALE_WINDOW_H // 24}-day sold · {PLATFORM_LABEL}",
+        "title": (f"🚨💎 PREMIUM BELOW 4-DAY SOLD · {PLATFORM_LABEL}" if hot
+                  else f"💎 Premium Dip · vs 24 h median · {PLATFORM_LABEL}"),
         "description": "\n".join(lines),
-        "color": 0x8E44AD,
-        "footer": {"text": (
-            f"Net = profit after 5% tax if resold at fair value · "
-            f"≥{PREMIUM_SOLD_MIN_DIP:.0f}% and ≥{PREMIUM_SIGMA_K:.0f} spreads deep"
-        )},
+        "color": 0xE74C3C if hot else 0x8E44AD,
+        "footer": {"text": ("Net = profit after 5% tax if resold at the sold price" if hot else
+                            f"Fallback while a card has under {PREMIUM_MIN_SALES} sales · "
+                            f"≥{PREMIUM_DIP_MIN_PCT:.0f}% below the median")},
     }
     if first and first.image_url:
         e["thumbnail"] = {"url": first.image_url}
     return [e]
+
 
 def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dict]:
     """Embed showing current price for every card on the watchlist."""
@@ -1982,11 +1986,12 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     _cyc = fresh_cycles(db, cycles, now) if run_cycles else []
     auto_watch_update(db, [c for c, _ in _cyc], now)
     embeds = (
-        build_dips(dips)
+        build_premium_dips(premium_dips, hot=True)    # 🚨 premium below its 4-day sold price: first, in red
+        + build_dips(dips)
         + (build_cycles(_cyc) if run_cycles else [])
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
-        + build_premium_dips(premium_dips)    # 💎 premium dips
+        + build_premium_dips(premium_dips)    # 💎 premium dips on the 24 h median fallback
     )
 
     # ── watchlist: posts only when a watched card dips again ─────────────────
