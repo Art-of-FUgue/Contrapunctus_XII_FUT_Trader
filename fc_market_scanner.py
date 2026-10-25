@@ -483,7 +483,7 @@ def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float 
     Premium cards: the premium rule (4-day sold price, or 24 h median when sales are thin),
     plus a crash alert when the price falls WATCH_PREMIUM_CRASH_PCT or more within 5 min.
     """
-    best, kind, extra = None, "watch", ""
+    best, kind, extra, ps = None, "watch", "", None
     if premium:
         ps = card_premium_dip_stats(db, card, now, mkt_adj)
         if ps:
@@ -519,7 +519,9 @@ def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float 
     db.execute("insert into alerts values (?,?,?,?)", (card.card_id, kind, now, card.price))
     db.commit()
     return {"pct": best[0], "why": best[1], "ref": best[2], "extra": extra,
-            "icon": "💥" if kind == "watchcrash" else "📉"}
+            "icon": "💥" if kind == "watchcrash" else "📉",
+            # a watched premium card that passed the 4-day sold rule also goes to the red alert
+            "sold": ps if (premium and kind == "watch" and ps and "net" in ps) else None}
 
 
 def build_watch_dips(items, auto: set[str]) -> list[dict]:
@@ -1871,6 +1873,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     watch = watchlist or set()
     auto = auto_watch_ids(db, now)
     watch_hits: list = []
+    sold_watch: list = []                        # watched premium cards below their 4-day sold price
     stats = {c.card_id: card_stats(db, c, now) for c in cards
              if c.card_id not in muted_new and c.card_id not in watch}
     prev_ts = db.execute("select max(ts) from prices").fetchone()[0]
@@ -1895,7 +1898,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
             d = watch_dip(db, c, now, _in_premium_list(c, ws["usual"] if ws else None),
                           adj24.get(rgroup(c), 0.0))
             if d:
-                watch_hits.append((c, d))
+                if d.get("sold"):
+                    sold_watch.append((c, d["sold"]))
+                else:
+                    watch_hits.append((c, d))
             cy = find_cycle(db, c, now)
             if cy:
                 cycles.append((c, cy))
@@ -2002,7 +2008,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
 
     # 🚨 premium below its 4-day sold price goes out LAST, so it sits at the bottom of the channel,
     # right where you look first
-    embeds += build_premium_dips(premium_dips, hot=True)
+    embeds += build_premium_dips(premium_dips + sold_watch, hot=True)
 
     return embeds
 
