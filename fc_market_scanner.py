@@ -575,10 +575,12 @@ def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float 
                 kind = "watchcrash"
     if not best:
         return None
-    if kind == "watchcrash":                      # crash: short cooldown, re-alert on a further drop
-        cool, realert = DIP_COOLDOWN_MIN * 60, DIP_REALERT_PCT
-    else:
-        cool, realert = SPIKE_COOLDOWN_HOURS * 3600, SPIKE_REALERT_PCT
+    try:
+        types = _behaviour_cached(db, now)
+    except Exception:
+        types = {}
+    # watched cards may repeat: same short per-type cooldown as the regular dip alerts
+    cool, realert = dip_cooldown_min(types, card.card_id) * 60, DIP_REALERT_PCT
     row = db.execute(
         "select price from alerts where card_id=? and kind=? and ts>=? "
         "order by ts desc limit 1", (card.card_id, kind, now - cool)).fetchone()
