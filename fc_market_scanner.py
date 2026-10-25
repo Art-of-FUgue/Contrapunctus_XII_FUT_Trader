@@ -366,7 +366,7 @@ DIP_REALERT_PCT = 3.0            # ...or its price drops this much below the las
 # Dip cooldown by behaviour type: busy cards can re-alert soon, quiet ones (and unclassified) wait longer.
 DIP_COOLDOWN_BY_TYPE = {
     "Active": float(os.environ.get("FC_DIP_COOLDOWN_ACTIVE", "5")),
-    "Mixed": float(os.environ.get("FC_DIP_COOLDOWN_MIXED", "5")),
+    "Mixed": float(os.environ.get("FC_DIP_COOLDOWN_MIXED", "10")),
     "Quiet": float(os.environ.get("FC_DIP_COOLDOWN_QUIET", str(DIP_COOLDOWN_MIN))),
 }
 
