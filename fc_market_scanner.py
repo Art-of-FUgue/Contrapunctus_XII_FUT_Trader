@@ -375,6 +375,18 @@ def dip_cooldown_min(types: dict, card_id: str) -> float:
     return DIP_COOLDOWN_BY_TYPE.get(types.get(card_id), DIP_COOLDOWN_MIN)
 
 
+# Premium-list and watched cards have no cooldown: they post again whenever the price has moved
+# at least REPEAT_MOVE_PCT since the last post (up or down), or after REPEAT_SAME_MIN minutes if not.
+REPEAT_MOVE_PCT = 1.0
+REPEAT_SAME_MIN = 30
+
+
+def repeat_blocked(db, card_id: str, kind: str, price: float, now: float) -> bool:
+    row = db.execute("select price from alerts where card_id=? and kind=? and ts>=? order by ts desc limit 1",
+                     (card_id, kind, now - REPEAT_SAME_MIN * 60)).fetchone()
+    return bool(row and row[0] > 0 and abs(price / row[0] - 1) * 100 < REPEAT_MOVE_PCT)
+
+
 def fresh_dips(db, items, now: float, kind: str):
     out = []
     try:
@@ -383,6 +395,12 @@ def fresh_dips(db, items, now: float, kind: str):
         types = {}
     for item in items:
         c = item[0]
+        if kind == "prem":                        # premium list: no cooldown, only a price-change filter
+            if repeat_blocked(db, c.card_id, kind, c.price, now):
+                continue
+            out.append(item)
+            db.execute("insert into alerts values (?,?,?,?)", (c.card_id, kind, now, c.price))
+            continue
         row = db.execute(
             "select price from alerts where card_id=? and kind=? and ts>=? "
             "order by ts desc limit 1",
@@ -570,17 +588,9 @@ def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float 
                 kind = "watchcrash"
     if not best:
         return None
-    try:
-        types = _behaviour_cached(db, now)
-    except Exception:
-        types = {}
-    # watched cards may repeat: same short per-type cooldown as the regular dip alerts
-    cool, realert = dip_cooldown_min(types, card.card_id) * 60, DIP_REALERT_PCT
-    row = db.execute(
-        "select price from alerts where card_id=? and kind=? and ts>=? "
-        "order by ts desc limit 1", (card.card_id, kind, now - cool)).fetchone()
-    if row and card.price > row[0] * (1 - realert / 100):
-        return None                               # already posted this dip
+    # watched cards have no cooldown: they post again when the price moved since the last post
+    if repeat_blocked(db, card.card_id, kind, card.price, now):
+        return None
     db.execute("insert into alerts values (?,?,?,?)", (card.card_id, kind, now, card.price))
     db.commit()
     return {"pct": best[0], "why": best[1], "ref": best[2], "extra": extra,
