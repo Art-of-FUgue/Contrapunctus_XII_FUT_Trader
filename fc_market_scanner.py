@@ -1655,11 +1655,26 @@ PREMIUM_ICON_HERO_MIN = parse_price(os.environ.get("FC_PREMIUM_ICON_HERO_MIN", 1
 PREMIUM_PROMO_MIN = parse_price(os.environ.get("FC_PREMIUM_PROMO_MIN", 300_000))
 
 
+PREMIUM_LIQUID_MIN_SALES = int(os.environ.get("FC_PREMIUM_LIQUID_MIN_SALES", "20"))   # sales in 4 days
+_LIQUID_CARDS: set = set()       # cards with at least that many inferred sales; refreshed every scan
+
+
+def refresh_liquid_cards(db, now: float) -> None:
+    global _LIQUID_CARDS
+    rows = db.execute("select card_id from sales_inferred where kind='sale' and ts>=? group by card_id "
+                      "having count(*)>=?", (now - PREMIUM_SALE_WINDOW_H * 3600, PREMIUM_LIQUID_MIN_SALES))
+    _LIQUID_CARDS = {r[0] for r in rows}
+
+
 def _in_premium_list(card: Card, usual: float | None = None) -> bool:
     """Judged on the higher of the current price and its 24 h median, so a card that
     dips below the threshold stays in the premium list instead of dropping out of it."""
     floor = PREMIUM_ICON_HERO_MIN if _is_premium(card) else PREMIUM_PROMO_MIN
-    return max(card.price, usual or 0) >= floor
+    value = max(card.price, usual or 0)
+    if value >= floor:
+        return True
+    # a well-traded card of 100k+ has plenty of sold prices to judge by, whatever its promo
+    return value >= PREMIUM_ICON_HERO_MIN and card.card_id in _LIQUID_CARDS
 
 
 def _is_totw(card: Card) -> bool:
@@ -1915,6 +1930,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     cards_map = {c.card_id: c for c in cards}
     muted_new = new_card_ids(db, now)
     watch = watchlist or set()
+    try:
+        refresh_liquid_cards(db, now)
+    except Exception as e:
+        print(f"[warn] liquid-card refresh failed: {e}")
     auto = auto_watch_ids(db, now)
     watch_hits: list = []
     sold_watch: list = []                        # watched premium cards below their 4-day sold price
