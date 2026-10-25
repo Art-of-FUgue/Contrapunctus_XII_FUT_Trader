@@ -18,6 +18,7 @@ jobs:
       DB_FILE: market_pc.db
       DATA_BRANCH: ${{ github.ref_name == 'main' && 'data' || format('data-{0}', github.ref_name) }}   # other branches get their own DB branch
       FC_WINDOWS_POST_HOURS: "24"      # buy-window report is posted from this branch only (main keeps it off)
+      FC_SCORER_POST_HOURS: "24"       # shadow dip-scorer scoreboard, once a day (this branch only)
 
     steps:
       - uses: actions/checkout@v4

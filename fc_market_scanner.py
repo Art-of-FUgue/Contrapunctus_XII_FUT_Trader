@@ -37,6 +37,7 @@ How it works
 """
 import argparse
 import json
+import math
 import os
 import random
 import sqlite3
@@ -313,6 +314,10 @@ def open_db(path: str) -> sqlite3.Connection:
     for col in ("xm15", "xm60", "best3"):                   # quick-flip outcomes added later
         if col not in have:
             db.execute(f"alter table dip_events add column {col} real")
+    for col, typ in (("verdict", "text"), ("v_h", "text"), ("v_n", "integer"), ("v_mean", "real"),
+                     ("v_lb", "real"), ("v_win", "real"), ("v_lvl", "integer")):   # shadow scorer verdict
+        if col not in have:
+            db.execute(f"alter table dip_events add column {col} {typ}")
     db.execute("create table if not exists index_ret(seg text, hour_ts integer, ret real, n integer, "
                "primary key(seg, hour_ts))")                    # permanent hourly index returns
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
@@ -1569,11 +1574,20 @@ def record_dip_events(db, cards, stats: dict, adj24: dict, skip: set, now: float
         fair = int(st["fair"]) if st and st["n"] >= 4 else None
         near = db.execute("select count(*) from sales_inferred where card_id=? and kind='sale' "
                           "and ts>=? and price<=?", (c.card_id, now - 1800, c.price * 1.01)).fetchone()[0]
-        db.execute("insert into dip_events(card_id, ts, price, usual, dip, mkt, typ, seg, band, persist, "
-                   "fair, sale_near, wd, hr) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                   (c.card_id, now, c.price, int(s_["usual"]), dip, adj24.get(rgroup(c), 0.0),
-                    beh.get(c.card_id, "?"), _index_segment(c.kind), price_band(c.price), persist,
-                    fair, near, loc.weekday(), loc.hour))
+        mkt = adj24.get(rgroup(c), 0.0)
+        typ = beh.get(c.card_id, "?")
+        cur = db.execute("insert into dip_events(card_id, ts, price, usual, dip, mkt, typ, seg, band, persist, "
+                         "fair, sale_near, wd, hr) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                         (c.card_id, now, c.price, int(s_["usual"]), dip, mkt,
+                          typ, _index_segment(c.kind), price_band(c.price), persist,
+                          fair, near, loc.weekday(), loc.hour))
+        try:
+            v = judge_dip(db, typ, dip, mkt, persist)       # shadow verdict, logged and never posted
+            db.execute("update dip_events set verdict=?, v_h=?, v_n=?, v_mean=?, v_lb=?, v_win=?, v_lvl=? "
+                       "where id=?", (v["verdict"], v["h"], v["n"], v["mean"], v["lb"], v["win"], v["lvl"],
+                                      cur.lastrowid))
+        except Exception as e:
+            print(f"[warn] dip scorer failed: {e}")
         n += 1
     db.execute("delete from dip_events where ts < ?", (now - EVENT_KEEP_DAYS * 86400,))
     db.commit()
@@ -1623,6 +1637,124 @@ def resolve_dip_events(db, now: float) -> int:
         done += 1
     db.commit()
     return done
+
+
+# ---- dip scorer: judge a dip by what similar past dips actually returned ------------------
+SCORER_MIN_N = int(os.environ.get("FC_SCORER_MIN_N", "30"))   # similar past events needed at a horizon
+SCORER_MIN_WIN = 0.55            # share of similar events that ended in profit, for a BUY
+SCORER_Z = 2.5                   # strict lower bound: the best of 4 horizons is picked, so a plain 95% would pass too much noise
+SCORE_HORIZONS = (("xm15", "15 min"), ("xm60", "1 h"), ("x3", "3 h"), ("x6", "6 h"))
+FALLING_MKT_PCT = -2.0           # the card's group is "falling" when it is down this much over 24 h
+
+
+def _depth_bin(dip: float) -> str:
+    a = abs(dip)
+    return "8-12" if a < 12 else "12-20" if a < 20 else "20+"
+
+
+def _depth_sql(b: str) -> tuple[float, float]:
+    return {"8-12": (0.0, 12.0), "12-20": (12.0, 20.0), "20+": (20.0, 1e9)}[b]
+
+
+def _winsor(v: list, lo_q: float = 0.05, hi_q: float = 0.95) -> list:
+    if len(v) < 10:
+        return v
+    s = sorted(v)
+    lo, hi = s[int(lo_q * (len(s) - 1))], s[int(hi_q * (len(s) - 1))]
+    return [min(max(x, lo), hi) for x in v]
+
+
+def _bound(vals: list) -> dict | None:
+    """Mean of the winsorized net results, its one-sided 95% lower bound and the win rate."""
+    vals = [x for x in vals if x is not None and x < 900]
+    if len(vals) < 2:
+        return None
+    w = _winsor(vals)
+    sd = statistics.pstdev(vals) or 1e-9               # spread of the raw results, outliers included
+    m = statistics.mean(w)
+    return {"n": len(vals), "mean": m, "lb": m - SCORER_Z * sd / math.sqrt(len(vals)),
+            "win": sum(1 for x in vals if x > 0) / len(vals), "median": statistics.median(vals)}
+
+
+def judge_dip(db, typ: str, dip: float, mkt: float, persist: int) -> dict:
+    """Verdict for a dip from the past events most like it (same behaviour type, depth band,
+    persistence, market direction). Looks for the most specific group that has SCORER_MIN_N resolved
+    events at some horizon, then says:
+      BUY      a horizon whose lower confidence bound is above zero net, with a win rate >= SCORER_MIN_WIN
+      WATCH    similar dips were profitable on average but not reliably
+      SKIP     similar dips lost on average
+      LEARNING not enough similar past events yet."""
+    lo, hi = _depth_sql(_depth_bin(dip))
+    falling = 1 if mkt <= FALLING_MKT_PCT else 0
+    levels = [
+        ("typ=? and abs(dip)>=? and abs(dip)<? and persist=? and (mkt<=?)=?", (typ, lo, hi, persist, FALLING_MKT_PCT, falling)),
+        ("typ=? and abs(dip)>=? and abs(dip)<? and persist=?", (typ, lo, hi, persist)),
+        ("typ=? and abs(dip)>=? and abs(dip)<?", (typ, lo, hi)),
+    ]                            # never mixes behaviour types: Active dips say nothing about Quiet ones
+    for lvl, (where, args) in enumerate(levels):
+        found = []
+        for col, label in SCORE_HORIZONS:
+            vals = [r[0] for r in db.execute(f"select {col} from dip_events where {where} and {col} is not null "
+                                             f"and {col}<900", args)]
+            st_ = _bound(vals)
+            if st_ and st_["n"] >= SCORER_MIN_N:
+                found.append((label, st_))
+        if not found:
+            continue
+        top = max(found, key=lambda x: x[1]["lb"])
+        verdict = ("BUY" if top[1]["lb"] > 0 and top[1]["win"] >= SCORER_MIN_WIN
+                   else "WATCH" if max(f_[1]["mean"] for f_ in found) > 0 else "SKIP")
+        return {"verdict": verdict, "h": top[0], "n": top[1]["n"], "mean": top[1]["mean"],
+                "lb": top[1]["lb"], "win": top[1]["win"], "lvl": lvl}
+    return {"verdict": "LEARNING", "h": None, "n": 0, "mean": None, "lb": None, "win": None, "lvl": None}
+
+
+def scorer_report(db, now: float) -> list[dict]:
+    """Scoreboard of the shadow verdicts: what each verdict group actually returned (net, after tax)."""
+    rows = db.execute("select verdict, xm15, xm60, x3, best3 from dip_events where verdict is not null "
+                      "and xm60 is not null and xm60 < 900").fetchall()
+    if not rows:
+        return []
+    groups = {}
+    for verdict, a, b, c, d in rows:
+        for key in (verdict, "ALL dips"):
+            groups.setdefault(key, []).append((a, b, c, d))
+
+    def fmt(v):
+        v = [x for x in v if x is not None and x < 900]
+        if len(v) < 3:
+            return "   –    "
+        return f"{statistics.median(v):+5.1f}% {100 * sum(1 for x in v if x > 0) / len(v):3.0f}%"
+    lines = ["```", f"{'verdict':9s}{'n':>5s}  {'15 min':>10s}  {'1 h':>10s}  {'3 h':>10s}  {'best 3h':>10s}",
+             "median net after tax · share in profit"]
+    for key in ("BUY", "WATCH", "SKIP", "LEARNING", "ALL dips"):
+        g = groups.get(key)
+        if not g:
+            continue
+        lines.append(f"{key:9s}{len(g):5d}  " + "  ".join(f"{fmt([r[i] for r in g]):>10s}" for i in range(4)))
+    lines.append("```")
+    total = db.execute("select count(*) from dip_events").fetchone()[0]
+    done = db.execute("select count(*) from dip_events where xm60 is not null and xm60<900").fetchone()[0]
+    lines.append(f"Events logged **{total}** · with a 1 h result **{done}** · a BUY needs "
+                 f"≥{SCORER_MIN_N} similar past events, a lower bound above 0 and ≥{SCORER_MIN_WIN * 100:.0f}% wins")
+    return [{"title": f"🧪 Dip Scorer · shadow scoreboard · {PLATFORM_LABEL}",
+             "description": "\n".join(lines), "color": 0x1ABC9C,
+             "footer": {"text": "Shadow mode: verdicts are logged, never posted as buy alerts"}}]
+
+
+SCORER_POST_HOURS = float(os.environ.get("FC_SCORER_POST_HOURS", "0"))   # 0 = never post the scoreboard
+
+
+def maybe_post_scorer(db, now: float, dry_run: bool) -> None:
+    if SCORER_POST_HOURS <= 0:
+        return
+    last = get_meta(db, "scorer_post_ts")
+    if last and now - float(last) < SCORER_POST_HOURS * 3600 - 120:
+        return
+    embeds = scorer_report(db, now)
+    if embeds:
+        post(embeds, dry_run)
+        set_meta(db, "scorer_post_ts", now)
 
 
 # ------------------------------------------------------------------- scan --
@@ -2160,6 +2292,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
             record_index_hours(db, now)                        # permanent hourly index record
             maybe_post_index(db, now, dry_run)                 # market index, every few hours
             maybe_post_buy_windows(db, now, dry_run)           # buy windows, once a day
+            maybe_post_scorer(db, now, dry_run)                # shadow dip-scorer scoreboard
         except Exception as e:                                 # never let the index break a scan
             print(f"[warn] market index failed: {e}")
         found = sm.update(db, [(c.card_id, c.price, rgroup(c), price_band(c.price)) for c in cards]
