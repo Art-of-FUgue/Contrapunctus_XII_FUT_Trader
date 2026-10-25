@@ -502,6 +502,10 @@ def dip_replay(series: dict, thr_pct: float = AUTO_DIP_PCT, hold_h: int = AUTO_H
 def auto_watch_update(db, cards, now: float, skip: set | None = None) -> None:
     """Refresh the auto-watchlist (see above). Runs at most every AUTO_REFRESH_H hours."""
     last = get_meta(db, "auto_watch_ts")
+    if not get_meta(db, "auto_watch_reset_v2"):          # one-time clean start: drop the round-trip list
+        db.execute("delete from watch_auto")
+        set_meta(db, "auto_watch_reset_v2", now)
+        last = None
     if last and now - float(last) < AUTO_REFRESH_H * 3600 - 120:
         return
     skip = skip or set()
