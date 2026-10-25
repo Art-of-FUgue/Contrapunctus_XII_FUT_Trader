@@ -1986,8 +1986,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     _cyc = fresh_cycles(db, cycles, now) if run_cycles else []
     auto_watch_update(db, [c for c, _ in _cyc], now)
     embeds = (
-        build_premium_dips(premium_dips, hot=True)    # 🚨 premium below its 4-day sold price: first, in red
-        + build_dips(dips)
+        build_dips(dips)
         + (build_cycles(_cyc) if run_cycles else [])
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
@@ -2000,6 +1999,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     # ── purchased list: spikes only for cards you hold ───────────────────────
     if purchased:
         embeds += build_owned_spikes(owned_spikes(db, cards_map, purchased, now))
+
+    # 🚨 premium below its 4-day sold price goes out LAST, so it sits at the bottom of the channel,
+    # right where you look first
+    embeds += build_premium_dips(premium_dips, hot=True)
 
     return embeds
 
