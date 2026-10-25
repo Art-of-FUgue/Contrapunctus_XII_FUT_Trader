@@ -368,14 +368,30 @@ DIP_COOLDOWN_MIN = float(os.environ.get("FC_DIP_COOLDOWN_MIN", "15"))
 DIP_REALERT_PCT = 3.0            # ...or its price drops this much below the last alert
 
 
+# Dip cooldown by behaviour type: busy cards can re-alert soon, quiet ones (and unclassified) wait longer.
+DIP_COOLDOWN_BY_TYPE = {
+    "Active": float(os.environ.get("FC_DIP_COOLDOWN_ACTIVE", "5")),
+    "Mixed": float(os.environ.get("FC_DIP_COOLDOWN_MIXED", "5")),
+    "Quiet": float(os.environ.get("FC_DIP_COOLDOWN_QUIET", str(DIP_COOLDOWN_MIN))),
+}
+
+
+def dip_cooldown_min(types: dict, card_id: str) -> float:
+    return DIP_COOLDOWN_BY_TYPE.get(types.get(card_id), DIP_COOLDOWN_MIN)
+
+
 def fresh_dips(db, items, now: float, kind: str):
     out = []
+    try:
+        types = _behaviour_cached(db, now)
+    except Exception:
+        types = {}
     for item in items:
         c = item[0]
         row = db.execute(
             "select price from alerts where card_id=? and kind=? and ts>=? "
             "order by ts desc limit 1",
-            (c.card_id, kind, now - DIP_COOLDOWN_MIN * 60)).fetchone()
+            (c.card_id, kind, now - dip_cooldown_min(types, c.card_id) * 60)).fetchone()
         if row and c.price > row[0] * (1 - DIP_REALERT_PCT / 100):
             continue                              # same dip, already posted
         out.append(item)
