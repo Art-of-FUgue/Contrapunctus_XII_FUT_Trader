@@ -309,6 +309,10 @@ def open_db(path: str) -> sqlite3.Connection:
                "ts real, price int, usual int, dip real, mkt real, typ text, seg text, band text, "
                "persist int, fair int, sale_near int, wd int, hr int, x3 real, x6 real, x12 real)")
     db.execute("create index if not exists dx on dip_events(card_id, ts)")
+    have = {r[1] for r in db.execute("pragma table_info(dip_events)")}
+    for col in ("xm15", "xm60", "best3"):                   # quick-flip outcomes added later
+        if col not in have:
+            db.execute(f"alter table dip_events add column {col} real")
     db.execute("create table if not exists index_ret(seg text, hour_ts integer, ret real, n integer, "
                "primary key(seg, hour_ts))")                    # permanent hourly index returns
     db.execute("create index if not exists ox on outcomes(card_id, ts)")
@@ -1500,7 +1504,10 @@ def maybe_post_buy_windows(db, now: float, dry_run: bool) -> None:
 EVENT_DIP_PCT = 8.0              # price this far below the card's 24 h median opens an event
 EVENT_COOLDOWN_H = 6             # one event per card per episode
 EVENT_MIN_PRICE = 10_000
-EVENT_HORIZONS = (3, 6, 12)      # hours after the event at which the net result is measured
+# outcome columns: (column, seconds after the event, snapshot tolerance in seconds)
+EVENT_HORIZONS = (("xm15", 900, 420), ("xm60", 3600, 600), ("x3", 3 * 3600, 1200),
+                  ("x6", 6 * 3600, 1200), ("x12", 12 * 3600, 1200))
+BEST_WINDOW_H = 3                # best3 = best exit price (15-minute medians) within this many hours
 EVENT_KEEP_DAYS = HISTORY_DAYS
 
 
@@ -1573,26 +1580,47 @@ def record_dip_events(db, cards, stats: dict, adj24: dict, skip: set, now: float
     return n
 
 
+def _net_pct(sell: float, buy: float) -> float:
+    """Net result in % of buying at `buy` and selling at `sell`, after 5% tax and the exit haircut."""
+    return (sell * (1 - EA_TAX) / buy - 1) * 100 - EXIT_HAIRCUT_PCT
+
+
 def resolve_dip_events(db, now: float) -> int:
-    """Fill in the net result (after 5% tax and the exit haircut, in %) once each horizon has passed.
-    999 marks a horizon whose price could not be found."""
+    """Fill in each event's net result (after 5% tax and the exit haircut, in %) once the horizon
+    has passed: 15 min, 1 h, 3 h, 6 h, 12 h, plus best3 = the best 15-minute median in the first
+    3 hours (what a patient seller could have got). 999 marks a horizon whose price is missing."""
     done = 0
-    for hz in EVENT_HORIZONS:
-        col = f"x{hz}"
+    for col, secs, tol in EVENT_HORIZONS:
         rows = db.execute(f"select id, card_id, ts, price from dip_events where {col} is null "
-                          f"and ts + ? <= ?", (hz * 3600 + 1200, now)).fetchall()
+                          f"and ts + ? <= ?", (secs + tol, now)).fetchall()
         for eid, cid, ts, price in rows:
-            t = ts + hz * 3600
+            t = ts + secs
             px = [r[0] for r in db.execute("select price from prices where card_id=? and ts between ? and ?",
-                                           (cid, t - 1200, t + 1200))]
+                                           (cid, t - tol, t + tol))]
             if px:
-                val = (statistics.median(px) * (1 - EA_TAX) / price - 1) * 100 - EXIT_HAIRCUT_PCT
+                val = _net_pct(statistics.median(px), price)
             elif now - t > 2 * 3600:
                 val = 999.0                                # no snapshot near that time, give up
             else:
                 continue
             db.execute(f"update dip_events set {col}=? where id=?", (val, eid))
             done += 1
+    span = BEST_WINDOW_H * 3600
+    rows = db.execute("select id, card_id, ts, price from dip_events where best3 is null and ts + ? <= ?",
+                      (span + 1200, now)).fetchall()
+    for eid, cid, ts, price in rows:
+        bins: dict = {}
+        for t, p in db.execute("select ts, price from prices where card_id=? and ts > ? and ts <= ?",
+                               (cid, ts, ts + span)):
+            bins.setdefault(int((t - ts) // 900), []).append(p)
+        if bins:
+            val = _net_pct(max(statistics.median(v) for v in bins.values()), price)
+        elif now - ts > span + 2 * 3600:
+            val = 999.0
+        else:
+            continue
+        db.execute("update dip_events set best3=? where id=?", (val, eid))
+        done += 1
     db.commit()
     return done
 
