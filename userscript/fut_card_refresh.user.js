@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         FUT card list refresh
 // @namespace    contrapunctus-xii
-// @version      1.1
-// @description  fut.gg helper: (1) Refresh cards: saves the card list + holo lookup into bundle.json; (2) Bought: collect cards you bought and export purchased.json.
+// @version      1.2
+// @description  fut.gg helper: (1) Refresh cards: saves the card list + holo lookup into bundle.json; (2) Bought: collect cards you bought (price + optional sell target) and export purchased.json.
 // @match        https://www.fut.gg/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -145,7 +145,7 @@
   }
 
   // ---- purchased list ---------------------------------------------------------------
-  // Stored in Tampermonkey: { "<card id or name text>": { price: number, name: string } }
+  // Stored in Tampermonkey: { "<card id or name text>": { price: number, target?: number, name: string } }
   const load = () => { try { return JSON.parse(GM_getValue("purchased", "{}")) || {}; } catch (_) { return {}; } };
   const save = (o) => { GM_setValue("purchased", JSON.stringify(o)); listBtn.textContent = `📋 Purchased (${Object.keys(o).length})`; };
   const fmt = (n) => (n >= 1e6 ? (n / 1e6).toFixed(2).replace(/\.?0+$/, "") + "M" : n >= 1e3 ? (n / 1e3).toFixed(1).replace(/\.0$/, "") + "k" : String(n));
@@ -158,7 +158,7 @@
 
   function purchasedJson() {                          // the format the scanner reads
     const out = {};
-    for (const [k, v] of Object.entries(load())) out[k] = { price: v.price, name: v.name };
+    for (const [k, v] of Object.entries(load())) out[k] = v.target ? { price: v.price, target: v.target, name: v.name } : { price: v.price, name: v.name };
     return JSON.stringify(out, null, 2) + "\n";
   }
 
@@ -171,9 +171,12 @@
     const old = cur[id] ? ` (currently ${fmt(cur[id].price)})` : "";
     const price = parsePrice(prompt(`Price you bought "${name}" for${old}?\n(e.g. 150000, 150k, 1.2m)`));
     if (!price) { log("Cancelled (no valid price)."); return; }
-    cur[id] = { price, name };
+    const oldT = cur[id]?.target ? ` (currently ${fmt(cur[id].target)})` : "";
+    const tIn = prompt(`Sell target for "${name}"?${oldT}\n(e.g. 445k — leave empty to let the scanner use fair value)`);
+    const target = parsePrice(tIn);
+    cur[id] = target ? { price, target, name } : { price, name };
     save(cur);
-    log(`✅ ${name} @ ${fmt(price)} added (${Object.keys(cur).length} in the list).`);
+    log(`✅ ${name} @ ${fmt(price)}${target ? " → target " + fmt(target) : ""} added (${Object.keys(cur).length} in the list).`);
   }
 
   function showList() {
@@ -185,7 +188,7 @@
     logEl.append(head);
     for (const k of keys) {
       const d = document.createElement("div");
-      d.textContent = `${cur[k].name} · ${fmt(cur[k].price)}  `;
+      d.textContent = `${cur[k].name} · ${fmt(cur[k].price)}${cur[k].target ? " → " + fmt(cur[k].target) : ""}  `;
       const x = document.createElement("a");
       x.textContent = "✖"; x.style.cssText = "cursor:pointer;color:#f87171;";
       x.onclick = () => { const o = load(); delete o[k]; save(o); showList(); };
@@ -208,7 +211,8 @@
           const raw = JSON.parse(t), o = load();
           for (const [k, v] of Object.entries(raw)) {
             const price = parsePrice(typeof v === "object" && v ? v.price : v);
-            if (price) o[k] = { price, name: (v && v.name) || k };
+            const target = parsePrice(typeof v === "object" && v ? v.target : null);
+            if (price) o[k] = target ? { price, target, name: (v && v.name) || k } : { price, name: (v && v.name) || k };
           }
           save(o); showList();
         } catch (e) { alert("Not valid JSON: " + e.message); }
