@@ -1762,6 +1762,43 @@ PREMIUM_LIQUID_MIN_SALES = int(os.environ.get("FC_PREMIUM_LIQUID_MIN_SALES", "20
 _LIQUID_CARDS: set = set()       # cards with at least that many inferred sales; refreshed every scan
 
 
+# ---- thin cards: erratic floors with few real sales are left out of the drop alerts ----------
+THIN_MIN_SALES = int(os.environ.get("FC_THIN_MIN_SALES", "15"))     # inferred sales in 4 days
+THIN_MAX_SPREAD_PCT = float(os.environ.get("FC_THIN_MAX_SPREAD", "60"))   # 24 h floor p10-p90 over median
+
+
+def thin_cards(db, now: float) -> set:
+    """Cards that should not raise drop alerts: fewer than THIN_MIN_SALES inferred sales in 4 days, or
+    a floor so erratic (p10-p90 of the last 24 h wider than THIN_MAX_SPREAD_PCT of its median) that a
+    'dip' is just a stray listing. Cached for 10 minutes."""
+    c = _cache.get("thin")
+    if c and now - c[0] < 600:
+        return c[1]
+    sales = dict(db.execute("select card_id, count(*) from sales_inferred where kind='sale' and ts>=? "
+                            "group by card_id", (now - PREMIUM_SALE_WINDOW_H * 3600,)))
+    thin: set = set()
+    seen: set = set()
+    cur, buf = None, []
+
+    def close():
+        if cur is None or len(buf) < 50:
+            return
+        seen.add(cur)
+        med = statistics.median(buf)
+        spread = (buf[9 * len(buf) // 10] - buf[len(buf) // 10]) / med * 100 if med else 0
+        if sales.get(cur, 0) < THIN_MIN_SALES or spread > THIN_MAX_SPREAD_PCT:
+            thin.add(cur)
+    for cid, price in db.execute("select card_id, price from prices where ts>=? order by card_id, price",
+                                 (now - 86400,)):
+        if cid != cur:
+            close()
+            cur, buf = cid, []
+        buf.append(price)
+    close()
+    _cache["thin"] = (now, thin)
+    return thin
+
+
 def refresh_liquid_cards(db, now: float) -> None:
     global _LIQUID_CARDS
     rows = db.execute("select card_id from sales_inferred where kind='sale' and ts>=? group by card_id "
@@ -2056,7 +2093,14 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     except Exception as e:
         print(f"[warn] active sales prune failed: {e}")
 
+    try:
+        thin = thin_cards(db, now)
+    except Exception as e:
+        thin = set()
+        print(f"[warn] thin-card filter failed: {e}")
     for c in cards:
+        if c.card_id in thin:
+            continue                              # erratic floor / almost no sales: no drop alerts
         if c.card_id in watch:
             # watched cards skip the price/new-card filters and the normal lists;
             # they only post when they dip again.
