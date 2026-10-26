@@ -81,9 +81,8 @@ Quiet cards barely move, so they do not need hourly history; the type rarely cha
 | Table | What | Kept |
 |---|---|---|
 | `index_ret` | hourly return of the equal-weighted price basket for each segment (All specials, Icons, Heroes, TOTW, Other promos, Holos) **and** each behaviour type (Active/Mixed/Quiet) | 56 days |
-| `market_ret` | median % move of each peer group between consecutive scans (feeds the seasonal profile) | 56 days |
 | `dip_events` | the **dip ledger** (includes `d6`, the % vs the 6 h-ago reference, and the Austin weekday/hour for buy-window research): every card ≥ 8% under its 24 h median, once per 6 h episode, with its situation (behaviour type, depth, market move, persisted?, fair value, nearby sale, weekday/hour) and later outcomes (net result at +15 min, +1 h, +3 h, +6 h, +12 h, and best exit within 3 h; `999` = unresolvable) | 56 days |
-| `outcomes` | dips that were actually **alerted**, with the floor 1/3/6 h later (net of tax + haircut). Feeds the "similar dips" score line | 30 days |
+| `outcomes` | dips that were actually **alerted**, with the floor 1/3/6 h later (net of tax + haircut). Kept for review of alerted and 6 h dips (no longer shown in alerts) | 30 days |
 
 ### 3.4 State tables
 
@@ -153,7 +152,7 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 - Reference = median of the hour before "6 h ago" (needs ≥ 12 snapshots in 24 h).
 - Fires when the price is **≥ 8 % below the reference after the market adjustment**, **and** below its 24 h median ("usual") **and** at or under its recent-sales average.
 - Grouped by card version; a tier emoji shows depth (🔴 15 %+ · 🟠 12–15 % · 🟢 8–12 %).
-- Each line can carry: **% chance to sell within 3 h**, and a **"similar dips" score** (how many past alerted dips of the same group / price band / depth / type / time slot were profitable at +3 h and their average net), plus the group's expected **seasonal drift**.
+- Each line can carry: **% chance to sell within 3 h**. (The old "similar dips x/y profitable" score line and the seasonal-drift estimate were removed: not useful.)
 - **Cooldown by behaviour type**: Active 5 min · Mixed 10 min · Quiet 15 min (`FC_DIP_COOLDOWN_*`); inside the cooldown it only re-posts if the price fell another 3 %.
 
 ### 5.2 ⚡ Fast Drop · vs 5 min ago
@@ -264,8 +263,8 @@ The manual `watchlist.json` is empty; the list is built automatically.
 Merges `main` regularly and adds, for research:
 - **Buy-window report** posted daily (`FC_WINDOWS_POST_HOURS=24`): for each segment and behaviour type, the cheapest hour and best entry hour in the next 24 h (Austin time), from the hour-of-day pattern (weekly pattern after 3 weeks of data), with "(weak)" when within the noise.
 - **Shadow dip scorer** (`judge_dip`, `scorer_report`, daily scoreboard via `FC_SCORER_POST_HOURS`): every ledger dip gets a verdict from *similar past events of the same behaviour type* (depth band, persistence, market direction):
-  **BUY** when the lower confidence bound (z = 2.5, winsorized mean) at some horizon (15 min / 1 h / 3 h / 6 h / 12 h) is above zero net with a win rate ≥ 55 % over ≥ 30 similar events; **WATCH** when profitable on average but not reliably; **SKIP** when it lost; **LEARNING** when too few events. Nothing is posted per dip: it only logs verdicts and, once a day, the scoreboard comparing each verdict group's real results against all dips. When BUY clearly beats the baseline it is meant to replace the old "x/y profitable @3h" line on `main`.
+  **BUY** when the lower confidence bound (z = 2.5, winsorized mean) at some horizon (15 min / 1 h / 3 h / 6 h / 12 h) is above zero net with a win rate ≥ 55 % over ≥ 30 similar events; **WATCH** when profitable on average but not reliably; **SKIP** when it lost; **LEARNING** when too few events. Nothing is posted per dip: it only logs verdicts and, once a day, the scoreboard comparing each verdict group's real results against all dips. (The old "x/y profitable @3h" line was removed from `main`; the scorer is now research only.)
 - Its own database branch (`data-buy-windows`).
 
 ---
-*Last updated: 2026-10-26 — fast drop minimum 10 % with tier hint, 6 h dip alert off by default; covers watchlist buy/sell with estimated sell time and 36 h reassess note, purchased-list sell alerts with optional targets, userscript v1.2, 8-week storage tiers, thin-card filter, dynamic watchlist.*
+*Last updated: 2026-10-26 — removed the 'similar dips' score line and seasonal drift, fast drop minimum 10 % with tier hint, 6 h dip alert off by default; covers watchlist buy/sell with estimated sell time and 36 h reassess note, purchased-list sell alerts with optional targets, userscript v1.2, 8-week storage tiers, thin-card filter, dynamic watchlist.*
