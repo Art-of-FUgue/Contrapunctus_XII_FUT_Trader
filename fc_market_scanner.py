@@ -149,6 +149,8 @@ def _limit(items: list) -> list:
 # ---- micro-spike / dip / crash (single scan-to-scan delta, ~15 min window) -
 FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as micro-spike
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
+FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
+FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
 FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "5"))   # reference = median price of the last N minutes
@@ -1290,13 +1292,13 @@ def build_spikes(items) -> list[dict]:
     return [e]
 
 
-def drop_tier(c: Card, beh: str | None) -> str:
-    """Hint for a fast drop from how past drops paid (net of tax): 🟢 under 100k, not a Hero, Active or Mixed;
-    🟡 under 100k and Quiet/unknown; ⚪ Heroes and cards from 100k (about break-even)."""
+def drop_tier(c: Card, beh: str | None, under: float, fair: float) -> str:
+    """Hint line for a fast drop: how far the new floor sits under the 4-day sold median (🟢 8%+, 🟡 5-8%;
+    past 5 s+ drops paid +27% net at 8%+ and about break-even under 5%), plus size, behaviour type, holo."""
     size = "<40k" if c.price < 40_000 else "40–100k" if c.price < 100_000 else "100k+"
-    mark = ("⚪" if c.price >= 100_000 or "hero" in c.kind.lower()
-            else "🟢" if beh in ("Active", "Mixed") else "🟡")
-    return f"{mark} {size} · {beh or 'type unknown'}" + (" · holo" if "Holo" in c.kind else "")
+    mark = "🟢" if under >= 8 else "🟡"
+    return (f"{mark} **{under:.0f}% under** 4-day sold {k(fair)} · {size} · {beh or 'type unknown'}"
+            + (" · holo" if "Holo" in c.kind else ""))
 
 
 def build_flashes(spike_items, dip_items) -> list[dict]:
@@ -1330,11 +1332,11 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
                 lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{open_link(c)}"
                              + (f"\n↳ {f['tier']}" if f.get("tier") else "")
                              + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
-        lines += ["", "Tier hint (from past fast drops, after tax): 🟢 under 100k, not a Hero, Active/Mixed · "
-                      "🟡 under 100k, Quiet · ⚪ Hero or 100k+ (barely paid)"]
+        lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted · "
+                      "🟢 8%+ under (best past results) · 🟡 5–8% under"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
              "color": 0x1ABC9C,
-             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below the price {w}"}}
+             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below the price {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
         img = next((c.image_url for c, _, _ in drops if c.image_url), None)
         if img:
             e["thumbnail"] = {"url": img}
@@ -2383,7 +2385,11 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 if pct >= FLASH_SPIKE_PCT:
                     flash_spikes.append((c, f, pct))
                 elif rel <= -FLASH_DIP_PCT:
-                    flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id))), rel))
+                    sold = sm.sale_stats(db, c.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+                    if sold and sold["n"] >= FAST_MIN_SALES and sold["fair"] > 0:
+                        under = (sold["fair"] - c.price) / sold["fair"] * 100
+                        if under >= FAST_MIN_UNDER_SOLD:        # drops that stay near/above sold lost money
+                            flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
