@@ -137,14 +137,7 @@ MAX_PRICE = parse_price(os.environ.get("FC_MAX_PRICE", None))  # None = no upper
 TOTW_MIN_PRICE = 15_000
 # fut.gg's rarity name is "Team of the week" (lower-case w), so match loosely.
 
-DIP_BANDS = [
-    (15_000, 100_000),
-    (100_000, 500_000),
-    (500_000, 1_500_000),
-    (1_500_000, 15_000_000),
-]
 DIP_MIN_PCT = 8.0                # drop vs COMPARE_HOURS ago
-SPIKE_BAND = (20_000, 950_000)
 SPIKE_MIN_PCT = 8.0              # jump vs COMPARE_HOURS ago
 MAX_LINES = int(os.environ.get("FC_MAX_LINES", 16))   # per card-version group (0 = unlimited)
 
@@ -512,9 +505,6 @@ def auto_watch_ids(db, now: float) -> set[str]:
         "select card_id from watch_auto where added_ts>=?", (now - AUTO_WATCH_DAYS * 86400,))}
 
 
-WATCH_PREMIUM_CRASH_PCT = 50.0   # premium watchlist cards: alert on a drop this big within FLASH_WINDOW_MIN
-
-
 WATCH_BUY_MIN_NET = 4.0          # a watched card signals a buy when selling at fair value nets this much
 WATCH_POSITION_EXPIRE_HOURS = float(os.environ.get("FC_WATCH_EXPIRE_HOURS", "72"))
 
@@ -702,7 +692,7 @@ def build_watch_sells(items, auto: set[str]) -> list[dict]:
     lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched"]
     e = {"title": f"🎯 Watchlist Sell · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x2ECC71,
-         "footer": {"text": f"Watchlist cycle complete · net profit after 5% EA tax · target reached"}}
+         "footer": {"text": "Watchlist cycle complete · net profit after 5% EA tax · target reached"}}
     if items[0][0].image_url:
         e["thumbnail"] = {"url": items[0][0].image_url}
     return [e]
@@ -803,17 +793,6 @@ def roll_up_old_hours(db, now: float) -> None:
         print(f"[warn] hourly sales summary failed: {e}")
     sm.compact_sales(db, now)
     set_meta(db, "rollup_ts", now)
-
-
-def history_rows(db, card_id: str, since: float) -> list[tuple[float, int]]:
-    """Raw snapshots plus hourly medians (stamped mid-hour) for older data, oldest first."""
-    raw = db.execute("select ts, price from prices where card_id=? and ts>=? order by ts",
-                     (card_id, since)).fetchall()
-    first_raw = raw[0][0] if raw else float("inf")
-    old = db.execute("select hour_ts+1800, price from prices_hourly where card_id=? "
-                     "and hour_ts+1800>=? and hour_ts+1800<? order by hour_ts",
-                     (card_id, since, first_raw)).fetchall()
-    return old + raw
 
 
 def card_flash_stats(db, card: Card, now: float | None = None):
@@ -1322,25 +1301,6 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
     }
     if first and first.image_url:
         e["thumbnail"] = {"url": first.image_url}
-    return [e]
-
-
-def build_watchlist(cards_map: dict[str, Card], watchlist: set[str]) -> list[dict]:
-    """Embed showing current price for every card on the watchlist."""
-    hits = [cards_map[cid] for cid in watchlist if cid in cards_map]
-    unlisted = [c for c in UNLISTED if c.card_id in watchlist]
-    if not hits and not unlisted:
-        return []
-    hits = sorted(hits, key=lambda c: -c.price)
-    lines = []
-    for c in hits:
-        lines.append(f"👁 **{k(c.price)}** {link(c)} {c.rating} {c.kind}")
-    for c in unlisted:
-        lines.append(f"👁 **no listing** {link(c)} {c.rating} {c.kind}")
-    e = {"title": f"👁 Watchlist Prices · now · {PLATFORM_LABEL}",
-         "description": "\n".join(lines),
-         "color": 0x9B59B6,
-         "footer": {"text": "Current floor price of every watched card"}}
     return [e]
 
 
@@ -1883,9 +1843,6 @@ def _is_totw_fodder(card: Card) -> bool:
     return _is_totw(card) and card.price < TOTW_MIN_PRICE
 
 
-SOLD_MIN_N = 3                   # inferred sales needed before they replace the floor median
-
-
 def _sell_text(d: dict) -> str:
     p = d.get("sellp")
     return f" · {p * 100:.0f}% sell ≤{SCORE_HORIZON}h" if p is not None else ""
@@ -2105,11 +2062,6 @@ def _score_key(d: dict, depth: float):
     if sc and sc["status"] == "ok":
         return (0, -(sc["mean"] + (d.get("season") or 0.0)))   # expected net incl. seasonal drift
     return (1, depth)
-
-
-def _mkt_text(d: dict) -> str:
-    m = d.get("mkt", 0.0)
-    return f" · mkt {m:+.1f}%" if abs(m) >= 0.5 else ""
 
 
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
