@@ -485,15 +485,16 @@ def build_cycles(items) -> list[dict]:
 # ---- auto-watchlist: liquid cards whose dips have paid back ------------------------------
 # Every AUTO_REFRESH_H hours the last AUTO_LOOKBACK_DAYS of hourly prices are replayed for each
 # liquid card: buy when the hourly price is AUTO_DIP_PCT below its trailing 24 h median (at most one
-# buy per 6 h), sell AUTO_HOLD_H hours later, net of the 5% tax and the exit haircut.
-# Cards whose dips averaged more than AUTO_MIN_MEAN % and won in at least AUTO_MIN_WIN of the trades
+# buy per 6 h), sell 3, 6, 12 or 24 hours later, net of the 5% tax and the exit haircut.
+# Cards whose dips pay (average above AUTO_MIN_MEAN %, wins in at least AUTO_MIN_WIN) at two or more holds
 # are watched. New cards are left out (their prices are still finding a level).
 AUTO_DIP_PCT = 6.0
-AUTO_HOLD_H = 6
+AUTO_HOLDS = (3, 6, 12, 24)      # hold times tested, in hours
+AUTO_MIN_HOLDS = 2               # a card must pay at this many of them (no single hold decides)
 AUTO_GAP_H = 6                   # at most one replayed buy per card per this many hours
-AUTO_MIN_EVENTS = int(os.environ.get("FC_AUTO_MIN_EVENTS", "4"))
+AUTO_MIN_EVENTS = int(os.environ.get("FC_AUTO_MIN_EVENTS", "3"))
 AUTO_MIN_MEAN = 2.0
-AUTO_MIN_WIN = 0.6
+AUTO_MIN_WIN = 0.55
 AUTO_MIN_SALES = 30              # inferred sales in 4 days (liquidity)
 AUTO_MIN_PRICE = 30_000
 AUTO_MAX = int(os.environ.get("FC_AUTO_MAX", "20"))
@@ -502,7 +503,7 @@ AUTO_REFRESH_H = 6
 AUTO_WATCH_DAYS = 3              # stay watched this long after last qualifying (avoids flicker)
 
 
-def dip_replay(series: dict, thr_pct: float = AUTO_DIP_PCT, hold_h: int = AUTO_HOLD_H) -> list[float]:
+def dip_replay(series: dict, thr_pct: float = AUTO_DIP_PCT, hold_h: int = 6) -> list[float]:
     """Net % (after tax and haircut) of each replayed dip-buy in one card's hourly price series."""
     out, last_h = [], -10 ** 9
     for h in sorted(series):
@@ -534,16 +535,20 @@ def auto_watch_update(db, cards, now: float, skip: set | None = None) -> None:
     for c in cards:
         if c.card_id in skip or c.price < AUTO_MIN_PRICE or sales.get(c.card_id, 0) < AUTO_MIN_SALES:
             continue
-        ev = dip_replay(px.get(c.card_id, {}))
-        if len(ev) < AUTO_MIN_EVENTS:
-            continue
-        mean, win = statistics.mean(ev), sum(1 for x in ev if x > 0) / len(ev)
-        if mean > AUTO_MIN_MEAN and win >= AUTO_MIN_WIN:
-            picks.append((mean * win, c, len(ev), mean, win))
+        ok = []
+        for hold in AUTO_HOLDS:
+            ev = dip_replay(px.get(c.card_id, {}), AUTO_DIP_PCT, hold)
+            if len(ev) >= AUTO_MIN_EVENTS:
+                mean, win = statistics.mean(ev), sum(1 for x in ev if x > 0) / len(ev)
+                if mean > AUTO_MIN_MEAN and win >= AUTO_MIN_WIN:
+                    ok.append((hold, len(ev), mean, win))
+        if len(ok) >= AUTO_MIN_HOLDS:
+            top = max(ok, key=lambda r: r[2] * r[3])
+            picks.append((top[2] * top[3] * len(ok), c, top[1], top[2], top[3], top[0], len(ok)))
     picks.sort(key=lambda r: -r[0])
-    for _, c, n, mean, win in picks[:AUTO_MAX]:
+    for _, c, n, mean, win, hold, holds in picks[:AUTO_MAX]:
         db.execute("insert or replace into watch_auto values (?,?)", (c.card_id, now))
-        print(f"[info] auto-watch: {c.name} ({n} dips, avg net {mean:+.1f}% @{AUTO_HOLD_H}h, {win * 100:.0f}% won)")
+        print(f"[info] auto-watch: {c.name} ({holds} holds pay; best {hold}h: {n} dips, avg net {mean:+.1f}%, {win * 100:.0f}% won)")
     db.execute("delete from watch_auto where added_ts < ?", (now - AUTO_WATCH_DAYS * 86400,))
     set_meta(db, "auto_watch_ts", now)
     db.commit()
@@ -600,16 +605,16 @@ def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float 
 
 
 def build_watch_dips(items, auto: set[str]) -> list[dict]:
-    items = _limit(sorted(items, key=lambda i: i[1]["pct"]))
+    items = _limit(sorted(items, key=lambda i: (i[0].card_id in auto, i[1]["pct"])))   # your own picks first
     if not items:
         return []
     lines = [f"⏱ Regular cards: vs **{COMPARE_HOURS} h ago** · premium cards: vs **{PREMIUM_SALE_WINDOW_H // 24}-day sold** · "
              f"💥 premium crash ≥{WATCH_PREMIUM_CRASH_PCT:.0f}% vs **{FLASH_WINDOW_MIN:g} min ago**", ""]
     for c, d in items:
-        tag = " 🔁" if c.card_id in auto else ""
+        tag = " 🔁" if c.card_id in auto else " ⭐"
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}{tag}")
         lines.append(f"{d.get('icon', '📉')} `{d['pct']:+.1f}%` · {d['why']}{d.get('extra', '')}{open_link(c)}")
-    lines += ["", "🔁 = auto-watched: liquid card whose recent dips paid back after tax"]
+    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched: liquid card whose recent dips paid back after tax"]
     e = {"title": f"👁 Watchlist Dip · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
          "footer": {"text": "Watched cards post only when they dip again"}}
