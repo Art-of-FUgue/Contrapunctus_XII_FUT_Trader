@@ -296,8 +296,6 @@ def open_db(path: str) -> sqlite3.Connection:
                "r1 real, r3 real, r6 real, done int default 0)")
     if "slot" not in {r[1] for r in db.execute("pragma table_info(outcomes)")}:
         db.execute("alter table outcomes add column slot text")
-    db.execute("create table if not exists market_ret(g text, ts real, ret real)")
-    db.execute("create index if not exists mx on market_ret(g, ts)")
     db.execute("create table if not exists prices_daily(card_id text, day integer, open int, high int, "
                "low int, med int, close int, hours integer, moves integer, primary key(card_id, day))")
     db.execute("create table if not exists dip_events(id integer primary key autoincrement, card_id text, "
@@ -1254,14 +1252,12 @@ def build_dips(items) -> list[dict]:
     lines = [f"⏱ Compared with the price **{COMPARE_HOURS} h ago**"]
     first = None
     for kind, grp in by_version(items):
-        grp = _limit(sorted(grp, key=lambda i: _score_key(i[1], i[2])))
+        grp = _limit(sorted(grp, key=lambda i: i[2]))                      # deepest first
         lines += ["", _group_header(kind, len(grp))]
         for c, s, pct in grp:
             first = first or c
             lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} **{COMPARE_HOURS} h ago**{_sell_text(s)}{open_link(c)}")
-            if s.get("score"):
-                lines.append(f"↳ {score_text(s)}")
     lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12% below"]
     e = {"title": f"📉 Dip Alert · vs {COMPARE_HOURS} h ago · {PLATFORM_LABEL}",
          "description": "\n".join(lines),
@@ -1330,8 +1326,7 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             for c, f, pct in grp:
                 lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
                 lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{open_link(c)}"
-                             + (f"\n↳ {f['tier']}" if f.get("tier") else "")
-                             + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
+                             + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
         lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted · "
                       "🟢 8%+ under (best past results) · 🟡 5–8% under"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
@@ -1358,7 +1353,7 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
                  f"compared with the **{PREMIUM_HISTORY_HOURS} h median** floor price"]
     first = None
     for kind, grp in by_version(items):
-        grp = _limit(sorted(grp, key=lambda i: _score_key(i[1], i[1]["dip_pct"])))
+        grp = _limit(sorted(grp, key=lambda i: -i[1]["rank"] if i[1].get("rank") is not None else i[1]["dip_pct"]))
         lines += ["", _group_header(kind, len(grp))]
         for c, s in grp:
             first = first or c
@@ -1371,8 +1366,6 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
                 f"{_sell_text(s)}{open_link(c)}"
             )
             lines.append(f"↳ {target_line(c.price, s['sales_median'], _premium_ref(s).strip('*'))}")
-            if s.get("score"):
-                lines.append(f"↳ {score_text(s)}")
     if hot:
         lines += ["", "vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%"]
     else:
@@ -2098,73 +2091,6 @@ def market_moves(db, cards, stats: dict, skip: set):
     return _group_median(v6), _group_median(v24), _group_median(vf), raw_f
 
 
-# ---- seasonality: hour-of-week drift of each peer group ---------------------
-SEASON_KEEP_DAYS = HISTORY_DAYS           # market-return history kept for the profile
-SEASON_MIN_WEEKS = 3             # weeks of data before an hour-of-week bin is used
-SEASON_MIN_DAYS = 7              # days of data before the time-of-day fallback is used
-SEASON_SHRINK = 2.0              # bins with few observations are shrunk toward 0
-SEASON_MIN_SCANS_PER_HOUR = 3    # an hour with fewer scans is ignored
-SEASON_MAX_GAP = 2400            # seconds; longer gaps between scans aren't recorded
-
-
-def record_market_returns(db, mret: dict, now: float) -> None:
-    """Store each group's median % move since the previous scan."""
-    db.executemany("insert into market_ret values (?,?,?)", [(g, now, r) for g, r in mret.items()])
-    db.execute("delete from market_ret where ts < ?", (now - SEASON_KEEP_DAYS * 86400,))
-    db.commit()
-
-
-def season_profile(db, g: str, now: float):
-    """Detrended mean hourly % move per hour-of-week (and time-of-day fallback), UTC."""
-    rows = db.execute("select ts, ret from market_ret where g=? and ts>=?",
-                      (g, now - SEASON_KEEP_DAYS * 86400)).fetchall()
-    hours: dict = {}
-    for ts, r in rows:
-        h = int(ts // 3600)
-        tot, n = hours.get(h, (0.0, 0))
-        hours[h] = (tot + r, n + 1)
-    hours = {h: t for h, (t, n) in hours.items() if n >= SEASON_MIN_SCANS_PER_HOUR}
-    if not hours:
-        return None
-    overall = statistics.mean(hours.values())
-    weekly: dict = {}
-    daily: dict = {}
-    for h, t in hours.items():
-        how = time.gmtime(h * 3600)
-        weekly.setdefault(how.tm_wday * 24 + how.tm_hour, []).append(t)
-        daily.setdefault(how.tm_hour, []).append(t)
-
-    def fit(bins):
-        return {b: ((statistics.mean(v) - overall) * len(v) / (len(v) + SEASON_SHRINK), len(v))
-                for b, v in bins.items()}
-    return {"weekly": fit(weekly), "daily": fit(daily)}
-
-
-def season_drift(db, g: str, now: float, cache: dict, horizon_h: int | None = None):
-    """Expected extra % move of the group over the next horizon_h hours (None if unknown)."""
-    horizon_h = horizon_h or SCORE_HORIZON
-    if g not in cache:
-        cache[g] = season_profile(db, g, now)
-    prof = cache[g]
-    if not prof:
-        return None
-    start = int(now // 3600)
-    total, used = 0.0, False
-    for j in range(horizon_h + 1):
-        w = ((start + 1) * 3600 - now) / 3600 if j == 0 else 1.0
-        if j == horizon_h:
-            w = (now - start * 3600) / 3600 if horizon_h else w
-        if w <= 0:
-            continue
-        t = time.gmtime((start + j) * 3600)
-        wb = prof["weekly"].get(t.tm_wday * 24 + t.tm_hour)
-        db_ = prof["daily"].get(t.tm_hour)
-        if wb and wb[1] >= SEASON_MIN_WEEKS:
-            total += w * wb[0]; used = True
-        elif db_ and db_[1] >= SEASON_MIN_DAYS:
-            total += w * db_[0]; used = True
-    return total if used else None
-
 
 TIMEZONE = os.environ.get("FC_TIMEZONE", "America/Chicago")   # Austin; shown in notices and logs
 
@@ -2187,8 +2113,6 @@ def time_slot(ts: float) -> str:
 
 # ---- dip outcomes + similar-dip score -------------------------------------
 SCORE_HORIZON = 3                # hours: the return the score is based on
-SCORE_MIN_N = int(os.environ.get("FC_SCORE_MIN_N", "20"))   # bucket size before backoff
-SCORE_SHRINK_K = 15              # shrinkage strength toward the coarser bucket
 OUTCOME_COOLDOWN_H = 6           # don't log the same card's dip again inside this
 EXIT_HAIRCUT_PCT = 1.0           # exit below the floor (undercut) on top of the tax
 
@@ -2232,53 +2156,6 @@ def resolve_outcomes(db, now: float) -> None:
     db.commit()
 
 
-def score_dip(db, g: str, band: str, dbin: str, dtype: str, slot: str = ""):
-    """Shrunken average net return of similar past dips (nested buckets, coarse -> fine)."""
-    col = {1: "r1", 3: "r3", 6: "r6"}[SCORE_HORIZON]
-    rows = db.execute(f"select g, band, dbin, dtype, {col}, slot from outcomes "
-                      f"where {col} is not null").fetchall()
-    if len(rows) < SCORE_MIN_N:
-        return {"status": "cold", "n": len(rows)}
-    me = {"g": g, "band": band, "dbin": dbin, "dtype": dtype, "slot": slot}
-    levels = [(), ("dbin",), ("g", "dbin"), ("g", "dbin", "dtype"),
-              ("g", "band", "dbin", "dtype"), ("g", "band", "dbin", "dtype", "slot")]
-    idx = {"g": 0, "band": 1, "dbin": 2, "dtype": 3, "slot": 5}
-    parent, chosen = None, None
-    for keys in levels:
-        sel = [r[4] for r in rows if all(r[idx[kk]] == me[kk] for kk in keys)]
-        if keys and len(sel) < SCORE_MIN_N:
-            break
-        n, tot = len(sel), sum(sel)
-        est = tot / n if parent is None else (tot + SCORE_SHRINK_K * parent) / (n + SCORE_SHRINK_K)
-        parent = est
-        chosen = {"status": "ok", "mean": est, "n": n, "hits": sum(1 for x in sel if x > 0),
-                  "label": " ".join(me[kk] for kk in keys) or "all dips"}
-    return chosen
-
-
-def score_text(d: dict) -> str:
-    sc, season = d.get("score"), d.get("season")
-    if not sc:
-        return ""
-    if sc["status"] == "cold":
-        txt = f"similar dips: not enough history yet ({sc['n']}/{SCORE_MIN_N})"
-    else:
-        txt = (f"similar ({sc['label']}): {sc['hits']}/{sc['n']} profitable @{SCORE_HORIZON}h "
-               f"· avg {sc['mean']:+.1f}% net")
-    if season is not None:
-        txt += f" · season {season:+.1f}%/{SCORE_HORIZON}h"
-    return txt
-
-
-def _score_key(d: dict, depth: float):
-    if d.get("rank") is not None:                         # sale-based premium dips
-        return (-1, -d["rank"])
-    sc = d.get("score")
-    if sc and sc["status"] == "ok":
-        return (0, -(sc["mean"] + (d.get("season") or 0.0)))   # expected net incl. seasonal drift
-    return (1, depth)
-
-
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
          spikes_on: bool = True, purchased: dict | None = None) -> list[dict]:
     dips, spikes, flash_spikes, flash_dips = [], [], [], []
@@ -2298,11 +2175,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     open_watch_positions = {r[0] for r in db.execute("select card_id from watch_positions")}
     stats = {c.card_id: card_stats(db, c, now) for c in cards
              if c.card_id not in muted_new and c.card_id not in watch}
-    prev_ts = db.execute("select max(ts) from prices").fetchone()[0]
-    adj6, adj24, adjf, mret = market_moves(db, cards, stats, muted_new | watch)
-    if prev_ts and now - prev_ts <= SEASON_MAX_GAP:       # feed the seasonal profile
-        record_market_returns(db, mret, now)
-    season_cache: dict = {}
+    adj6, adj24, adjf, _ = market_moves(db, cards, stats, muted_new | watch)
     try:
         record_dip_events(db, cards, stats, adj24, muted_new | watch, now)   # long-term dip ledger
     except Exception as e:                                                    # never break a scan
@@ -2395,20 +2268,14 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
     premium_dips = fresh_dips(db, premium_dips, now, "prem")
 
-    # score each dip by how similar past dips turned out, then log it for later scoring
+    # chance of a sale within the horizon, and log each dip for later review (outcomes table)
     for items, dtype in ((dips, "6h"), (flash_dips, "micro")):
         for c, d, rel in items:
-            d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(rel), dtype,
-                                   time_slot(now))
-            d["season"] = season_drift(db, rgroup(c), now, season_cache)
             d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
             log_outcome(db, c, dtype, rel, d.get("mkt", 0.0), now)
     if not DIP6H_ALERTS:
         dips = []                                  # 6 h dips are logged to `outcomes` for research, not posted
     for c, d in premium_dips:
-        d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(d["dip_pct"]), "prem",
-                               time_slot(now))
-        d["season"] = season_drift(db, rgroup(c), now, season_cache)
         if d.get("sellp") is None:
             d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
         log_outcome(db, c, "prem", d["dip_pct"], d.get("mkt", 0.0), now)
