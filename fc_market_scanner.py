@@ -835,6 +835,7 @@ PURCHASED_FILE = os.path.join(HERE, "purchased.json")
 OWNED_SPIKE_PCT = float(os.environ.get("FC_OWNED_SPIKE_PCT", "15"))   # spike = this % above your buy price
 
 
+PURCHASED_TARGETS: dict[str, int] = {}      # optional per-card sell target from purchased.json
 PURCHASED_PROBLEMS: list[str] = []      # entries that matched no card / several cards
 _ALIASES = {"icon": "base icon", "hero": "base hero", "totw": "team of the week",
             "dfg": "destined for glory", "fs": "future stars", "sp": "star performer",
@@ -883,6 +884,7 @@ def load_purchased(path: str | None = None) -> dict[str, int | None]:
     Also accepts a plain list, or {"x": {"price": N}}. Returns {card id: price|None}."""
     path = path or PURCHASED_FILE
     PURCHASED_PROBLEMS.clear()
+    PURCHASED_TARGETS.clear()
     if not os.path.exists(path):
         return {}
     try:
@@ -895,12 +897,15 @@ def load_purchased(path: str | None = None) -> dict[str, int | None]:
     items = raw.items() if isinstance(raw, dict) else [(i, None) for i in raw]
     out: dict[str, int | None] = {}
     for key, v in items:
+        target = None
         if isinstance(v, dict):
+            target = v.get("target")
             v = v.get("price")
         try:
             price = int(float(str(v).lower().replace("k", "e3").replace("m", "e6"))) if v else None
+            target = int(float(str(target).lower().replace("k", "e3").replace("m", "e6"))) if target else None
         except ValueError:
-            price = None
+            price, target = None, None
         key = str(key).strip()
         if key.isdigit():
             cid = key
@@ -910,6 +915,8 @@ def load_purchased(path: str | None = None) -> dict[str, int | None]:
                 PURCHASED_PROBLEMS.append(f"“{key}”: {why}")
                 continue
         out[cid] = price
+        if target:
+            PURCHASED_TARGETS[cid] = target
     print(f"[info] purchased list: {len(out)} card(s), {len(PURCHASED_PROBLEMS)} problem(s)")
     return out
 
@@ -934,6 +941,52 @@ def owned_spikes(db, cards_map: dict, purchased: dict, now: float) -> list:
         out.append((c, {"buy": buy, "up": up, "net": net}))
     db.commit()
     return out
+
+
+OWNED_MIN_NET = 3.0              # default sell target must net at least this % over your buy price
+
+
+def owned_sells(db, cards_map: dict, purchased: dict, now: float) -> list:
+    """Held cards whose floor reached the sell target: the target in purchased.json, else the card's
+    fair value (4-day sold / 24 h median), never below OWNED_MIN_NET % net over your buy price."""
+    out = []
+    for cid, buy in purchased.items():
+        c = cards_map.get(cid)
+        if not c or c.price <= 0 or not buy:
+            continue
+        target, ref = PURCHASED_TARGETS.get(cid), "your target"
+        if not target:
+            ws = card_stats(db, c, now)
+            fair = sell_target(db, c, now, ws["usual"] if ws else None)
+            floor_t = buy / (1 - EA_TAX) * (1 + OWNED_MIN_NET / 100)
+            if fair and fair[0] >= floor_t:
+                target, ref = fair[0], fair[1]
+            else:
+                target, ref = floor_t, f"+{OWNED_MIN_NET:.0f}% net"
+        if c.price < target or repeat_blocked(db, cid, "owned_sell", c.price, now):
+            continue
+        db.execute("insert into alerts values (?,?,?,?)", (cid, "owned_sell", now, c.price))
+        out.append((c, {"buy": buy, "target": target, "ref": ref,
+                        "net": (c.price * (1 - EA_TAX) - buy) / buy * 100}))
+    db.commit()
+    return out
+
+
+def build_owned_sells(items) -> list[dict]:
+    if not items:
+        return []
+    items = sorted(items, key=lambda i: -i[1]["net"])
+    lines = ["💰 The floor reached the sell target for a card you hold", ""]
+    for c, d in items:
+        lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
+        lines.append(f"💰 `{d['net']:+.1f}%` net after tax · bought **{k(d['buy'])}** · "
+                     f"target {k(d['target'])} ({d['ref']}){open_link(c)}")
+    e = {"title": f"💰 Your Card · Sell Now · {PLATFORM_LABEL}", "description": "\n".join(lines),
+         "color": 0x2ECC71,
+         "footer": {"text": "Target: \"target\" in purchased.json, else fair value (min +3% net) · net = after 5% EA tax"}}
+    if items[0][0].image_url:
+        e["thumbnail"] = {"url": items[0][0].image_url}
+    return [e]
 
 
 def build_owned_spikes(items) -> list[dict]:
@@ -2226,6 +2279,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
 
     # ── purchased list: spikes only for cards you hold ───────────────────────
     if purchased:
+        embeds += build_owned_sells(owned_sells(db, cards_map, purchased, now))
         embeds += build_owned_spikes(owned_spikes(db, cards_map, purchased, now))
 
     # 🚨 premium below its 4-day sold price goes out LAST, so it sits at the bottom of the channel,
