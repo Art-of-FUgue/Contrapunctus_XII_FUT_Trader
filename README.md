@@ -148,7 +148,8 @@ median move is subtracted, so a market-wide slide does not look like 200 separat
 `EA_TAX = 5 %`. "Net" always means profit after the 5 % tax. Alert order in Discord: dips, fast drops, premium
 dips, watchlist buy, watchlist sell, owned-card alerts, then the red premium alert **last** (so it sits at the bottom, where you look first).
 
-### 5.1 📉 Dip Alert · vs 6 h ago (regular cards)
+### 5.1 📉 Dip Alert · vs 6 h ago (regular cards) — **OFF by default** (`FC_DIP6H_ALERTS=1` turns it back on)
+Turned off because 6 h dips did not pay after tax in practice; the rule is kept in the code. When on:
 - Reference = median of the hour before "6 h ago" (needs ≥ 12 snapshots in 24 h).
 - Fires when the price is **≥ 8 % below the reference after the market adjustment**, **and** below its 24 h median ("usual") **and** at or under its recent-sales average.
 - Grouped by card version; a tier emoji shows depth (🔴 15 %+ · 🟠 12–15 % · 🟢 8–12 %).
@@ -157,7 +158,9 @@ dips, watchlist buy, watchlist sell, owned-card alerts, then the red premium ale
 
 ### 5.2 ⚡ Fast Drop · vs 5 min ago
 - Reference = median of the last 5 minutes of scans (`FC_FLASH_WINDOW_MIN`). Cards ≥ 10k, not on the premium list.
-- **≥ 8 %** below it (after market adjustment) = 📉; **≥ 12 %** = 💥 crash. Same per-type cooldowns.
+- Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
+- **Tier hint** on every line, from how past fast drops paid (26 h sample, net after tax, 3 h later): 🟢 under 100k, not a Hero, Active/Mixed · 🟡 under 100k, Quiet · ⚪ Heroes and anything 100k+ (about break-even). The line also shows the price size (<40k / 40–100k / 100k+), the behaviour type and "holo".
+- Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
 
 ### 5.3 💎 Premium Dip and 🚨 Premium below 4-day sold
 Premium-list cards are judged on real (inferred) sales:
@@ -232,6 +235,8 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_NEW_CARD_DAYS` | 4 | new-card mute |
 | `FC_DIP_COOLDOWN_ACTIVE/MIXED/QUIET` | 5 / 10 / 15 min | dip cooldown by type |
 | `FC_FLASH_WINDOW_MIN` | 5 | reference window of the fast drop |
+| `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the 5-minute reference |
+| `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
 | `FC_PREMIUM_ICON_HERO_MIN` / `FC_PREMIUM_PROMO_MIN` | 100k / 300k | premium list thresholds |
 | `FC_PREMIUM_LIQUID_MIN_SALES` | 20 | sales in 4 days to count a 100k+ card as premium |
 | `FC_THIN_MIN_SALES` / `FC_THIN_MAX_SPREAD` | 15 / 60 | thin-card filter |
@@ -245,6 +250,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_SALES_RAW_DAYS`, `FC_LISTING_HOURS`, `FC_SALE_TOL_SECONDS` | 4, `1,3,6,12`, 90 | sales inference |
 
 ## 9. Findings that shaped the design (for context)
+- **Fast drops (26 h, liquid non-thin cards 15k–250k):** 10 %+ drops on cards under 100k returned about +13 % net at 3 h (79 % won, n = 28); 8–10 % only ≈ +1 %. Under 40k and Active cards were best; Heroes and 100k+ ≈ break-even. Small sample, re-check as data grows.
 - Blind dip-buying is **net-negative after tax**; the market median is roughly flat over a week. Dips are only worth taking on liquid cards whose own history says they recover, which is why the watchlist and the premium rules are selective.
 - Sales surges are only weakly predictive. Holo Future Stars / DfG cards in the 100–300k range showed a steady rise through a week in one sample, which a dip rule alone does not capture (planned: rebound / weekly-cycle detector, needs ~3 weeks of hourly index data).
 - Cards that almost never sell at their listed floor (e.g. a 93k floor with real sales under 20k) are misleading; the thin-card filter removes them.
@@ -259,4 +265,4 @@ Merges `main` regularly and adds, for research:
 - Its own database branch (`data-buy-windows`).
 
 ---
-*Last updated: 2026-10-26 — covers watchlist buy/sell with estimated sell time and 36 h reassess note, purchased-list sell alerts with optional targets, userscript v1.2, 8-week storage tiers, thin-card filter, dynamic watchlist.*
+*Last updated: 2026-10-26 — fast drop minimum 10 % with tier hint, 6 h dip alert off by default; covers watchlist buy/sell with estimated sell time and 36 h reassess note, purchased-list sell alerts with optional targets, userscript v1.2, 8-week storage tiers, thin-card filter, dynamic watchlist.*
