@@ -82,7 +82,7 @@ Quiet cards barely move, so they do not need hourly history; the type rarely cha
 |---|---|---|
 | `index_ret` | hourly return of the equal-weighted price basket for each segment (All specials, Icons, Heroes, TOTW, Other promos, Holos) **and** each behaviour type (Active/Mixed/Quiet) | 56 days |
 | `market_ret` | median % move of each peer group between consecutive scans (feeds the seasonal profile) | 56 days |
-| `dip_events` | the **dip ledger**: every card ≥ 8% under its 24 h median, once per 6 h episode, with its situation (behaviour type, depth, market move, persisted?, fair value, nearby sale, weekday/hour) and later outcomes (net result at +15 min, +1 h, +3 h, +6 h, +12 h, and best exit within 3 h; `999` = unresolvable) | 56 days |
+| `dip_events` | the **dip ledger** (includes `d6`, the % vs the 6 h-ago reference, and the Austin weekday/hour for buy-window research): every card ≥ 8% under its 24 h median, once per 6 h episode, with its situation (behaviour type, depth, market move, persisted?, fair value, nearby sale, weekday/hour) and later outcomes (net result at +15 min, +1 h, +3 h, +6 h, +12 h, and best exit within 3 h; `999` = unresolvable) | 56 days |
 | `outcomes` | dips that were actually **alerted**, with the floor 1/3/6 h later (net of tax + haircut). Feeds the "similar dips" score line | 30 days |
 
 ### 3.4 State tables
@@ -149,7 +149,7 @@ median move is subtracted, so a market-wide slide does not look like 200 separat
 dips, watchlist buy, watchlist sell, owned-card alerts, then the red premium alert **last** (so it sits at the bottom, where you look first).
 
 ### 5.1 📉 Dip Alert · vs 6 h ago (regular cards) — **OFF by default** (`FC_DIP6H_ALERTS=1` turns it back on)
-Turned off because 6 h dips did not pay after tax in practice; the rule is kept in the code. When on:
+Turned off because 6 h dips did not pay after tax in practice, **but the rule still runs silently**: every 6 h dip is scored and logged to `outcomes` (floor 1/3/6 h later), and each dip-ledger event stores its `d6` (% vs the 6 h-ago reference) so longer-hold / buy-window research keeps its data. When on:
 - Reference = median of the hour before "6 h ago" (needs ≥ 12 snapshots in 24 h).
 - Fires when the price is **≥ 8 % below the reference after the market adjustment**, **and** below its 24 h median ("usual") **and** at or under its recent-sales average.
 - Grouped by card version; a tier emoji shows depth (🔴 15 %+ · 🟠 12–15 % · 🟢 8–12 %).
