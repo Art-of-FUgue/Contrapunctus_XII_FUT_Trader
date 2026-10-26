@@ -530,6 +530,15 @@ def auto_watch_update(db, cards, now: float, skip: set | None = None) -> None:
         db.execute("delete from watch_auto")
         set_meta(db, "auto_watch_reset_v2", now)
         last = None
+    if not get_meta(db, "auto_seed_v3"):                 # one-time: the starting list gets a grace period
+        try:
+            seed = json.load(open(os.path.join(HERE, "watch_seed.json")))
+        except (OSError, ValueError):
+            seed = []
+        for cid in seed:
+            db.execute("insert or replace into watch_auto values (?,?)", (str(cid), now))
+        set_meta(db, "auto_seed_v3", now)
+        last = None
     if last and now - float(last) < AUTO_REFRESH_H * 3600 - 120:
         return
     skip = skip or set()
@@ -2279,7 +2288,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         spikes = fresh_spikes(db, spikes, now, "spike")
         flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
     _cyc = fresh_cycles(db, cycles, now) if run_cycles else []
-    auto_watch_update(db, cards, now, muted_new | watch)
+    auto_watch_update(db, cards, now, muted_new | (watch - auto))   # auto picks are re-screened each time
     embeds = (
         build_dips(dips)
         + (build_cycles(_cyc) if run_cycles else [])
