@@ -1765,6 +1765,7 @@ _LIQUID_CARDS: set = set()       # cards with at least that many inferred sales;
 # ---- thin cards: erratic floors with few real sales are left out of the drop alerts ----------
 THIN_MIN_SALES = int(os.environ.get("FC_THIN_MIN_SALES", "15"))     # inferred sales in 4 days
 THIN_MAX_SPREAD_PCT = float(os.environ.get("FC_THIN_MAX_SPREAD", "60"))   # 24 h floor p10-p90 over median
+THIN_FLOOR_OVER_SOLD = 2.0         # floor above this multiple of its 4-day sold median is not a real price
 
 
 def thin_cards(db, now: float) -> set:
@@ -1774,9 +1775,17 @@ def thin_cards(db, now: float) -> set:
     c = _cache.get("thin")
     if c and now - c[0] < 600:
         return c[1]
-    sales = dict(db.execute("select card_id, count(*) from sales_inferred where kind='sale' and ts>=? "
-                            "group by card_id", (now - PREMIUM_SALE_WINDOW_H * 3600,)))
+    prices_sold: dict = {}
+    for cid, price in db.execute("select card_id, price from sales_inferred where kind='sale' and ts>=?",
+                                 (now - PREMIUM_SALE_WINDOW_H * 3600,)):
+        prices_sold.setdefault(cid, []).append(price)
+    sales = {cid: len(v) for cid, v in prices_sold.items()}
     thin: set = set()
+    # floor far above anything the card sells for: the cheap listings are gone and what is left is not the market
+    for cid, price in db.execute("select card_id, price from prices where ts=(select max(ts) from prices)"):
+        v = prices_sold.get(cid)
+        if v and len(v) >= 10 and price > THIN_FLOOR_OVER_SOLD * statistics.median(v):
+            thin.add(cid)
     seen: set = set()
     cur, buf = None, []
 
