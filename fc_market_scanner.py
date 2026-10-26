@@ -320,6 +320,10 @@ def open_db(path: str) -> sqlite3.Connection:
     db.execute("create table if not exists meta(k text primary key, v text)")
     db.execute("create table if not exists seen(card_id text primary key, first_ts real)")
     db.execute("create table if not exists watch_auto(card_id text primary key, added_ts real)")
+    db.execute("create table if not exists watch_positions(card_id text primary key, buy_price int, "
+               "target_price int, buy_ts real, est_hours real)")
+    if "est_hours" not in {r[1] for r in db.execute("pragma table_info(watch_positions)")}:
+        db.execute("alter table watch_positions add column est_hours real")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
     return db
 
@@ -572,6 +576,7 @@ WATCH_PREMIUM_CRASH_PCT = 50.0   # premium watchlist cards: alert on a drop this
 
 
 WATCH_BUY_MIN_NET = 4.0          # a watched card signals a buy when selling at fair value nets this much
+WATCH_POSITION_EXPIRE_HOURS = float(os.environ.get("FC_WATCH_EXPIRE_HOURS", "72"))
 
 
 def target_line(price: float, fair: float, ref: str) -> str:
@@ -593,73 +598,171 @@ def sell_target(db, card: Card, now: float, usual: float | None):
     return fair, ref, (fair * (1 - EA_TAX) / card.price - 1) * 100
 
 
-def watch_dip(db, card: Card, now: float, premium: bool = False, mkt_adj: float = 0.0):
-    """Dip rule for a watched card.
+def estimate_sell_hours(db, card: Card, target_price: float, now: float) -> float:
+    """Estimate how many hours it will take for a dipped card to reach target_price.
 
-    Regular cards: 6 h dip (median ref) or quick dip vs the last 5 min.
-    Premium cards: the premium rule (4-day sold price, or 24 h median when sales are thin),
-    plus a crash alert when the price falls WATCH_PREMIUM_CRASH_PCT or more within 5 min.
+    Uses:
+    1. Historical recovery time of past dips for this card in the last 7 days.
+    2. Inferred sales velocity from the sales model (sales/hour to absorb floor listings).
+    3. Default fallback of AUTO_GAP_H (6 hours).
     """
-    best, kind, extra, ps, icon = None, "watch", "", None, "📉"
+    try:
+        since = now - AUTO_LOOKBACK_DAYS * 86400
+        rows = db.execute(
+            "select hour_ts, price from prices_hourly where card_id=? and hour_ts>=? order by hour_ts",
+            (card.card_id, since)
+        ).fetchall()
+        if not rows:
+            rows = db.execute(
+                "select ts, price from prices where card_id=? and ts>=? order by ts",
+                (card.card_id, since)
+            ).fetchall()
+        if len(rows) >= 6:
+            recoveries = []
+            dip_start = None
+            for ts, price in rows:
+                if dip_start is None:
+                    if price <= target_price * (1 - AUTO_DIP_PCT / 100):
+                        dip_start = ts
+                else:
+                    if price >= target_price:
+                        recoveries.append((ts - dip_start) / 3600)
+                        dip_start = None
+            if recoveries:
+                med_rec = statistics.median(recoveries)
+                if med_rec > 0:
+                    return float(round(max(1.0, min(24.0, med_rec)), 1))
+    except Exception:
+        pass
+
+    try:
+        st = sm.sale_stats(db, card.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+        if st and st.get("n24", 0) >= 4:
+            rate = st["n24"] / 24.0
+            if rate > 0:
+                est = 2.5 / rate
+                return float(round(max(1.0, min(24.0, est)), 1))
+    except Exception:
+        pass
+
+    return float(AUTO_GAP_H)
+
+
+def watch_dip(db, card: Card, now: float):
+    """Buy-signal rule for a watched card.
+
+    Alerts only when the card is AUTO_DIP_PCT (6%) below its 24 h median AND
+    selling at fair value (4-day sold or 24 h median) would net at least
+    WATCH_BUY_MIN_NET (4%) after the 5% EA tax.  The watchlist has its own
+    criterion — it does not reuse the 6 h / premium / flash dip rules.
+    """
     ws = card_stats(db, card, now)
     usual = ws["usual"] if ws else None
-    if premium:
-        ps = card_premium_dip_stats(db, card, now, mkt_adj)
-        if ps:
-            best = (ps["dip_pct"], f"vs {_premium_ref(ps)} {k(ps['sales_median'])}", ps["sales_median"])
-            extra = f" · net {ps['net']:+.1f}%" if "net" in ps else ""
-        flash_pct = WATCH_PREMIUM_CRASH_PCT
-    else:
-        s = ws
-        if s and s["ref"] > 0:
-            pct = (card.price - s["ref"]) / s["ref"] * 100
-            if pct <= -DIP_MIN_PCT:
-                best = (pct, f"vs {k(s['ref'])} **{COMPARE_HOURS} h ago**", s["ref"])
-        flash_pct = FLASH_DIP_PCT
-    f = card_flash_stats(db, card, now)
-    if f and f["prev_price"] > 0:
-        pct = (card.price - f["prev_price"]) / f["prev_price"] * 100
-        if pct <= -flash_pct and (best is None or pct < best[0]):
-            best = (pct, f"vs {k(f['prev_price'])} **{FLASH_WINDOW_MIN:g} min ago**", f["prev_price"])
-            extra = ""
-            if premium:
-                kind = "watchcrash"
-    tgt = sell_target(db, card, now, usual)
-    if best is None and usual and tgt and card.price <= usual * (1 - AUTO_DIP_PCT / 100) \
-            and tgt[2] >= WATCH_BUY_MIN_NET:
-        # buy signal: the card is in the zone where its dips have paid, and fair value nets enough
-        best, icon = ((card.price - usual) / usual * 100, f"vs {k(usual)} **{PREMIUM_HISTORY_HOURS} h median**", usual), "🎯"
-    if not best:
+    if not usual:
         return None
-    # watched cards have no cooldown: they post again when the price moved since the last post
+    tgt = sell_target(db, card, now, usual)
+    if not tgt or card.price > usual * (1 - AUTO_DIP_PCT / 100) or tgt[2] < WATCH_BUY_MIN_NET:
+        return None
+    pct = (card.price - usual) / usual * 100
+    kind = "watch"
     if repeat_blocked(db, card.card_id, kind, card.price, now):
         return None
+    est_h = estimate_sell_hours(db, card, tgt[0], now)
+    est_ts = now + est_h * 3600
     db.execute("insert into alerts values (?,?,?,?)", (card.card_id, kind, now, card.price))
+    db.execute(
+        "insert or replace into watch_positions(card_id, buy_price, target_price, buy_ts, est_hours) "
+        "values (?,?,?,?,?)",
+        (card.card_id, card.price, int(tgt[0]), now, est_h)
+    )
     db.commit()
-    return {"pct": best[0], "why": best[1], "ref": best[2], "extra": extra,
-            "icon": "💥" if kind == "watchcrash" else icon,
-            "target": target_line(card.price, tgt[0], tgt[1]) if tgt else "",
-            # a watched premium card that passed the 4-day sold rule also goes to the red alert
-            "sold": ps if (premium and kind == "watch" and ps and "net" in ps) else None}
+    return {"pct": pct, "why": f"vs {k(usual)} **{PREMIUM_HISTORY_HOURS} h median**", "ref": usual,
+            "extra": f" · net {tgt[2]:+.1f}% at fair value",
+            "icon": "🎯",
+            "target": target_line(card.price, tgt[0], tgt[1]),
+            "est_hours": est_h,
+            "est_ts": est_ts,
+            "sold": None}
+
+
+def watch_sell(db, card: Card, now: float):
+    """Sell-signal rule for a watched card with an active buy position.
+
+    Fires when the card's price reaches or exceeds the target fair value established
+    at buy time, completing the trading cycle.
+    """
+    row = db.execute(
+        "select buy_price, target_price, buy_ts, est_hours from watch_positions where card_id=?",
+        (card.card_id,)
+    ).fetchone()
+    if not row:
+        return None
+    buy_price, target_price, buy_ts, est_hours = row
+    if card.price < target_price:
+        return None
+
+    net = (card.price * (1 - EA_TAX) - buy_price) / buy_price * 100
+    gross = (card.price - buy_price) / buy_price * 100
+    held_h = max(0.1, (now - buy_ts) / 3600)
+
+    db.execute("delete from watch_positions where card_id=?", (card.card_id,))
+    db.execute("insert into alerts values (?,?,?,?)", (card.card_id, "watch_sell", now, card.price))
+    db.commit()
+
+    return {
+        "buy_price": buy_price,
+        "target_price": target_price,
+        "net": net,
+        "gross": gross,
+        "held_h": held_h,
+        "buy_ts": buy_ts,
+        "est_hours": est_hours or 0.0,
+    }
 
 
 def build_watch_dips(items, auto: set[str]) -> list[dict]:
     items = _limit(sorted(items, key=lambda i: (i[0].card_id in auto, i[1]["pct"])))   # your own picks first
     if not items:
         return []
-    lines = [f"⏱ Regular cards: vs **{COMPARE_HOURS} h ago** · premium cards: vs **{PREMIUM_SALE_WINDOW_H // 24}-day sold** · "
-             f"💥 premium crash ≥{WATCH_PREMIUM_CRASH_PCT:.0f}% vs **{FLASH_WINDOW_MIN:g} min ago**", ""]
+    lines = [f"🎯 **{AUTO_DIP_PCT:.0f}%+** below 24 h median · fair value nets **{WATCH_BUY_MIN_NET:.0f}%+** after tax", ""]
     for c, d in items:
         tag = " 🔁" if c.card_id in auto else " ⭐"
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}{tag}")
-        lines.append(f"{d.get('icon', '📉')} `{d['pct']:+.1f}%` · {d['why']}{d.get('extra', '')}{open_link(c)}")
+        lines.append(f"{d.get('icon', '🎯')} `{d['pct']:+.1f}%` · {d['why']}{d.get('extra', '')}{open_link(c)}")
         if d.get("target"):
             lines.append(f"↳ {d['target']}")
-    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched · 🎯 = buy signal: "
-             f"{AUTO_DIP_PCT:.0f}%+ under its 24 h median and fair value nets {WATCH_BUY_MIN_NET:.0f}%+ after tax"]
-    e = {"title": f"👁 Watchlist Dip · {PLATFORM_LABEL}",
+        if d.get("est_ts"):
+            eh = d["est_hours"]
+            eh_str = f"{eh:.1f}h" if eh % 1 != 0 else f"{int(eh)}h"
+            lines.append(f"↳ ⏱ est. sell <t:{int(d['est_ts'])}:t> (~{eh_str}, <t:{int(d['est_ts'])}:R>)")
+    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched"]
+    e = {"title": f"🎯 Watchlist Buy Signal · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
-         "footer": {"text": "Watched cards post only when they dip again"}}
+         "footer": {"text": f"Buy signal: {AUTO_DIP_PCT:.0f}%+ under 24 h median · "
+                             f"fair value nets {WATCH_BUY_MIN_NET:.0f}%+ after 5% EA tax"}}
+    if items[0][0].image_url:
+        e["thumbnail"] = {"url": items[0][0].image_url}
+    return [e]
+
+
+def build_watch_sells(items, auto: set[str]) -> list[dict]:
+    items = _limit(sorted(items, key=lambda i: (i[0].card_id in auto, -i[1]["net"])))
+    if not items:
+        return []
+    lines = ["🎯 **Target reached** · time to list and take profit", ""]
+    for c, d in items:
+        tag = " 🔁" if c.card_id in auto else " ⭐"
+        lines.append(f"### {k(c.price)} · {c.name} · {c.kind}{tag}")
+        lines.append(f"💰 `{d['net']:+.1f}%` net after tax · target **{k(d['target_price'])}** reached!{open_link(c)}")
+        held_h = d["held_h"]
+        held_str = f"{held_h:.1f}h" if held_h < 10 else f"{int(round(held_h))}h"
+        est_str = f"~{int(round(d['est_hours']))}h" if d.get("est_hours") else ""
+        timing = f"held ~{held_str}" + (f" (est. was {est_str})" if est_str else "")
+        lines.append(f"↳ bought at **{k(d['buy_price'])}** <t:{int(d['buy_ts'])}:R> · {timing}")
+    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched"]
+    e = {"title": f"🎯 Watchlist Sell · {PLATFORM_LABEL}",
+         "description": "\n".join(lines), "color": 0x2ECC71,
+         "footer": {"text": f"Watchlist cycle complete · net profit after 5% EA tax · target reached"}}
     if items[0][0].image_url:
         e["thumbnail"] = {"url": items[0][0].image_url}
     return [e]
@@ -2085,7 +2188,9 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         print(f"[warn] liquid-card refresh failed: {e}")
     auto = auto_watch_ids(db, now)
     watch_hits: list = []
-    sold_watch: list = []                        # watched premium cards below their 4-day sold price
+    watch_sells: list = []
+    db.execute("delete from watch_positions where buy_ts < ?", (now - WATCH_POSITION_EXPIRE_HOURS * 3600,))
+    open_watch_positions = {r[0] for r in db.execute("select card_id from watch_positions")}
     stats = {c.card_id: card_stats(db, c, now) for c in cards
              if c.card_id not in muted_new and c.card_id not in watch}
     prev_ts = db.execute("select max(ts) from prices").fetchone()[0]
@@ -2110,16 +2215,15 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     for c in cards:
         if c.card_id in thin:
             continue                              # erratic floor / almost no sales: no drop alerts
-        if c.card_id in watch:
+        if c.card_id in watch or c.card_id in open_watch_positions:
             # watched cards skip the price/new-card filters and the normal lists;
-            # they only post when they dip again.
-            ws = card_stats(db, c, now)
-            d = watch_dip(db, c, now, _in_premium_list(c, ws["usual"] if ws else None),
-                          adj24.get(rgroup(c), 0.0))
-            if d:
-                if d.get("sold"):
-                    sold_watch.append((c, d["sold"]))
-                else:
+            # they fire buy signals and sell signals to complete the trading cycle.
+            s = watch_sell(db, c, now)
+            if s:
+                watch_sells.append((c, s))
+            elif c.card_id in watch:
+                d = watch_dip(db, c, now)
+                if d:
                     watch_hits.append((c, d))
             cy = find_cycle(db, c, now)
             if cy:
@@ -2218,8 +2322,9 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         + build_premium_dips(premium_dips)    # 💎 premium dips on the 24 h median fallback
     )
 
-    # ── watchlist: posts only when a watched card dips again ─────────────────
+    # ── watchlist: buy signals and sell alerts for watched cards ─────────────
     embeds += build_watch_dips(watch_hits, auto)
+    embeds += build_watch_sells(watch_sells, auto)
 
     # ── purchased list: spikes only for cards you hold ───────────────────────
     if purchased:
@@ -2227,7 +2332,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
 
     # 🚨 premium below its 4-day sold price goes out LAST, so it sits at the bottom of the channel,
     # right where you look first
-    embeds += build_premium_dips(premium_dips + sold_watch, hot=True)
+    embeds += build_premium_dips(premium_dips, hot=True)
 
     return embeds
 
