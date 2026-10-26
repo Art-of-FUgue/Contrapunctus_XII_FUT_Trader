@@ -302,7 +302,7 @@ def open_db(path: str) -> sqlite3.Connection:
                "persist int, fair int, sale_near int, wd int, hr int, x3 real, x6 real, x12 real)")
     db.execute("create index if not exists dx on dip_events(card_id, ts)")
     have = {r[1] for r in db.execute("pragma table_info(dip_events)")}
-    for col in ("xm15", "xm60", "best3"):                   # quick-flip outcomes added later
+    for col in ("xm15", "xm60", "best3", "d6"):             # quick-flip outcomes, and the 6 h-ago dip %, added later
         if col not in have:
             db.execute(f"alter table dip_events add column {col} real")
     db.execute("create table if not exists index_ret(seg text, hour_ts integer, ret real, n integer, "
@@ -1772,10 +1772,11 @@ def record_dip_events(db, cards, stats: dict, adj24: dict, skip: set, now: float
         near = db.execute("select count(*) from sales_inferred where card_id=? and kind='sale' "
                           "and ts>=? and price<=?", (c.card_id, now - 1800, c.price * 1.01)).fetchone()[0]
         db.execute("insert into dip_events(card_id, ts, price, usual, dip, mkt, typ, seg, band, persist, "
-                   "fair, sale_near, wd, hr) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   "fair, sale_near, wd, hr, d6) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                    (c.card_id, now, c.price, int(s_["usual"]), dip, adj24.get(rgroup(c), 0.0),
                     beh.get(c.card_id, "?"), _index_segment(c.kind), price_band(c.price), persist,
-                    fair, near, loc.weekday(), loc.hour))
+                    fair, near, loc.weekday(), loc.hour,
+                    (c.price / s_["ref"] - 1) * 100 if s_.get("ref") else None))
         n += 1
     db.execute("delete from dip_events where ts < ?", (now - EVENT_KEEP_DAYS * 86400,))
     db.commit()
@@ -2234,7 +2235,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 pct = (c.price - s["ref"]) / s["ref"] * 100
                 m6 = adj6.get(rgroup(c), 0.0)
                 rel = pct - m6                          # dip beyond the market's own move
-                if DIP6H_ALERTS and rel <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
+                if rel <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
                     dips.append((c, dict(s, mkt=m6, raw=pct), rel))
                 if pct >= SPIKE_MIN_PCT:
                     spikes.append((c, s, pct))
@@ -2252,7 +2253,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 elif rel <= -FLASH_DIP_PCT:
                     flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id))), rel))
 
-    dips = fresh_dips(db, dips, now, "dip")
+    dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
     premium_dips = fresh_dips(db, premium_dips, now, "prem")
 
@@ -2264,6 +2265,8 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
             d["season"] = season_drift(db, rgroup(c), now, season_cache)
             d["sellp"] = sm.sell_prob(db, rgroup(c), price_band(c.price), SCORE_HORIZON, now)
             log_outcome(db, c, dtype, rel, d.get("mkt", 0.0), now)
+    if not DIP6H_ALERTS:
+        dips = []                                  # 6 h dips are logged to `outcomes` for research, not posted
     for c, d in premium_dips:
         d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(d["dip_pct"]), "prem",
                                time_slot(now))
