@@ -7,9 +7,8 @@ holo ...; each title names the period it compares against):
     ⚡ Fast Drop          · vs 5 min ago      down 8%+ against the last 5 minutes (💥 = 12%+)
     💎 Premium Dip        · vs 4-day sold     Icons/Heroes/pricey promo cards vs real sale prices
                                               (thin cards: vs 24 h median)
-    🔁 Round Trip         · within 24 h       a card that dipped then recovered (flip profit)
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
-    👁 Watchlist Dip      · vs 6 h / 5 min    watched cards dipping again
+    🎯 Watchlist Buy/Sell · vs 24 h median    watched cards buy signal & sell when target hit
     👁 Watchlist Prices   · now               current price of every watched card
     🕒 Buy Windows        · next 24 h         cheapest and best-entry hours per card type, daily (FC_WINDOWS_POST_HOURS)
     📊 Market Index       · 24 h trend        whole-market index by segment, posted every 3 h (FC_INDEX_POST_HOURS)
@@ -32,7 +31,7 @@ How it works
   1. Each scan reads current prices from fut.gg's static price files (skipped when the feed
      has not changed) and labels them using players.json (see setup.py / build_players.py).
   2. Prices are saved to SQLite; sales_model.py infers real sales from floor-price moves.
-  3. Dips, crashes, premium dips, round trips and held-card spikes are judged against the
+  3. Dips, crashes, premium dips and held-card spikes are judged against the
      periods above and posted as Discord embeds.
 """
 import argparse
@@ -422,68 +421,9 @@ SPIKE_COOLDOWN_HOURS = float(os.environ.get("FC_SPIKE_COOLDOWN_HOURS", "6"))
 SPIKE_REALERT_PCT = 5.0          # ...or climbs this much above the price last alerted
 
 
-# ---- round trips: a dip followed by a spike inside the last 24 h -------------
-CYCLE_HOURS = 24                 # window searched for buy-low / sell-high pairs
-CYCLE_RECENT_HOURS = 4           # the sell peak must be this fresh
-CYCLE_MIN_NET_PCT = float(os.environ.get("FC_CYCLE_MIN_NET_PCT", "50"))  # profit after 5% EA tax
 EA_TAX = 0.05
 # Standalone spike alerts are off by default (set FC_SPIKE_ALERTS=1 to bring back).
 SPIKE_ALERTS = os.environ.get("FC_SPIKE_ALERTS", "0") == "1"
-
-
-def find_cycle(db, card: Card, now: float):
-    """Best buy-low -> sell-high pair (low first, then later high) in the window."""
-    rows = db.execute(
-        "select ts, price from prices where card_id=? and ts>=? order by ts",
-        (card.card_id, now - CYCLE_HOURS * 3600)).fetchall()
-    rows = trim_outliers(rows)
-    if len(rows) < MIN_SAMPLES:
-        return None
-    low_ts, low = rows[0]
-    best = None
-    for ts, price in rows[1:]:
-        if price < low:
-            low_ts, low = ts, price
-        elif low > 0 and ts >= now - CYCLE_RECENT_HOURS * 3600:   # only fresh peaks
-            net = (price * (1 - EA_TAX) - low) / low * 100
-            if best is None or net > best["net"]:
-                best = {"net": net, "gross": (price - low) / low * 100,
-                        "buy": low, "buy_ts": low_ts, "sell": price, "sell_ts": ts}
-    if not best or best["net"] < CYCLE_MIN_NET_PCT:
-        return None
-    return best
-
-
-def fresh_cycles(db, items, now: float):
-    """Drop cycles already posted (same card within the cooldown) and record new ones."""
-    out = []
-    for c, cy in items:
-        row = db.execute(
-            "select price from alerts where card_id=? and kind='cycle' and ts>=? "
-            "order by ts desc limit 1", (c.card_id, now - 12 * 3600)).fetchone()
-        if row and cy["sell"] < row[0] * (1 + SPIKE_REALERT_PCT / 100):
-            continue
-        out.append((c, cy))
-        db.execute("insert into alerts values (?,?,?,?)", (c.card_id, "cycle", now, cy["sell"]))
-    db.commit()
-    return out
-
-
-def build_cycles(items) -> list[dict]:
-    items = _limit(sorted(items, key=lambda i: -i[1]["net"]))
-    if not items:
-        return []
-    lines = [f"⏱ Dip → recovery inside **{CYCLE_HOURS} h** · profit after 5% EA tax ≥{CYCLE_MIN_NET_PCT:.0f}%", ""]
-    for c, cy in items:
-        lines.append(f"🔁 `{cy['net']:+.1f}%` net · buy **{k(cy['buy'])}** → sell **{k(cy['sell'])}** "
-                     f"{link(c)} {c.kind}")
-        lines.append(f"low <t:{int(cy['buy_ts'])}:t> · high <t:{int(cy['sell_ts'])}:t> · now {k(c.price)}")
-    e = {"title": f"🔁 Round Trip · within {CYCLE_HOURS} h · {PLATFORM_LABEL}",
-         "description": "\n".join(lines), "color": 0xF1C40F,
-         "footer": {"text": f"{CYCLE_HOURS} h window · net of 5% tax · from price snapshots"}}
-    if items[0][0].image_url:
-        e["thumbnail"] = {"url": items[0][0].image_url}
-    return [e]
 
 
 # ---- auto-watchlist: liquid cards whose dips have paid back ------------------------------
@@ -2173,10 +2113,8 @@ def _mkt_text(d: dict) -> str:
 
 
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
-         spikes_on: bool = True, run_cycles: bool = True,
-         purchased: dict | None = None) -> list[dict]:
+         spikes_on: bool = True, purchased: dict | None = None) -> list[dict]:
     dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
-    cycles: list = []
     spikes_on = spikes_on and SPIKE_ALERTS
     premium_dips: list[tuple[Card, dict]] = []   # (card, stats) – own embed
     cards_map = {c.card_id: c for c in cards}
@@ -2225,9 +2163,6 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 d = watch_dip(db, c, now)
                 if d:
                     watch_hits.append((c, d))
-            cy = find_cycle(db, c, now)
-            if cy:
-                cycles.append((c, cy))
             continue
         if c.card_id in muted_new:
             continue                                  # released in the last few days
@@ -2240,10 +2175,6 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         # ── skip TOTW fodder at min price (noisy, no signal) ────────────────
         if _is_totw_fodder(c):
             continue
-
-        cy = find_cycle(db, c, now)
-        if cy:
-            cycles.append((c, cy))
 
         in_premium = _in_premium_list(c, (stats.get(c.card_id) or {}).get("usual"))
         if in_premium:
@@ -2312,11 +2243,9 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     if spikes_on:
         spikes = fresh_spikes(db, spikes, now, "spike")
         flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
-    _cyc = fresh_cycles(db, cycles, now) if run_cycles else []
     auto_watch_update(db, cards, now, muted_new | (watch - auto))   # auto picks are re-screened each time
     embeds = (
         build_dips(dips)
-        + (build_cycles(_cyc) if run_cycles else [])
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
         + build_premium_dips(premium_dips)    # 💎 premium dips on the 24 h median fallback
