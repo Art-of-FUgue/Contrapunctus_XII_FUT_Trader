@@ -3,8 +3,8 @@ EA FC market scanner: finds price dips on special cards and posts them to a Disc
 
 Alert types (one post per criterion; inside it cards are grouped by version: Icon, Hero, TOTW,
 holo ...; each title names the period it compares against):
-    📉 Dip Alert         · vs 6 h ago        regular cards, price down >=8% vs the 6 h reference
-    ⚡ Fast Drop          · vs 5 min ago      down 8%+ against the last 5 minutes (💥 = 12%+)
+    📉 Dip Alert         · vs 6 h ago        OFF by default (FC_DIP6H_ALERTS=1): regular cards, down >=8% vs 6 h ago
+    ⚡ Fast Drop          · vs 5 min ago      down 10%+ against the last 5 minutes, with a tier hint
     💎 Premium Dip        · vs 4-day sold     Icons/Heroes/pricey promo cards vs real sale prices
                                               (thin cards: vs 24 h median)
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
@@ -148,8 +148,8 @@ def _limit(items: list) -> list:
 
 # ---- micro-spike / dip / crash (single scan-to-scan delta, ~15 min window) -
 FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as micro-spike
-FLASH_DIP_PCT = 8.0              # drop between last two snapshots to count as micro-dip
-FLASH_CRASH_PCT = 12.0           # drop threshold that escalates a micro-dip to a crash
+FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
+DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
 FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "5"))   # reference = median price of the last N minutes
 
@@ -1290,7 +1290,16 @@ def build_spikes(items) -> list[dict]:
     return [e]
 
 
-def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
+def drop_tier(c: Card, beh: str | None) -> str:
+    """Hint for a fast drop from how past drops paid (net of tax): 🟢 under 100k, not a Hero, Active or Mixed;
+    🟡 under 100k and Quiet/unknown; ⚪ Heroes and cards from 100k (about break-even)."""
+    size = "<40k" if c.price < 40_000 else "40–100k" if c.price < 100_000 else "100k+"
+    mark = ("⚪" if c.price >= 100_000 or "hero" in c.kind.lower()
+            else "🟢" if beh in ("Active", "Mixed") else "🟡")
+    return f"{mark} {size} · {beh or 'type unknown'}" + (" · holo" if "Holo" in c.kind else "")
+
+
+def build_flashes(spike_items, dip_items) -> list[dict]:
     """5-minute criterion: quick spikes, and quick dips + sharp crashes together, each grouped
     by card version. (Spikes are off unless FC_SPIKE_ALERTS=1.)"""
     embeds = []
@@ -1310,20 +1319,21 @@ def build_flashes(spike_items, dip_items, crash_items) -> list[dict]:
             e["thumbnail"] = {"url": spike_items[0][0].image_url}
         embeds.append(e)
 
-    drops = list(dip_items) + list(crash_items)
+    drops = list(dip_items)
     if drops:
         lines = [f"⏱ Down ≥{FLASH_DIP_PCT:.0f}% vs **{w}**"]
         for kind, grp in by_version(drops):
             grp = _limit(sorted(grp, key=lambda i: i[2]))             # deepest first
             lines += ["", _group_header(kind, len(grp))]
             for c, f, pct in grp:
-                icon = "💥" if pct <= -FLASH_CRASH_PCT else "📉"
                 lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
-                lines.append(f"{icon} `{pct:.1f}%` · vs **{w}**{open_link(c)}"
+                lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{open_link(c)}"
+                             + (f"\n↳ {f['tier']}" if f.get("tier") else "")
                              + (f"\n↳ {score_text(f)}" if f.get("score") else ""))
-        lines += ["", f"💥 {FLASH_CRASH_PCT:.0f}%+ · 📉 {FLASH_DIP_PCT:.0f}–{FLASH_CRASH_PCT:.0f}%"]
+        lines += ["", "Tier hint (from past fast drops, after tax): 🟢 under 100k, not a Hero, Active/Mixed · "
+                      "🟡 under 100k, Quiet · ⚪ Hero or 100k+ (barely paid)"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
-             "color": 0xE74C3C if crash_items else 0x1ABC9C,
+             "color": 0x1ABC9C,
              "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below the price {w}"}}
         img = next((c.image_url for c, _, _ in drops if c.image_url), None)
         if img:
@@ -2268,7 +2278,7 @@ def _score_key(d: dict, depth: float):
 
 def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
          spikes_on: bool = True, purchased: dict | None = None) -> list[dict]:
-    dips, spikes, flash_spikes, flash_dips, flash_crashes = [], [], [], [], []
+    dips, spikes, flash_spikes, flash_dips = [], [], [], []
     spikes_on = spikes_on and SPIKE_ALERTS
     premium_dips: list[tuple[Card, dict]] = []   # (card, stats) – own embed
     cards_map = {c.card_id: c for c in cards}
@@ -2304,6 +2314,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     except Exception as e:
         thin = set()
         print(f"[warn] thin-card filter failed: {e}")
+    try:
+        beh_types = _behaviour_cached(db, now)
+    except Exception:
+        beh_types = {}
     for c in cards:
         if c.card_id in thin:
             continue                              # erratic floor / almost no sales: no drop alerts
@@ -2352,7 +2366,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 pct = (c.price - s["ref"]) / s["ref"] * 100
                 m6 = adj6.get(rgroup(c), 0.0)
                 rel = pct - m6                          # dip beyond the market's own move
-                if rel <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
+                if DIP6H_ALERTS and rel <= -DIP_MIN_PCT and c.price < s["usual"] and c.price <= s["sales_avg"]:
                     dips.append((c, dict(s, mkt=m6, raw=pct), rel))
                 if pct >= SPIKE_MIN_PCT:
                     spikes.append((c, s, pct))
@@ -2367,18 +2381,15 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 f = dict(f, mkt=mf, raw=pct)
                 if pct >= FLASH_SPIKE_PCT:
                     flash_spikes.append((c, f, pct))
-                elif rel <= -FLASH_CRASH_PCT:
-                    flash_crashes.append((c, f, rel))
                 elif rel <= -FLASH_DIP_PCT:
-                    flash_dips.append((c, f, rel))
+                    flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id))), rel))
 
     dips = fresh_dips(db, dips, now, "dip")
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
-    flash_crashes = fresh_dips(db, flash_crashes, now, "flashcrash")
     premium_dips = fresh_dips(db, premium_dips, now, "prem")
 
     # score each dip by how similar past dips turned out, then log it for later scoring
-    for items, dtype in ((dips, "6h"), (flash_dips, "micro"), (flash_crashes, "micro")):
+    for items, dtype in ((dips, "6h"), (flash_dips, "micro")):
         for c, d, rel in items:
             d["score"] = score_dip(db, rgroup(c), price_band(c.price), depth_bin(rel), dtype,
                                    time_slot(now))
@@ -2401,7 +2412,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     embeds = (
         build_dips(dips)
         + (build_spikes(spikes) if spikes_on else [])
-        + build_flashes(flash_spikes if spikes_on else [], flash_dips, flash_crashes)
+        + build_flashes(flash_spikes if spikes_on else [], flash_dips)
         + build_premium_dips(premium_dips)    # 💎 premium dips on the 24 h median fallback
     )
 
