@@ -159,7 +159,8 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 ### 5.2 ⚡ Fast Drop · vs 5 min ago
 - Reference = median of the last 5 minutes of scans (`FC_FLASH_WINDOW_MIN`). Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
-- **Tier hint** on every line, from how past fast drops paid (26 h sample, net after tax, 3 h later): 🟢 under 100k, not a Hero, Active/Mixed · 🟡 under 100k, Quiet · ⚪ Heroes and anything 100k+ (about break-even). The line also shows the price size (<40k / 40–100k / 100k+), the behaviour type and "holo".
+- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15).
+- **Hint line:** 🟢 8 %+ under sold · 🟡 5–8 % under, with the sold price, size (<40k / 40–100k / 100k+), behaviour type and "holo".
 - Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
 
 ### 5.3 💎 Premium Dip and 🚨 Premium below 4-day sold
@@ -236,6 +237,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_DIP_COOLDOWN_ACTIVE/MIXED/QUIET` | 5 / 10 / 15 min | dip cooldown by type |
 | `FC_FLASH_WINDOW_MIN` | 5 | reference window of the fast drop |
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the 5-minute reference |
+| `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted |
 | `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
 | `FC_PREMIUM_ICON_HERO_MIN` / `FC_PREMIUM_PROMO_MIN` | 100k / 300k | premium list thresholds |
 | `FC_PREMIUM_LIQUID_MIN_SALES` | 20 | sales in 4 days to count a 100k+ card as premium |
@@ -250,7 +252,8 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_SALES_RAW_DAYS`, `FC_LISTING_HOURS`, `FC_SALE_TOL_SECONDS` | 4, `1,3,6,12`, 90 | sales inference |
 
 ## 9. Findings that shaped the design (for context)
-- **Fast drops (26 h, liquid non-thin cards 15k–250k):** 10 %+ drops on cards under 100k returned about +13 % net at 3 h (79 % won, n = 28); 8–10 % only ≈ +1 %. Under 40k and Active cards were best; Heroes and 100k+ ≈ break-even. Small sample, re-check as data grows.
+- **Fast drops (26 h, liquid non-thin cards 15k–250k):** 10 %+ drops on cards under 100k returned about +13 % net at 3 h (79 % won, n = 28); 8–10 % only ≈ +1 %. The deciding factor was the gap to the 4-day sold median (see 5.2). Small sample, re-check as data grows.
+- **Sustained dips do not pay:** when the cheap price is still the floor an hour later (406 hourly dips ≥ 6 % under the prior 24 h median, 680 hourly floors under the sold median) results were −2 % to −6 % net — the market had repriced (often new promo cards). The edge exists only in the first minutes of a sudden drop.
 - Blind dip-buying is **net-negative after tax**; the market median is roughly flat over a week. Dips are only worth taking on liquid cards whose own history says they recover, which is why the watchlist and the premium rules are selective.
 - Sales surges are only weakly predictive. Holo Future Stars / DfG cards in the 100–300k range showed a steady rise through a week in one sample, which a dip rule alone does not capture (planned: rebound / weekly-cycle detector, needs ~3 weeks of hourly index data).
 - Cards that almost never sell at their listed floor (e.g. a 93k floor with real sales under 20k) are misleading; the thin-card filter removes them.
