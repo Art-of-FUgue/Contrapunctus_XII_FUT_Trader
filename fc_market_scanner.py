@@ -321,6 +321,8 @@ def open_db(path: str) -> sqlite3.Connection:
                "target_price int, buy_ts real, est_hours real)")
     if "est_hours" not in {r[1] for r in db.execute("pragma table_info(watch_positions)")}:
         db.execute("alter table watch_positions add column est_hours real")
+    if "warned" not in {r[1] for r in db.execute("pragma table_info(watch_positions)")}:
+        db.execute("alter table watch_positions add column warned int default 0")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
     return db
 
@@ -511,6 +513,7 @@ def auto_watch_ids(db, now: float) -> set[str]:
 
 
 WATCH_BUY_MIN_NET = 4.0          # a watched card signals a buy when selling at fair value nets this much
+WATCH_REASSESS_HOURS = float(os.environ.get("FC_WATCH_REASSESS_HOURS", "36"))   # target not reached by now: one reassess note
 WATCH_POSITION_EXPIRE_HOURS = float(os.environ.get("FC_WATCH_EXPIRE_HOURS", "72"))
 
 
@@ -627,14 +630,22 @@ def watch_sell(db, card: Card, now: float):
     at buy time, completing the trading cycle.
     """
     row = db.execute(
-        "select buy_price, target_price, buy_ts, est_hours from watch_positions where card_id=?",
+        "select buy_price, target_price, buy_ts, est_hours, warned from watch_positions where card_id=?",
         (card.card_id,)
     ).fetchone()
     if not row:
         return None
-    buy_price, target_price, buy_ts, est_hours = row
+    buy_price, target_price, buy_ts, est_hours, warned = row
     if card.price < target_price:
-        return None
+        held = (now - buy_ts) / 3600
+        if held < WATCH_REASSESS_HOURS or warned:
+            return None
+        # target not reached in time: one reassess note, the position stays open until it expires
+        db.execute("update watch_positions set warned=1 where card_id=?", (card.card_id,))
+        db.commit()
+        return {"stale": True, "buy_price": buy_price, "target_price": target_price,
+                "net": (card.price * (1 - EA_TAX) - buy_price) / buy_price * 100,
+                "held_h": held, "buy_ts": buy_ts, "est_hours": est_hours or 0.0}
 
     net = (card.price * (1 - EA_TAX) - buy_price) / buy_price * 100
     gross = (card.price - buy_price) / buy_price * 100
@@ -681,13 +692,19 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
 
 
 def build_watch_sells(items, auto: set[str]) -> list[dict]:
-    items = _limit(sorted(items, key=lambda i: (i[0].card_id in auto, -i[1]["net"])))
+    items = _limit(sorted(items, key=lambda i: (bool(i[1].get("stale")), i[0].card_id in auto, -i[1]["net"])))
     if not items:
         return []
-    lines = ["🎯 **Target reached** · time to list and take profit", ""]
+    lines = ["🎯 **Target reached** · time to list and take profit  ·  ⏰ **Target not reached** · reassess", ""]
     for c, d in items:
         tag = " 🔁" if c.card_id in auto else " ⭐"
         lines.append(f"### {k(c.price)} · {c.name} · {c.kind}{tag}")
+        if d.get("stale"):
+            lines.append(f"⏰ `{d['net']:+.1f}%` net after tax if sold now · target **{k(d['target_price'])}** "
+                         f"not reached in {int(round(d['held_h']))}h{open_link(c)}")
+            lines.append(f"↳ bought at **{k(d['buy_price'])}** <t:{int(d['buy_ts'])}:R> · "
+                         "consider exiting or lowering the target")
+            continue
         lines.append(f"💰 `{d['net']:+.1f}%` net after tax · target **{k(d['target_price'])}** reached!{open_link(c)}")
         held_h = d["held_h"]
         held_str = f"{held_h:.1f}h" if held_h < 10 else f"{int(round(held_h))}h"
