@@ -676,6 +676,7 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
             eh = d["est_hours"]
             eh_str = f"{eh:.1f}h" if eh % 1 != 0 else f"{int(eh)}h"
             lines.append(f"↳ ⏱ est. sell <t:{int(d['est_ts'])}:t> (~{eh_str}, <t:{int(d['est_ts'])}:R>)")
+        lines.append(name_block(c))
     lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched"]
     e = {"title": f"🎯 Watchlist Buy Signal · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
@@ -1217,15 +1218,14 @@ def link(c: Card) -> str:
     return f"[{c.name}]({c.url})" if c.url else f"**{c.name}**"
 
 
-WEBAPP_URL = "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/"
-
-
 def open_link(c: Card) -> str:
-    """Links after an alert line: the fut.gg card page, the EA Web App (it has no search deep link),
-    and the player name in code so it can be copied into the Transfer Market search."""
-    if not c.url:
-        return ""
-    return f" · [open]({c.url}) · [🛒]({WEBAPP_URL}) · `{c.name}`"
+    return f" · [open]({c.url})" if c.url else ""
+
+
+def name_block(c: Card) -> str:
+    """The player name in a code block: Discord shows a copy button on it (hold to copy on mobile),
+    ready to paste into the Web App's Transfer Market search (which has no search link)."""
+    return f"```\n{c.name}\n```"
 
 
 def _version_order(kind: str):
@@ -1260,6 +1260,7 @@ def build_dips(items) -> list[dict]:
             first = first or c
             lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} **{COMPARE_HOURS} h ago**{_sell_text(s)}{open_link(c)}")
+            lines.append(name_block(c))
     lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12% below"]
     e = {"title": f"📉 Dip Alert · vs {COMPARE_HOURS} h ago · {PLATFORM_LABEL}",
          "description": "\n".join(lines),
@@ -1329,6 +1330,7 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
                 lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
                 lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{open_link(c)}"
                              + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
+                lines.append(name_block(c))
         lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted · "
                       "🟢 8%+ under (best past results) · 🟡 5–8% under"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
@@ -1368,6 +1370,7 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
                 f"{_sell_text(s)}{open_link(c)}"
             )
             lines.append(f"↳ {target_line(c.price, s['sales_median'], _premium_ref(s).strip('*'))}")
+            lines.append(name_block(c))
     if hot:
         lines += ["", "vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%"]
     else:
