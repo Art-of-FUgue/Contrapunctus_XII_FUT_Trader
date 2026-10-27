@@ -152,7 +152,7 @@ FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # t
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
-FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "5"))   # reference = median price of the last N minutes
+FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "1"))   # reference = median price of the last N minutes
 
 # ---- watchlist -------------------------------------------------------------
 WATCHLIST_FILE = os.path.join(HERE, "watchlist.json")   # auto-loaded if it exists
@@ -207,9 +207,10 @@ def _get_session():
     global _session
     if _session is None:
         try:
-            from curl_cffi import requests as cffi_requests
+            import importlib
+            cffi_requests = importlib.import_module("curl_cffi.requests")
             _session = cffi_requests.Session(impersonate="chrome")
-        except ImportError:
+        except Exception:
             _session = requests.Session()
         _session.headers.update(FUTGG_HEADERS)
     return _session
@@ -228,7 +229,9 @@ def _get_json(url: str, retries: int = 3):
             last_err = e
             if attempt < retries - 1:
                 time.sleep(1.5 * (attempt + 1))
-    raise last_err
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Failed to fetch {url}")
 
 
 def _r2(name: str, manifest: dict):
