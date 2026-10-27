@@ -174,8 +174,19 @@ class Card:
 # ----------------------------------------------------------- fut.gg source --
 FUTGG_YEAR = "27"
 R2 = f"https://r2.fut.gg/{FUTGG_YEAR}/"
-FUTGG_HEADERS = {"Referer": "https://www.fut.gg/",
-                 "User-Agent": "Mozilla/5.0 (personal price alert bot)"}
+FUTGG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.fut.gg",
+    "Referer": "https://www.fut.gg/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "sec-ch-ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 # Player names/ratings/images. Save this by hand from your browser (Ctrl+S) at
 #   https://www.fut.gg/api/fut/players/v2/27/?response_format=card-image
 # That API is disallowed for bots in fut.gg's robots.txt, so the script reads
@@ -189,12 +200,35 @@ PLAYERS_FILE = os.environ.get("FUTGG_PLAYERS_FILE", os.path.join(HERE, "players.
 HOLO_FILE = os.environ.get("FC_HOLO_FILE", os.path.join(HERE, "holo_ids.json"))
 MIN_TRACK_PRICE = 5_000          # ignore cheaper cards (keeps the DB small)
 _cache: dict = {}
+_session = None
 
 
-def _get_json(url: str):
-    r = requests.get(url, headers=FUTGG_HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _get_session():
+    global _session
+    if _session is None:
+        try:
+            from curl_cffi import requests as cffi_requests
+            _session = cffi_requests.Session(impersonate="chrome")
+        except ImportError:
+            _session = requests.Session()
+        _session.headers.update(FUTGG_HEADERS)
+    return _session
+
+
+def _get_json(url: str, retries: int = 3):
+    s = _get_session()
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = s.get(url, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            r.raise_for_status()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_err
 
 
 def _r2(name: str, manifest: dict):
