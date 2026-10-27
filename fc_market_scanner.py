@@ -4,7 +4,7 @@ EA FC market scanner: finds price dips on special cards and posts them to a Disc
 Alert types (one post per criterion; inside it cards are grouped by version: Icon, Hero, TOTW,
 holo ...; each title names the period it compares against):
     📉 Dip Alert         · vs 6 h ago        OFF by default (FC_DIP6H_ALERTS=1): regular cards, down >=8% vs 6 h ago
-    ⚡ Fast Drop          · vs 5 min ago      down 10%+ against the last 5 minutes, with a tier hint
+    ⚡ Fast Drop          · vs prev. update   down 10%+ against the previous price update (~5-6 min), with a tier hint
     💎 Premium Dip        · vs 4-day sold     Icons/Heroes/pricey promo cards vs real sale prices
                                               (thin cards: vs 24 h median)
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
@@ -153,7 +153,7 @@ FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # t
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
-FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "5"))   # reference = median price of the last N minutes
+FLASH_WINDOW_MIN = float(os.environ.get("FC_FLASH_WINDOW_MIN", "1"))   # reference = median price of the last N minutes
 
 # ---- watchlist -------------------------------------------------------------
 WATCHLIST_FILE = os.path.join(HERE, "watchlist.json")   # auto-loaded if it exists
@@ -175,8 +175,19 @@ class Card:
 # ----------------------------------------------------------- fut.gg source --
 FUTGG_YEAR = "27"
 R2 = f"https://r2.fut.gg/{FUTGG_YEAR}/"
-FUTGG_HEADERS = {"Referer": "https://www.fut.gg/",
-                 "User-Agent": "Mozilla/5.0 (personal price alert bot)"}
+FUTGG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://www.fut.gg",
+    "Referer": "https://www.fut.gg/",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "sec-ch-ua": '"Not(A:Brand";v="99", "Google Chrome";v="133", "Chromium";v="133"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
 # Player names/ratings/images. Save this by hand from your browser (Ctrl+S) at
 #   https://www.fut.gg/api/fut/players/v2/27/?response_format=card-image
 # That API is disallowed for bots in fut.gg's robots.txt, so the script reads
@@ -190,12 +201,38 @@ PLAYERS_FILE = os.environ.get("FUTGG_PLAYERS_FILE", os.path.join(HERE, "players.
 HOLO_FILE = os.environ.get("FC_HOLO_FILE", os.path.join(HERE, "holo_ids.json"))
 MIN_TRACK_PRICE = 5_000          # ignore cheaper cards (keeps the DB small)
 _cache: dict = {}
+_session = None
 
 
-def _get_json(url: str):
-    r = requests.get(url, headers=FUTGG_HEADERS, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def _get_session():
+    global _session
+    if _session is None:
+        try:
+            import importlib
+            cffi_requests = importlib.import_module("curl_cffi.requests")
+            _session = cffi_requests.Session(impersonate="chrome")
+        except Exception:
+            _session = requests.Session()
+        _session.headers.update(FUTGG_HEADERS)
+    return _session
+
+
+def _get_json(url: str, retries: int = 3):
+    s = _get_session()
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = s.get(url, timeout=30)
+            if r.status_code == 200:
+                return r.json()
+            r.raise_for_status()
+        except Exception as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError(f"Failed to fetch {url}")
 
 
 def _r2(name: str, manifest: dict):
@@ -833,7 +870,8 @@ def card_flash_stats(db, card: Card, now: float | None = None):
             (card.card_id,)).fetchall()
     if not rows:
         return None
-    return {"prev_price": statistics.median(p for _, p in rows), "prev_ts": rows[0][0]}
+    return {"prev_price": statistics.median(p for _, p in rows), "prev_ts": rows[0][0],
+            "age_min": (now - rows[0][0]) / 60}
 
 
 # ---- purchased list: spike alerts only for cards you hold ------------------------
@@ -1309,7 +1347,7 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
     """5-minute criterion: quick spikes, and quick dips + sharp crashes together, each grouped
     by card version. (Spikes are off unless FC_SPIKE_ALERTS=1.)"""
     embeds = []
-    w = f"{FLASH_WINDOW_MIN:g} min ago"
+    w = "the previous update"        # fut.gg publishes prices about every 5-6 min, so this is the last snapshot
 
     if spike_items:
         lines = [f"⏱ Up ≥{FLASH_SPIKE_PCT:.0f}% vs **{w}**"]
@@ -1333,14 +1371,15 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             lines += ["", _group_header(kind, len(grp))]
             for c, f, pct in grp:
                 lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
-                lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{open_link(c)}"
+                ago = f" ({f['age_min']:.0f} min ago)" if f.get("age_min") else ""
+                lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{ago}{open_link(c)}"
                              + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
                 lines.append(name_block(c))
         lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted · "
                       "🟢 8%+ under (best past results) · 🟡 5–8% under"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
              "color": 0x1ABC9C,
-             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below the price {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
+             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
         img = next((c.image_url for c, _, _ in drops if c.image_url), None)
         if img:
             e["thumbnail"] = {"url": img}

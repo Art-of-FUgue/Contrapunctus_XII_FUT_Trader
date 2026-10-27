@@ -18,7 +18,7 @@ buy-signal and sell alerts to a Discord webhook.
 
 | Piece | What it does |
 |---|---|
-| `.github/workflows/scan.yml` | Launched every 15 min (a backup `cron` plus an outside timer via `workflow_dispatch`). One launch = **13 scans, 60 s apart** (`FC_RUNS`, `FC_RUN_GAP`). A scan is skipped when fut.gg has not published new prices. Never two at once (`concurrency: fc-scan`). |
+| `.github/workflows/scan.yml` | Launched every 15 min (a backup `cron` plus an outside timer via `workflow_dispatch`). One launch = **13 scans, 60 s apart** (`FC_RUNS`, `FC_RUN_GAP`). A scan is skipped when fut.gg has not published new prices (it publishes about every 5–6 min, so most of the 13 scans per launch are skipped; this feed cadence, not the scanner, is the limit on alert speed). The workflow installs `requests` and `curl_cffi`: fut.gg's CDN sometimes answers bots with 403, so requests use browser headers with Chrome impersonation and retry 3 times. Never two at once (`concurrency: fc-scan`). |
 | `fc_market_scanner.py` | The scanner: fetch → judge → post → save. |
 | `sales_model.py` | Infers completed sales from floor moves (section 3). |
 | `data` branch | Holds the SQLite database as one **gzip-compressed** file `market_pc.db.gz`, force-pushed as a single commit after every launch so the repo never grows. Non-`main` branches use `data-<branch>`. The workflow restores it at the start and saves it at the end (even if the scan failed). |
@@ -61,7 +61,7 @@ uncompressed (≈ one third of that compressed); GitHub's 100 MB file limit is n
 
 | Table | Grain | Kept | Notes |
 |---|---|---|---|
-| `prices` | every scan (≈ each minute fut.gg updates), every tracked card | **26 h** (`RAW_HOURS`) | The raw floor ("cheapest BIN") snapshots. Source of the 24 h stats, the 5-minute reference, the card behaviour type and thin-card filter. |
+| `prices` | every scan (one per fut.gg price update, about every 5–6 min), every tracked card | **26 h** (`RAW_HOURS`) | The raw floor ("cheapest BIN") snapshots. Source of the 24 h stats, the fast-drop reference, the card behaviour type and thin-card filter. |
 | `prices_hourly` | median floor per card per hour | **28 days** (Active & Mixed cards) · **current day only** for Quiet cards | Written when raw rows age out. |
 | `prices_daily` | per card per UTC day: open, high, low, median, close, hours present, hour-to-hour changes | **56 days** | Built when hourly rows age out (Quiet cards roll up almost immediately). |
 
@@ -136,8 +136,8 @@ Used for: dip cooldowns, retention (Quiet), the dip ledger, buy-window rhythm, s
 5. **Premium list**: Icons/Heroes (and their holos) worth ≥ **100k**, any other special (promo, TOTW … and holos) worth ≥ **300k**,
    or any card ≥ 100k with ≥ 20 inferred sales in 4 days. Value is judged on the higher of the current price and
    its 24 h median, so a card that dips stays on the list. Premium-list cards get **only** the premium detector
-   (they are left out of the 6 h and 5-minute alerts).
-6. Everything else: **standard** rules (6 h dip, 5-minute drop).
+   (they are left out of the 6 h and fast-drop alerts).
+6. Everything else: **standard** rules (6 h dip, fast drop).
 
 **Market adjustment:** dips are measured *beyond the card's peer group* (Icon, Hero, TOTW, other promo, holo …). The group's
 median move is subtracted, so a market-wide slide does not look like 200 separate dips.
@@ -155,8 +155,8 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 - Each line can carry: **% chance to sell within 3 h**. (The old "similar dips x/y profitable" score line and the seasonal-drift estimate were removed: not useful.)
 - **Cooldown by behaviour type**: Active 5 min · Mixed 10 min · Quiet 15 min (`FC_DIP_COOLDOWN_*`); inside the cooldown it only re-posts if the price fell another 3 %.
 
-### 5.2 ⚡ Fast Drop · vs 5 min ago
-- Reference = median of the last 5 minutes of scans (`FC_FLASH_WINDOW_MIN`). Cards ≥ 10k, not on the premium list.
+### 5.2 ⚡ Fast Drop · vs the previous price update
+- Reference = the price at the previous fut.gg update (median of the snapshots in the last `FC_FLASH_WINDOW_MIN` minutes, default 1, else the newest earlier snapshot). **fut.gg publishes new prices only about every 5–6 minutes** (measured: median spacing 6 min, 90 % under 7 min), so in practice this is "the drop since the last update" and each line shows how many minutes ago that was. Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
 - **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15).
 - **Hint line:** 🟢 8 %+ under sold · 🟡 5–8 % under, with the sold price, size (<40k / 40–100k / 100k+), behaviour type and "holo".
@@ -235,8 +235,8 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_MAX_LINES` | 16 | cards per section |
 | `FC_NEW_CARD_DAYS` | 4 | new-card mute |
 | `FC_DIP_COOLDOWN_ACTIVE/MIXED/QUIET` | 5 / 10 / 15 min | dip cooldown by type |
-| `FC_FLASH_WINDOW_MIN` | 5 | reference window of the fast drop |
-| `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the 5-minute reference |
+| `FC_FLASH_WINDOW_MIN` | 1 | reference window of the fast drop (falls back to the previous snapshot) |
+| `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
 | `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted |
 | `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
 | `FC_PREMIUM_ICON_HERO_MIN` / `FC_PREMIUM_PROMO_MIN` | 100k / 300k | premium list thresholds |
