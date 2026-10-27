@@ -1566,6 +1566,156 @@ def maybe_post_index(db, now: float, dry_run: bool) -> None:
         set_meta(db, "index_post_ts", now)
 
 
+# ---- 12-hour summary: what moved, how the watchlist and the alerts are doing ----------------
+SUMMARY_HOURS = os.environ.get("FC_SUMMARY_HOURS", "7,19")          # Austin hours to post at ("" = never)
+SUMMARY_WINDOW_H = 12
+SUMMARY_MIN_SALES = 30           # inferred sales in 4 days for a card to count as liquid
+SUMMARY_TOP = 5
+
+
+def _med(vals):
+    return statistics.median(vals) if vals else None
+
+
+def summary_data(db, now: float, hours: int = SUMMARY_WINDOW_H) -> dict:
+    """Numbers for the summary: segment moves, top risers/fallers, watchlist, alert scorecard, held cards.
+    Moves compare each card's price now (median of the last 2 hourly values) with `hours` hours ago
+    (median of the 3 hours around that point), so one stray listing cannot set either end."""
+    players = _load_players()
+    holo = _load_holo(players)
+    meta = {str(k): (v["commonName"], v["rarityName"] + (" 🃏 Holo" if k in holo else ""), v["overall"])
+            for k, v in players.items()}
+    px = _hourly_px(db, now - (hours + 30) * 3600)
+    cur = int(now // 3600)
+    sales = dict(db.execute("select card_id, count(*) from sales_inferred where kind='sale' and ts>=? "
+                            "group by card_id", (now - PREMIUM_SALE_WINDOW_H * 3600,)))
+    try:
+        muted = new_card_ids(db, now)
+    except Exception:
+        muted = set()
+    latest = dict(db.execute("select card_id, price from prices where ts=(select max(ts) from prices)"))
+    out = {"moves": [], "seg": {}, "latest": latest, "meta": meta, "hours": hours}
+    for cid, s_ in px.items():
+        if cid not in meta or cid not in latest:
+            continue
+        a = _med([s_[h] for h in (cur - hours - 1, cur - hours, cur - hours + 1) if h in s_])
+        b = _med([s_[h] for h in (cur - 1, cur) if h in s_]) or latest[cid]
+        if not a or not b or a < 15_000 or b < 15_000:
+            continue
+        out["moves"].append((cid, a, b, (b / a - 1) * 100, sales.get(cid, 0) >= SUMMARY_MIN_SALES, cid in muted))
+    liquid = [m for m in out["moves"] if m[4] and not m[5]]
+    segs = {"All specials": liquid}
+    for m in liquid:
+        segs.setdefault(_index_segment(meta[m[0]][1]), []).append(m)
+    out["seg"] = {g: (statistics.median(x[3] for x in v), sum(1 for x in v if x[3] > 0) / len(v), len(v))
+                  for g, v in segs.items() if len(v) >= 5}
+    newm = [m for m in out["moves"] if m[5]]
+    out["new"] = (statistics.median(x[3] for x in newm), len(newm)) if len(newm) >= 5 else None
+    out["liquid"] = liquid
+    return out
+
+
+def _net_now(price_now: float, bought: float) -> float:
+    return (price_now * (1 - EA_TAX) / bought - 1) * 100 - EXIT_HAIRCUT_PCT
+
+
+def build_summary(db, now: float) -> list[dict]:
+    d = summary_data(db, now)
+    if not d["liquid"]:
+        return []
+    meta, latest, hours = d["meta"], d["latest"], d["hours"]
+    move_of = {m[0]: m for m in d["moves"]}
+    lines = [f"⏱ Last **{hours} h** · compared with each card's price {hours} h ago · liquid cards (≥{SUMMARY_MIN_SALES} sales in 4 days)", ""]
+    # -- market by segment
+    rows = [f"{'':13}{'median':>8} {'rising':>7} {'cards':>6}"]
+    for g in ["All specials"] + [x for x in INDEX_SEGMENTS if x != "All specials"]:
+        if g in d["seg"]:
+            med, up, n = d["seg"][g]
+            rows.append(f"{g:13}{('▲' if med > 0 else '▼' if med < 0 else '▬') + f'{abs(med):.1f}%':>8} {up * 100:6.0f}% {n:6d}")
+    lines += ["**Market**", "```", *rows, "```"]
+    if d["new"]:
+        lines.append(f"New cards (muted): median {d['new'][0]:+.1f}% over {d['new'][1]} cards")
+    # -- risers / fallers
+    liq = sorted(d["liquid"], key=lambda m: m[3])
+
+    def fmt(m):
+        nm, kind, ov = meta[m[0]]
+        return f"`{m[3]:+5.0f}%` {k(m[2])} · {nm} · {kind}"
+    lines += ["", "**Rose most**"] + [fmt(m) for m in reversed(liq[-SUMMARY_TOP:])]
+    lines += ["", "**Fell most**"] + [fmt(m) for m in liq[:SUMMARY_TOP]]
+    # -- watchlist
+    try:
+        watch = load_watchlist(WATCHLIST_FILE) | auto_watch_ids(db, now)
+    except Exception:
+        watch = set()
+    wl = []
+    for cid in watch:
+        m = move_of.get(cid)
+        if not m or cid not in meta:
+            continue
+        wl.append((cid, m))
+    if wl:
+        lines += ["", f"**Watchlist** ({len(watch)} cards)"]
+        pos = {r[0]: r for r in db.execute("select card_id, buy_price, target_price, buy_ts from watch_positions")}
+        for cid, m in sorted(wl, key=lambda x: x[1][3]):
+            nm, kind, ov = meta[cid]
+            line = f"`{m[3]:+5.0f}%` {k(m[2])} · {nm} · {kind}"
+            if cid in pos:
+                _, buy, tgt, bts = pos[cid]
+                line += f" · **open buy** {k(buy)} → target {k(tgt)} · {_net_now(latest.get(cid, m[2]), buy):+.1f}% net now"
+            lines.append(line)
+    # -- how the alerts did
+    since = now - hours * 3600
+    sc, first = {}, set()
+    for cid, kind, ts, price in db.execute("select card_id, kind, ts, price from alerts where ts>=? and ts<=? "
+                                           "order by ts", (since, now - 3600)):
+        if cid in latest and price > 0 and kind in ("flashdip", "flashcrash", "prem", "watch", "dip") \
+                and (cid, kind) not in first:             # first alert per card, so re-posts do not count twice
+            first.add((cid, kind))
+            sc.setdefault(kind, []).append(_net_now(latest[cid], price))
+    if sc:
+        names = {"flashdip": "⚡ Fast Drop", "flashcrash": "💥 Fast crash", "prem": "💎 Premium",
+                 "watch": "🎯 Watchlist buy", "dip": "📉 6 h dip"}
+        lines += ["", "**Alerts of the last 12 h, if sold now at the floor** (first alert per card, older than 1 h; net after 5% tax + 1% haircut)"]
+        for kind, v in sc.items():
+            lines.append(f"{names[kind]}: {len(v)} alerts · avg `{statistics.mean(v):+.1f}%` · median `{statistics.median(v):+.1f}%` · "
+                         f"{sum(1 for x in v if x > 0) / len(v) * 100:.0f}% in profit")
+    # -- cards you hold
+    try:
+        held = load_purchased()
+    except Exception:
+        held = {}
+    hl = [(cid, b) for cid, b in held.items() if b and cid in latest and cid in meta]
+    if hl:
+        lines += ["", "**Cards you hold**"]
+        for cid, b in hl:
+            nm, kind, ov = meta[cid]
+            tgt = PURCHASED_TARGETS.get(cid)
+            lines.append(f"{nm} · {kind}: bought {k(b)} · floor {k(latest[cid])} · `{_net_now(latest[cid], b):+.1f}%` net if sold now"
+                         + (f" · target {k(tgt)}" if tgt else ""))
+    text = "\n".join(lines)
+    return [{"title": f"🗞 {hours}-hour summary · {PLATFORM_LABEL}", "description": text[:DISCORD_DESC_MAX], "color": 0x95A5A6,
+             "footer": {"text": "Medians of liquid cards ≥15k, unchained (each card vs its own price 12 h ago) · "
+                                "alert results use today's floor, not what you could actually list at"}}]
+
+
+def maybe_post_summary(db, now: float, dry_run: bool) -> None:
+    """Post the summary at the Austin hours in FC_SUMMARY_HOURS (default 7 and 19), once per slot."""
+    if not SUMMARY_HOURS.strip():
+        return
+    from zoneinfo import ZoneInfo
+    import datetime as _dt
+    loc = _dt.datetime.fromtimestamp(now, ZoneInfo(TIMEZONE))
+    hrs = {int(x) for x in SUMMARY_HOURS.split(",") if x.strip()}
+    last = get_meta(db, "summary_post_ts")
+    if loc.hour not in hrs or (last and now - float(last) < 10 * 3600):
+        return
+    embeds = build_summary(db, now)
+    if embeds:
+        post(embeds, dry_run)
+        set_meta(db, "summary_post_ts", now)
+
+
 # ---- card behaviour types + weekly/daily rhythm -> buy windows ----------------------
 BEHAVIOURS = ["Active", "Mixed", "Quiet"]
 BEH_ACTIVE_MAX_STAY = 0.30           # floor unchanged in <=30% of updates -> Active
@@ -2343,6 +2493,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         try:
             record_index_hours(db, now)                        # permanent hourly index record
             maybe_post_index(db, now, dry_run)                 # market index, every few hours
+            maybe_post_summary(db, now, dry_run)               # 12-hour summary, at 7 and 19 Austin time
             maybe_post_buy_windows(db, now, dry_run)           # buy windows, once a day
         except Exception as e:                                 # never let the index break a scan
             print(f"[warn] market index failed: {e}")
