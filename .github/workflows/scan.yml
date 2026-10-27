@@ -56,8 +56,8 @@ jobs:
         run: python fc_market_scanner.py --once
         env:
           FC_PLATFORM: pc
-          FC_RUNS: "13"                # scans per launch, 1 min apart (~12 min of the 15 min cycle)
-          FC_RUN_GAP: "60"             # seconds between scans (min 30); unchanged feeds are skipped
+          FC_RUNS: "24"                # scans per launch, 30 s apart (~12 min of the 15 min cycle)
+          FC_RUN_GAP: "30"             # seconds between scans (min 30); unchanged feeds are skipped
           FC_NOTIFY_EACH_RUN: "1"      # set to "0" to stop the per-run Discord line
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           FC_MAX_LINES: "16"           # max cards per section (0 = unlimited)

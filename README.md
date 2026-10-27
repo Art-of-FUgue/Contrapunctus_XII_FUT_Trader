@@ -18,7 +18,7 @@ buy-signal and sell alerts to a Discord webhook.
 
 | Piece | What it does |
 |---|---|
-| `.github/workflows/scan.yml` | Launched every 15 min (a backup `cron` plus an outside timer via `workflow_dispatch`). One launch = **13 scans, 60 s apart** (`FC_RUNS`, `FC_RUN_GAP`). A scan is skipped when fut.gg has not published new prices (it publishes about every 5–6 min, so most of the 13 scans per launch are skipped; this feed cadence, not the scanner, is the limit on alert speed). The workflow installs `requests` and `curl_cffi`: fut.gg's CDN sometimes answers bots with 403, so requests use browser headers with Chrome impersonation and retry 3 times. Never two at once (`concurrency: fc-scan`). |
+| `.github/workflows/scan.yml` | Launched every 15 min (a backup `cron` plus an outside timer via `workflow_dispatch`). One launch = **24 checks, 30 s apart** (`FC_RUNS`, `FC_RUN_GAP`). A scan is skipped when fut.gg has not published new prices (it publishes about every 5–6 min, so most of the 24 checks per launch are skipped; this feed cadence, not the scanner, is the limit on alert speed). The workflow installs `requests` and `curl_cffi`: fut.gg's CDN sometimes answers bots with 403, so requests use browser headers with Chrome impersonation and retry 3 times. Never two at once (`concurrency: fc-scan`). |
 | `fc_market_scanner.py` | The scanner: fetch → judge → post → save. |
 | `sales_model.py` | Infers completed sales from floor moves (section 3). |
 | `data` branch | Holds the SQLite database as one **gzip-compressed** file `market_pc.db.gz`, force-pushed as a single commit after every launch so the repo never grows. Non-`main` branches use `data-<branch>`. The workflow restores it at the start and saves it at the end (even if the scan failed). |
@@ -230,7 +230,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | — | where alerts go (repo secret) |
 | `FC_PLATFORM` | `pc` | `pc` or `ps` |
-| `FC_RUNS` / `FC_RUN_GAP` | 13 / 60 s | scans per launch / spacing |
+| `FC_RUNS` / `FC_RUN_GAP` | 24 / 30 s | scans per launch / spacing |
 | `FC_MIN_PRICE` / `FC_MAX_PRICE` | 15k / 2M (workflow) | alert price range |
 | `FC_MAX_LINES` | 16 | cards per section |
 | `FC_NEW_CARD_DAYS` | 4 | new-card mute |
