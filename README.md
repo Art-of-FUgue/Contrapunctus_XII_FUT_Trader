@@ -199,10 +199,18 @@ For cards in `purchased.json` with a buy price:
 - **Spiked**: floor ≥ **15 %** above your buy price (`FC_OWNED_SPIKE_PCT`).
 - Entries that cannot be resolved to a single card are reported once in a "⚠️ purchased.json: fix these entries" embed.
 
-### 5.7 📊 Market Index · 24 h trend (every 3 h)
+### 5.7 🗞 12-hour summary (7am and 7pm Austin)
+Posted automatically twice a day (`FC_SUMMARY_HOURS`, default `7,19`; empty = off). Everything compares each card with **its own price 12 h ago** (unchained, so no index drift) over *liquid* cards (≥ 30 inferred sales in 4 days, ≥ 15k, not muted-new):
+- **Market**: median move, share of cards rising and card count per segment (All specials, Icons, Heroes, TOTW, Other promos, Holos), plus the median of the muted new cards.
+- **Rose most / Fell most**: top 5 each.
+- **Watchlist**: every watched card's 12 h move; open buys show buy price, target and the net if sold now.
+- **Alert scorecard**: for each alert type in the last 12 h (first alert per card, older than 1 h), the net after tax + haircut if sold now at today's floor: average, median and share in profit. This is a hindsight check on the rules, not what you could actually list at.
+- **Cards you hold** (`purchased.json`): floor now and net if sold now.
+
+### 5.8 📊 Market Index · 24 h trend (every 3 h)
 Equal-weighted, chain-linked price basket (cards ≥ 10k, ≥ 5 cards per step) per segment, shown over 1 h / 6 h / 12 h / 24 h with a sparkline and the mood of the last 6 h.
 
-### 5.8 Off or limited
+### 5.9 Off or limited
 - 🚀 Rise Alert and ⚡ Quick Spike exist but are **off** (`FC_SPIKE_ALERTS=1` enables them; regular-card spike alerts are off by design).
 - Buy alerts (fast drop, premium, watchlist buy) show a one-line `[open]` link to the fut.gg card and the player name in a code block below the card: Discord puts a copy button on it (press and hold on mobile) so the name can be pasted into the Web App Transfer Market search, which has no search link.
 - 🕒 Buy Windows report: code is on `main` but **never posts there** (`FC_WINDOWS_POST_HOURS=0`); the data behind it (`index_ret`) is always collected.
@@ -245,6 +253,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_AUTO_MIN_EVENTS` / `FC_AUTO_MAX` | 3 / 20 | auto-watch qualification / size |
 | `FC_WATCH_REASSESS_HOURS` / `FC_WATCH_EXPIRE_HOURS` | 36 / 72 | watch position timing |
 | `FC_OWNED_SPIKE_PCT` | 15 | owned-card spike threshold |
+| `FC_SUMMARY_HOURS` | `7,19` | Austin hours for the 12-hour summary |
 | `FC_INDEX_POST_HOURS` | 3 | market index cadence (0 = off) |
 | `FC_WINDOWS_POST_HOURS` | 0 | buy-window report cadence (0 = off) |
 | `FC_SPIKE_ALERTS` | 0 | enable spike alerts |
