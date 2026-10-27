@@ -204,6 +204,7 @@ Equal-weighted, chain-linked price basket (cards ≥ 10k, ≥ 5 cards per step) 
 
 ### 5.8 Off or limited
 - 🚀 Rise Alert and ⚡ Quick Spike exist but are **off** (`FC_SPIKE_ALERTS=1` enables them; regular-card spike alerts are off by design).
+- Every alert line ends with `[open]` (fut.gg card), `[🛒]` (opens the EA Web App; it has no search deep link) and the player name in code for copying into the Transfer Market search.
 - 🕒 Buy Windows report: code is on `main` but **never posts there** (`FC_WINDOWS_POST_HOURS=0`); the data behind it (`index_ret`) is always collected.
 - Per-scan "🔄 scan ran" status line in Discord (`FC_NOTIFY_EACH_RUN`).
 
