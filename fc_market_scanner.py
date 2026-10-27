@@ -4,7 +4,7 @@ EA FC market scanner: finds price dips on special cards and posts them to a Disc
 Alert types (one post per criterion; inside it cards are grouped by version: Icon, Hero, TOTW,
 holo ...; each title names the period it compares against):
     📉 Dip Alert         · vs 6 h ago        OFF by default (FC_DIP6H_ALERTS=1): regular cards, down >=8% vs 6 h ago
-    ⚡ Fast Drop          · vs 5 min ago      down 10%+ against the last 5 minutes, with a tier hint
+    ⚡ Fast Drop          · vs prev. update   down 10%+ against the previous price update (~5-6 min), with a tier hint
     💎 Premium Dip        · vs 4-day sold     Icons/Heroes/pricey promo cards vs real sale prices
                                               (thin cards: vs 24 h median)
     💰 Your Card Spiked   · vs your buy price held cards (purchased.json) up 15%+
@@ -865,7 +865,8 @@ def card_flash_stats(db, card: Card, now: float | None = None):
             (card.card_id,)).fetchall()
     if not rows:
         return None
-    return {"prev_price": statistics.median(p for _, p in rows), "prev_ts": rows[0][0]}
+    return {"prev_price": statistics.median(p for _, p in rows), "prev_ts": rows[0][0],
+            "age_min": (now - rows[0][0]) / 60}
 
 
 # ---- purchased list: spike alerts only for cards you hold ------------------------
@@ -1341,7 +1342,7 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
     """5-minute criterion: quick spikes, and quick dips + sharp crashes together, each grouped
     by card version. (Spikes are off unless FC_SPIKE_ALERTS=1.)"""
     embeds = []
-    w = f"{FLASH_WINDOW_MIN:g} min ago"
+    w = "the previous update"        # fut.gg publishes prices about every 5-6 min, so this is the last snapshot
 
     if spike_items:
         lines = [f"⏱ Up ≥{FLASH_SPIKE_PCT:.0f}% vs **{w}**"]
@@ -1365,14 +1366,15 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             lines += ["", _group_header(kind, len(grp))]
             for c, f, pct in grp:
                 lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
-                lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{open_link(c)}"
+                ago = f" ({f['age_min']:.0f} min ago)" if f.get("age_min") else ""
+                lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{ago}{open_link(c)}"
                              + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
                 lines.append(name_block(c))
         lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted · "
                       "🟢 8%+ under (best past results) · 🟡 5–8% under"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
              "color": 0x1ABC9C,
-             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below the price {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
+             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
         img = next((c.image_url for c, _, _ in drops if c.image_url), None)
         if img:
             e["thumbnail"] = {"url": img}
