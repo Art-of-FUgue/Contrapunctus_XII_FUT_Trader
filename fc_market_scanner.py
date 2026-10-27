@@ -1217,8 +1217,15 @@ def link(c: Card) -> str:
     return f"[{c.name}]({c.url})" if c.url else f"**{c.name}**"
 
 
+WEBAPP_URL = "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/"
+
+
 def open_link(c: Card) -> str:
-    return f" · [open]({c.url})" if c.url else ""
+    """Links after an alert line: the fut.gg card page, the EA Web App (it has no search deep link),
+    and the player name in code so it can be copied into the Transfer Market search."""
+    if not c.url:
+        return ""
+    return f" · [open]({c.url}) · [🛒]({WEBAPP_URL}) · `{c.name}`"
 
 
 def _version_order(kind: str):
