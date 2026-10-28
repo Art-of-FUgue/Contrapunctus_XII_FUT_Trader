@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         FUT card list refresh
 // @namespace    contrapunctus-xii
-// @version      1.2
-// @description  fut.gg helper: (1) Refresh cards: saves the card list + holo lookup into bundle.json; (2) Bought: collect cards you bought (price + optional sell target) and export purchased.json.
+// @version      1.3
+// @description  fut.gg helper: (1) Refresh cards: saves the card list + holo lookup into bundle.json; (2) Bought: collect cards you bought (price + optional sell target) and export purchased.json; (3) live bid badge on player pages (max bid for +3/+5/+8% net, from the scanner's sold prices).
 // @match        https://www.fut.gg/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_setClipboard
 // @connect      r2.fut.gg
+// @connect      raw.githubusercontent.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -258,4 +259,48 @@
   }
 
   btn.addEventListener("click", refresh);
+
+  // ---- live bid badge ------------------------------------------------------------
+  // Reads bid_sheet.json (published by the scanner on the data branch) every time a player page
+  // opens, so the numbers are as fresh as the last scan. Nothing to update by hand.
+  const BID_URL = "https://raw.githubusercontent.com/Art-of-FUgue/Contrapunctus_XII_FUT_Trader/data/bid_sheet.json";
+  let sheet = null, sheetAt = 0, badgeEl = null, lastPath = "";
+
+  async function loadSheet() {
+    if (sheet && Date.now() - sheetAt < 60_000) return sheet;
+    try {
+      const r = await gm("GET", BID_URL + "?t=" + Math.floor(Date.now() / 60_000));
+      if (r.status === 200) { sheet = JSON.parse(r.text); sheetAt = Date.now(); }
+    } catch (e) { console.log("[bid badge]", e.message); }
+    return sheet;
+  }
+
+  const fmtK = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1).replace(/\.0$/, "") + "K" : String(n));
+
+  async function updateBadge() {
+    const m = location.pathname.match(/\/players\/(\d+)/);
+    if (!m) { if (badgeEl) badgeEl.style.display = "none"; return; }
+    if (!badgeEl) {
+      badgeEl = document.createElement("div");
+      badgeEl.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:99999;background:#10151c;color:#e8eef5;" +
+        "border:1px solid #3b82f6;border-radius:8px;padding:8px 10px;font:12px/1.4 system-ui,sans-serif;max-width:260px;" +
+        "box-shadow:0 2px 10px rgba(0,0,0,.5)";
+      document.body.append(badgeEl);
+    }
+    badgeEl.style.display = "block";
+    badgeEl.textContent = "bid sheet…";
+    const d = await loadSheet();
+    if (!d) { badgeEl.textContent = "bid sheet: unreachable"; return; }
+    const c = d.cards[m[1]];
+    const age = Math.round((Date.now() / 1000 - d.ts) / 60);
+    if (!c) { badgeEl.textContent = `No reliable sold price yet (needs 4+ sales in 4 days) · sheet ${age} min old`; return; }
+    const under = ((c.floor / c.fair - 1) * 100).toFixed(1);
+    const bids = d.nets.map((n, i) => `+${n}% ≤ <b>${fmtK(c.bid[i])}</b>`).join("<br>");
+    badgeEl.innerHTML = `<b>Sold median ${fmtK(c.fair)}</b> (${c.n} sales, ${c.n24} in 24h, ±${c.sig}%)<br>` +
+      `Floor ${fmtK(c.floor)} (${under > 0 ? "+" : ""}${under}% vs sold)<br>Max bid for net profit:<br>${bids}` +
+      `<br><span style="opacity:.6">sheet ${age} min old${c.n24 < 4 ? " · thin, be careful" : ""}</span>`;
+  }
+
+  setInterval(() => { if (location.pathname !== lastPath) { lastPath = location.pathname; updateBadge(); } }, 800);
+  setInterval(() => { if (badgeEl && badgeEl.style.display !== "none") updateBadge(); }, 120_000);
 })();

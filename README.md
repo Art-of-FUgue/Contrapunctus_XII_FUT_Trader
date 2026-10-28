@@ -158,7 +158,7 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 ### 5.2 ⚡ Fast Drop · vs the previous price update
 - Reference = the price at the previous fut.gg update (median of the snapshots in the last `FC_FLASH_WINDOW_MIN` minutes, default 1, else the newest earlier snapshot). **fut.gg publishes new prices only about every 5–6 minutes** (measured: median spacing 6 min, 90 % under 7 min), so in practice this is "the drop since the last update" and each line shows how many minutes ago that was. Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
-- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15).
+- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) skips this filter, because it can be flipped right away; its hint line shows ⚪ and how far the floor sits from the sold median.
 - **Hint line:** 🟢 8 %+ under sold · 🟡 5–8 % under, with the sold price, size (<40k / 40–100k / 100k+), behaviour type and "holo".
 - Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
 
@@ -228,7 +228,9 @@ The manual `watchlist.json` is empty; the list is built automatically.
   Up to 20 best cards (ranked by mean × win rate × number of paying holds) are watched; a card stays watched for 3 days after it last qualified.
 - Marks: ⭐ on your list / seed, 🔁 auto-picked.
 
-## 7. Userscript (`userscript/fut_card_refresh.user.js`, v1.2)
+## 7. Userscript (`userscript/fut_card_refresh.user.js`, v1.3)
+
+**Bid badge (v1.3, live):** every scan writes `bid_sheet.json` (per card with ≥ 4 sales in 96 h: sold median, floor, sales/24 h, noise, max bid for +3/+5/+8 % net after 5 % tax and 1 % exit haircut). The workflow publishes it on the `data` branch next to the database. On any `fut.gg/players/<id>` page the script fetches it from raw.githubusercontent.com (public repo, no token) and shows a corner badge. Numbers refresh by themselves; only the script install is manual.
 - **Refresh cards**: reads fut.gg's price index and downloads `bundle.json` (new cards + holo lookup). Commit it and `refresh-cards.yml` does the rest.
 - **➕ Bought** (on a card page): asks for your buy price and an optional sell target, stores them in Tampermonkey. **📋 Purchased** shows the list, exports `purchased.json` (copy/download), imports an existing file. It never holds a GitHub token; you commit the file yourself.
 
@@ -245,7 +247,9 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_DIP_COOLDOWN_ACTIVE/MIXED/QUIET` | 5 / 10 / 15 min | dip cooldown by type |
 | `FC_FLASH_WINDOW_MIN` | 1 | reference window of the fast drop (falls back to the previous snapshot) |
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
-| `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted |
+| `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted (liquid cards excepted) |
+| `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid and exempt from the sold-median filter |
+| `FC_BID_SHEET` | bid_sheet.json | output file of the bid sheet |
 | `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
 | `FC_PREMIUM_ICON_HERO_MIN` / `FC_PREMIUM_PROMO_MIN` | 100k / 300k | premium list thresholds |
 | `FC_PREMIUM_LIQUID_MIN_SALES` | 20 | sales in 4 days to count a 100k+ card as premium |
@@ -277,4 +281,4 @@ Merges `main` regularly and adds, for research:
 - Its own database branch (`data-buy-windows`).
 
 ---
-*Last updated: 2026-10-26 — removed the 'similar dips' score line and seasonal drift, fast drop minimum 10 % with tier hint, 6 h dip alert off by default; covers watchlist buy/sell with estimated sell time and 36 h reassess note, purchased-list sell alerts with optional targets, userscript v1.2, 8-week storage tiers, thin-card filter, dynamic watchlist.*
+*Last updated: 2026-10-27 — bid sheet + userscript 1.3 badge, liquid cards exempt from the fast-drop sold-median filter. Earlier: 2026-10-26 — removed the 'similar dips' score line and seasonal drift, fast drop minimum 10 % with tier hint, 6 h dip alert off by default; covers watchlist buy/sell with estimated sell time and 36 h reassess note, purchased-list sell alerts with optional targets, userscript v1.2, 8-week storage tiers, thin-card filter, dynamic watchlist.*

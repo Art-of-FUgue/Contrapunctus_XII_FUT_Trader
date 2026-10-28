@@ -150,6 +150,7 @@ def _limit(items: list) -> list:
 FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as micro-spike
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
 FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
+FAST_LIQUID_N24 = int(os.environ.get("FC_FAST_LIQUID_N24", "10"))           # liquid card: this many sales/24 h skips the sold-median filter
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
@@ -1338,8 +1339,9 @@ def drop_tier(c: Card, beh: str | None, under: float, fair: float) -> str:
     """Hint line for a fast drop: how far the new floor sits under the 4-day sold median (🟢 8%+, 🟡 5-8%;
     past 5 s+ drops paid +27% net at 8%+ and about break-even under 5%), plus size, behaviour type, holo."""
     size = "<40k" if c.price < 40_000 else "40–100k" if c.price < 100_000 else "100k+"
-    mark = "🟢" if under >= 8 else "🟡"
-    return (f"{mark} **{under:.0f}% under** 4-day sold {k(fair)} · {size} · {beh or 'type unknown'}"
+    mark = "🟢" if under >= 8 else "🟡" if under >= FAST_MIN_UNDER_SOLD else "⚪"
+    rel = f"{under:.0f}% under" if under >= 0 else f"{-under:.0f}% over"
+    return (f"{mark} **{rel}** 4-day sold {k(fair)}{' · liquid, flip fast' if mark == '⚪' else ''} · {size} · {beh or 'type unknown'}"
             + (" · holo" if "Holo" in c.kind else ""))
 
 
@@ -1375,8 +1377,8 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
                 lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{ago}{open_link(c)}"
                              + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
                 lines.append(name_block(c))
-        lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted · "
-                      "🟢 8%+ under (best past results) · 🟡 5–8% under"]
+        lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted (liquid cards excepted) · "
+                      "🟢 8%+ under (best past results) · 🟡 5–8% under · ⚪ liquid card (≥" + str(FAST_LIQUID_N24) + " sales/24 h), no sold filter"]
         e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
              "color": 0x1ABC9C,
              "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
@@ -1702,6 +1704,38 @@ def build_summary(db, now: float) -> list[dict]:
     return [{"title": f"🗞 {hours}-hour summary · {PLATFORM_LABEL}", "description": text[:DISCORD_DESC_MAX], "color": 0x95A5A6,
              "footer": {"text": "Medians of liquid cards ≥15k, unchained (each card vs its own price 12 h ago) · "
                                 "alert results use today's floor, not what you could actually list at"}}]
+
+
+# ---- bid sheet: sold-price reference per card, published for the userscript ------------
+BID_SHEET_FILE = os.environ.get("FC_BID_SHEET", "bid_sheet.json")
+BID_NETS = (3, 5, 8)             # target net profit % after tax + exit haircut
+BID_MIN_SALES = 4                # fewer sales in 96 h: no reliable reference
+
+
+def max_bid(sell: float, net_pct: float) -> int:
+    """Highest buy price that still nets `net_pct` % when sold at `sell` (5% tax + exit haircut)."""
+    return int(sell * (1 - EA_TAX) / (1 + (net_pct + EXIT_HAIRCUT_PCT) / 100))
+
+
+def write_bid_sheet(db, cards, now: float) -> int:
+    """bid_sheet.json: per card sold median, floor, sales rate and max bids. The workflow publishes it."""
+    out = {}
+    for c in cards:
+        st = sm.sale_stats(db, c.card_id, now, 96, 24)
+        if not st or st["n"] < BID_MIN_SALES:
+            continue
+        fair = int(st["fair"])
+        out[c.card_id] = {"n": st["n"], "n24": st["n24"], "fair": fair, "floor": c.price,
+                          "sig": round(st["sigma_pct"], 1),
+                          "bid": [max_bid(fair, x) for x in BID_NETS]}
+    if not out:
+        return 0
+    import json as _j
+    tmp = BID_SHEET_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        _j.dump({"ts": int(now), "nets": list(BID_NETS), "cards": out}, f, separators=(",", ":"))
+    os.replace(tmp, BID_SHEET_FILE)
+    return len(out)
 
 
 def maybe_post_summary(db, now: float, dry_run: bool) -> None:
@@ -2458,9 +2492,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     flash_spikes.append((c, f, pct))
                 elif rel <= -FLASH_DIP_PCT:
                     sold = sm.sale_stats(db, c.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
-                    if sold and sold["n"] >= FAST_MIN_SALES and sold["fair"] > 0:
+                    liquid = bool(sold) and sold["n24"] >= FAST_LIQUID_N24 and sold["fair"] > 0
+                    if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
-                        if under >= FAST_MIN_UNDER_SOLD:        # drops that stay near/above sold lost money
+                        if liquid or under >= FAST_MIN_UNDER_SOLD:      # drops that stay near/above sold lost money
                             flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
@@ -2622,6 +2657,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
             set_meta(db, "purchased_warn", sig)
         post(embeds, dry_run)
         save_snapshot(db, cards, now)
+        try:
+            write_bid_sheet(db, cards, now)
+        except Exception as e:
+            print(f"[warn] bid sheet failed: {e}")
         try:
             record_index_hours(db, now)                        # permanent hourly index record
             maybe_post_index(db, now, dry_run)                 # market index, every few hours
