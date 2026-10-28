@@ -150,8 +150,18 @@ FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as m
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
 FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
 FAST_LIQUID_N24 = int(os.environ.get("FC_FAST_LIQUID_N24", "10"))           # liquid card: this many sales/24 h skips the sold-median filter
-FAST_VOLUME_N24 = int(os.environ.get("FC_FAST_VOLUME_N24", "40"))           # high-volume card: sales/24 h for the lower drop threshold
-FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a high-volume card
+VOLUME_FILE = os.environ.get("FC_VOLUME_LIST", "volume_list.json")          # {card_id: name}: high-volume cards you trade often
+FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a volume-list card
+
+
+def load_volume_list() -> set[str]:
+    try:
+        with open(VOLUME_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(x) for x in (d.keys() if isinstance(d, dict) else d)}
+    except (OSError, ValueError):
+        return set()
+
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
@@ -2297,6 +2307,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         beh_types = _behaviour_cached(db, now)
     except Exception:
         beh_types = {}
+    vol_list = load_volume_list()
     for c in cards:
         if c.card_id in thin:
             continue                              # erratic floor / almost no sales: no drop alerts
@@ -2351,7 +2362,8 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     spikes.append((c, s, pct))
 
         # ── micro-spike / dip / crash (last two snapshots) ───────────────────
-        if c.price >= FLASH_MIN_PRICE and not in_premium:
+        in_vol = c.card_id in vol_list
+        if c.price >= FLASH_MIN_PRICE and (not in_premium or in_vol):
             f = card_flash_stats(db, c)
             if f and f["prev_price"] > 0:
                 pct = (c.price - f["prev_price"]) / f["prev_price"] * 100
@@ -2360,15 +2372,13 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 f = dict(f, mkt=mf, raw=pct)
                 if pct >= FLASH_SPIKE_PCT:
                     flash_spikes.append((c, f, pct))
-                elif rel <= -min(FLASH_DIP_PCT, FAST_VOLUME_DIP_PCT):
+                elif rel <= -(FAST_VOLUME_DIP_PCT if in_vol else FLASH_DIP_PCT):
                     sold = sm.sale_stats(db, c.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
-                    if rel > -FLASH_DIP_PCT and not (sold and sold["n24"] >= FAST_VOLUME_N24):
-                        continue                    # a drop between the two thresholds only counts on high-volume cards
-                    liquid = bool(sold) and sold["n24"] >= FAST_LIQUID_N24 and sold["fair"] > 0
+                    liquid = bool(sold) and (in_vol or sold["n24"] >= FAST_LIQUID_N24) and sold["fair"] > 0
                     if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
                         if liquid or under >= FAST_MIN_UNDER_SOLD:      # drops that stay near/above sold lost money
-                            flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
+                            flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"]) + (" · 📦 volume list" if in_vol else "")), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
