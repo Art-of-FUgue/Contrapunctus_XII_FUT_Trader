@@ -134,18 +134,21 @@ Used for: dip cooldowns, retention (Quiet), the dip ledger, buy-window rhythm, s
 3. **TOTW fodder**: TOTW cards under 15k are skipped.
 4. **Watched or held** cards skip the price-range / new-card filters and the normal lists; they use the
    watchlist rules (section 5.4–5.5).
-5. **Premium list**: Icons/Heroes (and their holos) worth ≥ **100k**, any other special (promo, TOTW … and holos) worth ≥ **300k**,
+5. **Three lists decide which dip alert a card can get** (a card belongs to the first that applies):
+   **📦 Volume list** (8 % Volume Drop, section 5.2b) · **💎 Premium list** (premium detector, section 5.3) · **⚡ general** (everything else: 10 % Fast Drop, section 5.2).
+   A volume-list card is *also* scanned for premium alerts if it is on the premium list (a Hero at 100k can get both).
+6. **Premium list**: Icons/Heroes (and their holos) worth ≥ **100k**, any other special (promo, TOTW … and holos) worth ≥ **300k**,
    or any card ≥ 100k with ≥ 20 inferred sales in 4 days. Value is judged on the higher of the current price and
    its 24 h median, so a card that dips stays on the list. Premium-list cards get **only** the premium detector
    (they are left out of the 6 h and fast-drop alerts).
-6. Everything else: **standard** rules (6 h dip, fast drop).
+7. Everything else: **standard** rules (6 h dip, fast drop).
 
 **Market adjustment:** dips are measured *beyond the card's peer group* (Icon, Hero, TOTW, other promo, holo …). The group's
 median move is subtracted, so a market-wide slide does not look like 200 separate dips.
 
 ## 5. Alerts and their logic
 
-`EA_TAX = 5 %`. "Net" always means profit after the 5 % tax. Alert order in Discord: dips, fast drops, premium
+`EA_TAX = 5 %`. "Net" always means profit after the 5 % tax. Alert order in Discord: dips, fast drops, volume drops, premium
 dips, watchlist buy, watchlist sell, owned-card alerts, then the red premium alert **last** (so it sits at the bottom, where you look first).
 
 ### 5.1 📉 Dip Alert · vs 6 h ago (regular cards) — **OFF by default** (`FC_DIP6H_ALERTS=1` turns it back on)
@@ -159,9 +162,16 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 ### 5.2 ⚡ Fast Drop · vs the previous price update
 - Reference = the price at the previous fut.gg update (median of the snapshots in the last `FC_FLASH_WINDOW_MIN` minutes, default 1, else the newest earlier snapshot). **fut.gg publishes new prices only about every 5–6 minutes** (measured: median spacing 6 min, 90 % under 7 min), so in practice this is "the drop since the last update" and each line shows how many minutes ago that was. Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
-- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) skips this filter, because it can be flipped right away. **Volume list** = pinned cards in `volume_list.json` (`{card_id: name}`) **plus an automatic part rebuilt hourly**. A card qualifies automatically when its floor is 12k–160k, it has ≥ 60 inferred sales in 24 h and ≥ 40 in 96 h, and its sale-price noise (σ) is ≤ 10 %; it stays on the list 48 h after it last qualified. Cards on it need only an 8 % drop instead of 10 %, skip the sold-median filter, are scanned even if on the premium list (so a Hero can get both a premium and a fast-drop alert), and are tagged 📦. Backtest of the automatic filter (26 h, ~80 cards): 8 %+ drops netted a median +3.2 % at 3 h, 69 % winners, about 16 raw drops per hour before cooldowns. Evidence for 8 %: on cards with ≥ 40 sales/24 h, past 7–10 % drops on these cards: ≈ +0.1 % net at 3 h, 52 % winners; 5–7 %: −1.6 %, 38 %; ≥ 10 %: +5.1 %, 73 %. The hint line of a liquid card shows ⚪ and how far the floor sits from the sold median.
+- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) skips this filter, because it can be flipped right away. The hint line of such a card shows ⚪ and how far the floor sits from the sold median.
 - **Hint line:** 🟢 8 %+ under sold · 🟡 5–8 % under, with the sold price, size (<40k / 40–100k / 100k+), behaviour type and "holo".
 - Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
+
+### 5.2b 📦 Volume Drop · vs the previous price update (volume list)
+Its own blue embed, separate from ⚡ Fast Drop. Same reference (previous fut.gg update), same market adjustment, same cooldowns and thin-card filter, but:
+- Fires at **≥ 8 %** (`FC_FAST_VOLUME_DIP_PCT`) instead of 10 %; **no sold-median filter** (these cards flip right away; the card still needs some recorded sales for the hint line).
+- **The list** = pinned cards in `volume_list.json` (`{card_id: name}`) **plus an automatic part rebuilt hourly**: floor 12k–160k, ≥ 60 inferred sales in 24 h (`FC_VOLUME_MIN_N24`) and ≥ 40 in 96 h (`FC_VOLUME_MIN_N96`), sale-price noise σ ≤ 10 % (`FC_VOLUME_MAX_SIGMA`), floor ≤ `FC_VOLUME_MAX_PRICE`; a card stays on 48 h after it last qualified.
+- Scanned even if the card is on the premium list.
+- Evidence: cards with ≥ 40 sales/24 h, drops 5–7 %: median −1.6 % net at 3 h (38 % winners) · 7–10 %: +0.1 % (52 %) · ≥ 10 %: +5.1 % (73 %). Backtest of the automatic filter (~80 cards, 26 h): 8 %+ drops +3.2 % median, 69 % winners, about 16 raw drops per hour before cooldowns. Small margin, so the value is speed and volume.
 
 ### 5.3 💎 Premium Dip and 🚨 Premium below 4-day sold
 Premium-list cards are judged on real (inferred) sales:

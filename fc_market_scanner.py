@@ -1407,9 +1407,9 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             e["thumbnail"] = {"url": spike_items[0][0].image_url}
         embeds.append(e)
 
-    drops = list(dip_items)
-    if drops:
-        lines = [f"⏱ Down ≥{FLASH_DIP_PCT:.0f}% vs **{w}**"]
+    def drop_embed(drops, vol: bool) -> dict:
+        pct_need = FAST_VOLUME_DIP_PCT if vol else FLASH_DIP_PCT
+        lines = [f"⏱ Down ≥{pct_need:.0f}% vs **{w}**"]
         for kind, grp in by_version(drops):
             grp = _limit(sorted(grp, key=lambda i: i[2]))             # deepest first
             lines += ["", _group_header(kind, len(grp))]
@@ -1419,15 +1419,29 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
                 lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{ago}{open_link(c)}"
                              + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
                 lines.append(name_block(c))
-        lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted (liquid cards excepted) · "
-                      "🟢 8%+ under (best past results) · 🟡 5–8% under · ⚪ liquid card (≥" + str(FAST_LIQUID_N24) + " sales/24 h), no sold filter"]
-        e = {"title": f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", "description": "\n".join(lines),
-             "color": 0x1ABC9C,
-             "footer": {"text": f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"}}
+        if vol:
+            lines += ["", "Volume list: high-turnover cards (pinned + automatic), no sold-median filter · "
+                          "small margin, quick flip"]
+            title, color, foot = f"📦 Volume Drop · vs {w} · {PLATFORM_LABEL}", 0x3498DB, \
+                f"Volume Drop · {FAST_VOLUME_DIP_PCT:.0f}%+ below {w}"
+        else:
+            lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted (cards with ≥{FAST_LIQUID_N24} sales/24 h excepted) · "
+                          "🟢 8%+ under (best past results) · 🟡 5–8% under · ⚪ no sold filter"]
+            title, color, foot = f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", 0x1ABC9C, \
+                f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"
+        e = {"title": title, "description": "\n".join(lines), "color": color, "footer": {"text": foot}}
         img = next((c.image_url for c, _, _ in drops if c.image_url), None)
         if img:
             e["thumbnail"] = {"url": img}
-        embeds.append(e)
+        return e
+
+    drops = list(dip_items)
+    general = [d for d in drops if not d[1].get("vol")]
+    volume = [d for d in drops if d[1].get("vol")]
+    if general:
+        embeds.append(drop_embed(general, False))
+    if volume:
+        embeds.append(drop_embed(volume, True))
     return embeds
 
 def build_premium_dips(items, hot: bool = False) -> list[dict]:
@@ -2544,7 +2558,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
                         if liquid or under >= FAST_MIN_UNDER_SOLD:      # drops that stay near/above sold lost money
-                            flash_dips.append((c, dict(f, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"]) + (" · 📦 volume list" if in_vol else "")), rel))
+                            flash_dips.append((c, dict(f, vol=in_vol, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
