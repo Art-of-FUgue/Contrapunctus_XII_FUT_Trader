@@ -150,11 +150,10 @@ FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as m
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
 FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
 FAST_LIQUID_N24 = int(os.environ.get("FC_FAST_LIQUID_N24", "10"))           # liquid card: this many sales/24 h skips the sold-median filter
-VOLUME_FILE = os.environ.get("FC_VOLUME_LIST", "volume_list.json")          # {card_id: name}: high-volume cards you trade often
 FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a volume-list card
 
 
-# Dynamic part of the volume list: a card qualifies when ALL hold (re-checked hourly)
+# The volume list is fully dynamic: a card qualifies when ALL hold (re-checked hourly)
 VOL_MIN_N24 = int(os.environ.get("FC_VOLUME_MIN_N24", "60"))        # inferred sales in the last 24 h
 VOL_MIN_N96 = int(os.environ.get("FC_VOLUME_MIN_N96", "40"))        # ... and in 96 h (not a one-day burst)
 VOL_MIN_PRICE = 12_000                                              # floor price range worth trading
@@ -183,14 +182,8 @@ def refresh_volume_cards(db, cards, now: float) -> None:
 
 
 def load_volume_list() -> set[str]:
-    """Pinned cards from volume_list.json plus the automatic ones."""
-    try:
-        with open(VOLUME_FILE, encoding="utf-8") as f:
-            d = json.load(f)
-        pinned = {str(x) for x in (d.keys() if isinstance(d, dict) else d)}
-    except (OSError, ValueError):
-        pinned = set()
-    return pinned | _VOL_AUTO
+    """The volume list is fully automatic: whatever refresh_volume_cards last selected."""
+    return set(_VOL_AUTO)
 
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
@@ -1415,7 +1408,7 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
                              + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
                 lines.append(name_block(c))
         if vol:
-            lines += ["", "Volume list: high-turnover cards (pinned + automatic), no sold-median filter · "
+            lines += ["", "Volume list: high-turnover cards (automatic), no sold-median filter · "
                           "small margin, quick flip"]
             title, color, foot = f"📦 Volume Drop · vs {w} · {PLATFORM_LABEL}", 0x3498DB, \
                 f"Volume Drop · {FAST_VOLUME_DIP_PCT:.0f}%+ below {w}"
