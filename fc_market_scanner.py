@@ -154,13 +154,43 @@ VOLUME_FILE = os.environ.get("FC_VOLUME_LIST", "volume_list.json")          # {c
 FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a volume-list card
 
 
+# Dynamic part of the volume list: a card qualifies when ALL hold (re-checked hourly)
+VOL_MIN_N24 = int(os.environ.get("FC_VOLUME_MIN_N24", "60"))        # inferred sales in the last 24 h
+VOL_MIN_N96 = int(os.environ.get("FC_VOLUME_MIN_N96", "40"))        # ... and in 96 h (not a one-day burst)
+VOL_MIN_PRICE = 12_000                                              # floor price range worth trading
+VOL_MAX_PRICE = int(os.environ.get("FC_VOLUME_MAX_PRICE", "160000"))
+VOL_MAX_SIGMA = float(os.environ.get("FC_VOLUME_MAX_SIGMA", "10"))  # sale-price noise (%): the sold median must mean something
+VOL_KEEP_H = 48                                                     # stays on the list this long after last qualifying
+_VOL_AUTO: set[str] = set()
+
+
+def refresh_volume_cards(db, cards, now: float) -> None:
+    """Hourly: rebuild the automatic part of the volume list from the sales model."""
+    global _VOL_AUTO
+    last = get_meta(db, "vol_auto_ts")
+    cache = json.loads(get_meta(db, "vol_auto") or "{}")
+    if not last or now - float(last) >= 3600:
+        for c in cards:
+            if not VOL_MIN_PRICE <= c.price <= VOL_MAX_PRICE:
+                continue
+            st = sm.sale_stats(db, c.card_id, now, 96, 24)
+            if st and st["n24"] >= VOL_MIN_N24 and st["n"] >= VOL_MIN_N96 and st["sigma_pct"] <= VOL_MAX_SIGMA:
+                cache[c.card_id] = now
+        cache = {k_: t for k_, t in cache.items() if now - t < VOL_KEEP_H * 3600}
+        set_meta(db, "vol_auto", json.dumps(cache))
+        set_meta(db, "vol_auto_ts", now)
+    _VOL_AUTO = set(cache)
+
+
 def load_volume_list() -> set[str]:
+    """Pinned cards from volume_list.json plus the automatic ones."""
     try:
         with open(VOLUME_FILE, encoding="utf-8") as f:
             d = json.load(f)
-        return {str(x) for x in (d.keys() if isinstance(d, dict) else d)}
+        pinned = {str(x) for x in (d.keys() if isinstance(d, dict) else d)}
     except (OSError, ValueError):
-        return set()
+        pinned = set()
+    return pinned | _VOL_AUTO
 
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
@@ -2307,6 +2337,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         beh_types = _behaviour_cached(db, now)
     except Exception:
         beh_types = {}
+    try:
+        refresh_volume_cards(db, cards, now)
+    except Exception as e:
+        print(f"[warn] volume list refresh failed: {e}")
     vol_list = load_volume_list()
     for c in cards:
         if c.card_id in thin:
