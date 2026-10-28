@@ -39,7 +39,6 @@ watched or purchased card. Alerts only consider cards ≥ `FC_MIN_PRICE` (15k) a
 |---|---|
 | `players.json` | All special cards (id, name, rating, rarity, URL, image). Built by `setup.py`/`build_players.py` from saved fut.gg list pages (`pages/`). |
 | `holo_ids.json` | Ids of holographic cards. fut.gg's data has no holo flag, so holos are labelled from here (`🃏 Holo`). |
-| `volume_list.json` | Cards you trade often (high turnover); fast drop needs only 8 % for them. Edit freely: `{card_id: name}`. |
 | `watchlist.json` | Manual watchlist. **Empty on purpose**: the whole watchlist is dynamic. |
 | `watch_seed.json` | 13 cards that seed the auto-watchlist once (with a 3-day grace period). |
 | `purchased.json` | Cards you hold: `{"<card id or "name promo">": {"price": 399000, "target": 445000, "name": "…"}}`. `target` is optional. Re-read every scan. You commit it yourself. |
@@ -169,7 +168,7 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 ### 5.2b 📦 Volume Drop · vs the previous price update (volume list)
 Its own blue embed, separate from ⚡ Fast Drop. Same reference (previous fut.gg update), same market adjustment, same cooldowns and thin-card filter, but:
 - Fires at **≥ 8 %** (`FC_FAST_VOLUME_DIP_PCT`) instead of 10 %; **no sold-median filter** (these cards flip right away; the card still needs some recorded sales for the hint line).
-- **The list** = pinned cards in `volume_list.json` (`{card_id: name}`) **plus an automatic part rebuilt hourly**: floor 12k–160k, ≥ 60 inferred sales in 24 h (`FC_VOLUME_MIN_N24`) and ≥ 40 in 96 h (`FC_VOLUME_MIN_N96`), sale-price noise σ ≤ 10 % (`FC_VOLUME_MAX_SIGMA`), floor ≤ `FC_VOLUME_MAX_PRICE`; a card stays on 48 h after it last qualified.
+- **The list is fully dynamic** (no manual file), rebuilt hourly from the sales model; a card is on it when: floor 12k–160k, ≥ 60 inferred sales in 24 h (`FC_VOLUME_MIN_N24`) and ≥ 40 in 96 h (`FC_VOLUME_MIN_N96`), sale-price noise σ ≤ 10 % (`FC_VOLUME_MAX_SIGMA`), floor ≤ `FC_VOLUME_MAX_PRICE`; a card stays on 48 h after it last qualified.
 - Scanned even if the card is on the premium list.
 - Evidence: cards with ≥ 40 sales/24 h, drops 5–7 %: median −1.6 % net at 3 h (38 % winners) · 7–10 %: +0.1 % (52 %) · ≥ 10 %: +5.1 % (73 %). Backtest of the automatic filter (~80 cards, 26 h): 8 %+ drops +3.2 % median, 69 % winners, about 16 raw drops per hour before cooldowns. Small margin, so the value is speed and volume.
 
@@ -260,8 +259,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
 | `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted (liquid cards excepted) |
 | `FC_VOLUME_MIN_N24` / `FC_VOLUME_MIN_N96` / `FC_VOLUME_MAX_PRICE` / `FC_VOLUME_MAX_SIGMA` | 60 / 40 / 160000 / 10 | automatic volume-list filter |
-| `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on `volume_list.json` (instead of 10) |
-| `FC_VOLUME_LIST` | volume_list.json | file with the volume-list cards |
+| `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on the volume list (instead of 10) |
 | `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid and exempt from the sold-median filter |
 | `FC_BID_SHEET` | bid_sheet.json | output file of the bid sheet |
 | `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
