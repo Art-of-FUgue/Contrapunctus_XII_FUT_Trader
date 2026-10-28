@@ -151,6 +151,8 @@ FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as m
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
 FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
 FAST_LIQUID_N24 = int(os.environ.get("FC_FAST_LIQUID_N24", "10"))           # liquid card: this many sales/24 h skips the sold-median filter
+FAST_VOLUME_N24 = int(os.environ.get("FC_FAST_VOLUME_N24", "40"))           # high-volume card: sales/24 h for the lower drop threshold
+FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a high-volume card
 FAST_MIN_SALES = 8                                                          # sales in 4 days needed to know that median
 DIP6H_ALERTS = os.environ.get("FC_DIP6H_ALERTS", "0") == "1"      # the 6 h dip alert is off by default
 FLASH_MIN_PRICE = 10_000         # ignore cheap cards for flash alerts
@@ -2490,8 +2492,10 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                 f = dict(f, mkt=mf, raw=pct)
                 if pct >= FLASH_SPIKE_PCT:
                     flash_spikes.append((c, f, pct))
-                elif rel <= -FLASH_DIP_PCT:
+                elif rel <= -min(FLASH_DIP_PCT, FAST_VOLUME_DIP_PCT):
                     sold = sm.sale_stats(db, c.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+                    if rel > -FLASH_DIP_PCT and not (sold and sold["n24"] >= FAST_VOLUME_N24):
+                        continue                    # a drop between the two thresholds only counts on high-volume cards
                     liquid = bool(sold) and sold["n24"] >= FAST_LIQUID_N24 and sold["fair"] > 0
                     if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
