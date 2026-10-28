@@ -2540,7 +2540,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
             f = card_flash_stats(db, c)
             if f and f["prev_price"] > 0:
                 pct = (c.price - f["prev_price"]) / f["prev_price"] * 100
-                mf = adjf.get(rgroup(c), 0.0)
+                mf = 0.0 if in_vol else adjf.get(rgroup(c), 0.0)   # volume list: raw drop, quick flips need no market adjustment
                 rel = pct - mf
                 f = dict(f, mkt=mf, raw=pct)
                 if pct >= FLASH_SPIKE_PCT:
