@@ -167,7 +167,7 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 
 ### 5.2b 📦 Volume Drop · vs the previous price update (volume list)
 Its own blue embed, separate from ⚡ Fast Drop. Same reference (previous fut.gg update), same market adjustment, same cooldowns and thin-card filter, but:
-- Fires at **≥ 8 %** (`FC_FAST_VOLUME_DIP_PCT`) instead of 10 %; **no sold-median filter** (these cards flip right away; the card still needs some recorded sales for the hint line).
+- Fires at **≥ 8 %** (`FC_FAST_VOLUME_DIP_PCT`) instead of 10 %, measured as the **raw** drop vs the previous update (no peer-group market adjustment: they are meant to be flipped within the hour, and the group's median move per update is ~0 anyway); **no sold-median filter** (these cards flip right away; the card still needs some recorded sales for the hint line).
 - **The list is fully dynamic** (no manual file), rebuilt hourly from the sales model; a card is on it when: floor 12k–160k, ≥ 60 inferred sales in 24 h (`FC_VOLUME_MIN_N24`) and ≥ 40 in 96 h (`FC_VOLUME_MIN_N96`), sale-price noise σ ≤ 10 % (`FC_VOLUME_MAX_SIGMA`), floor ≤ `FC_VOLUME_MAX_PRICE`; a card stays on 48 h after it last qualified.
 - Scanned even if the card is on the premium list.
 - Evidence: cards with ≥ 40 sales/24 h, drops 5–7 %: median −1.6 % net at 3 h (38 % winners) · 7–10 %: +0.1 % (52 %) · ≥ 10 %: +5.1 % (73 %). Backtest of the automatic filter (~80 cards, 26 h): 8 %+ drops +3.2 % median, 69 % winners, about 16 raw drops per hour before cooldowns. Small margin, so the value is speed and volume.
