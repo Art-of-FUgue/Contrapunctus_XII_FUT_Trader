@@ -238,9 +238,9 @@ The manual `watchlist.json` is empty; the list is built automatically.
   Up to 20 best cards (ranked by mean × win rate × number of paying holds) are watched; a card stays watched for 3 days after it last qualified.
 - Marks: ⭐ on your list / seed, 🔁 auto-picked.
 
-## 7. Userscript (`userscript/fut_card_refresh.user.js`, v1.3)
+## 7. Userscript (`userscript/fut_card_refresh.user.js`, v1.3.1)
 
-**Bid badge (v1.3, live):** every scan writes `bid_sheet.json` (per card with ≥ 4 sales in 96 h: sold median, floor, sales/24 h, noise, max bid for +3/+5/+8 % net after 5 % tax and 1 % exit haircut). The workflow publishes it on the `data` branch next to the database. On any `fut.gg/players/<id>` page the script fetches it from raw.githubusercontent.com (public repo, no token) and shows a corner badge. Numbers refresh by themselves; only the script install is manual.
+**Bid badge (v1.3, live):** every scan writes `bid_sheet.json` (per card with ≥ 4 sales in 96 h: sold median, floor, sales/24 h, noise, max bid for +3/+5/+8 % net after 5 % tax and 1 % exit haircut). The workflow publishes it on the `data` branch next to the database. On any `fut.gg/players/<id>` page the script fetches it from raw.githubusercontent.com (public repo, no token) and shows a corner badge. Numbers refresh by themselves; only the script install is manual. The card id is read from the `27-<card id>` part of the URL (v1.3.1; the first number in the URL is the player id, shared by the normal and holo versions).
 - **Refresh cards**: reads fut.gg's price index and downloads `bundle.json` (new cards + holo lookup). Commit it and `refresh-cards.yml` does the rest.
 - **➕ Bought** (on a card page): asks for your buy price and an optional sell target, stores them in Tampermonkey. **📋 Purchased** shows the list, exports `purchased.json` (copy/download), imports an existing file. It never holds a GitHub token; you commit the file yourself.
 

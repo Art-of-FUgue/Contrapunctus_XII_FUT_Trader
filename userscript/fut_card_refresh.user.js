@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         FUT card list refresh
 // @namespace    contrapunctus-xii
-// @version      1.3
+// @version      1.3.1
 // @description  fut.gg helper: (1) Refresh cards: saves the card list + holo lookup into bundle.json; (2) Bought: collect cards you bought (price + optional sell target) and export purchased.json; (3) live bid badge on player pages (max bid for +3/+5/+8% net, from the scanner's sold prices).
 // @match        https://www.fut.gg/*
 // @grant        GM_xmlhttpRequest
@@ -278,7 +278,10 @@
   const fmtK = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 100000 ? 0 : 1).replace(/\.0$/, "") + "K" : String(n));
 
   async function updateBadge() {
-    const m = location.pathname.match(/\/players\/(\d+)/);
+    // /players/<player id>-<slug>/27-<card id>/ : the player id is shared by every version of a player
+    // (normal, holo ...), the card id after "27-" is the specific card the scanner tracks.
+    const mm = location.pathname.match(/\/players\/(\d+)[^/]*\/27-(\d+)/) || location.pathname.match(/\/players\/(\d+)/);
+    const m = mm && [mm[0], mm[2] || mm[1]];
     if (!m) { if (badgeEl) badgeEl.style.display = "none"; return; }
     if (!badgeEl) {
       badgeEl = document.createElement("div");
