@@ -2862,9 +2862,9 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             continue
         text = m.get("content", "")
         if not text:
-            if not get_meta(db, "bot_intent_warned"):
-                set_meta(db, "bot_intent_warned", 1)
-                print("[warn] bot sees empty message text: switch on the Message Content intent in the Developer Portal")
+            print("[warn] bot sees empty message text: switch on the Message Content intent in the Developer Portal")
+            _webhook_note(db, "bot_intent_note", "🤖 The bot sees your message but not its text: switch on **Message Content Intent** "
+                          "(Developer Portal → your app → Bot → Privileged Gateway Intents), save, and type again.")
             continue
         parsed = parse_held_message(text)
         forced = True
