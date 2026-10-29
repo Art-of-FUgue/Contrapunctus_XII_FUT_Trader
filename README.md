@@ -215,7 +215,7 @@ With a Discord bot in the alert channel (`DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_I
 - `sold Carpenter, holo totw` stops tracking it.
 - The text before the numbers is matched like `purchased.json` keys (name + promo + holo; all words must match). The bot replies to your message: ✅ with the card and the sell price it will alert at, or ❓ with why it couldn't pick one card.
 - Stored in table `held` (14 days) and merged with `purchased.json` (the file wins on a clash), so the cards use the same sell alerts as 5.6: 💰 Sell Now at your target (else fair value, at least +3 % net) and 🚀 Spiked.
-- Alerts themselves still go out through the webhook. If the bot variables are missing the feature is simply off.
+- **With the bot configured, every post (alerts, reports, status line) goes out through the bot**, so there is one sender; if a bot post fails it is sent through the webhook instead (`DISCORD_WEBHOOK_URL` stays required as the fallback). Without the bot variables everything uses the webhook and the typing feature is off. The bot's name and picture are set in the Developer Portal.
 
 ### 5.7 🗞 12-hour summary (7am and 7pm Austin)
 Posted automatically twice a day (`FC_SUMMARY_HOURS`, default `7,19`; empty = off). Everything compares each card with **its own price 12 h ago** (unchained, so no index drift) over *liquid* cards (≥ 30 inferred sales in 4 days, ≥ 15k, not muted-new):
