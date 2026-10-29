@@ -209,6 +209,14 @@ For cards in `purchased.json` with a buy price:
 - **Spiked**: floor ≥ **15 %** above your buy price (`FC_OWNED_SPIKE_PCT`).
 - Entries that cannot be resolved to a single card are reported once in a "⚠️ purchased.json: fix these entries" embed.
 
+### 5.6b Telling the bot what you bought (type in the alert channel)
+With a Discord bot in the alert channel (`DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`; the bot needs View Channel, Send Messages, Read Message History, and the **Message Content intent** switched on in the Developer Portal), type a message and the scanner reads it on its next scan (every ~30 s):
+- `Bischof, future stars, 81k` or `Carpenter, holo totw, 43000, 47k` (second number = your sell target) or `Ellie Carpenter holo totw 43k`. Optional prefix `bought`.
+- `sold Carpenter, holo totw` stops tracking it.
+- The text before the numbers is matched like `purchased.json` keys (name + promo + holo; all words must match). The bot replies to your message: ✅ with the card and the sell price it will alert at, or ❓ with why it couldn't pick one card.
+- Stored in table `held` (14 days) and merged with `purchased.json` (the file wins on a clash), so the cards use the same sell alerts as 5.6: 💰 Sell Now at your target (else fair value, at least +3 % net) and 🚀 Spiked.
+- Alerts themselves still go out through the webhook. If the bot variables are missing the feature is simply off.
+
 ### 5.7 🗞 12-hour summary (7am and 7pm Austin)
 Posted automatically twice a day (`FC_SUMMARY_HOURS`, default `7,19`; empty = off). Everything compares each card with **its own price 12 h ago** (unchained, so no index drift) over *liquid* cards (≥ 30 inferred sales in 4 days, ≥ 15k, not muted-new):
 - **Market**: median move, share of cards rising and card count per segment (All specials, Icons, Heroes, TOTW, Other promos, Holos), plus the median of the muted new cards.
@@ -259,6 +267,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
 | `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted (liquid cards excepted) |
 | `FC_VOLUME_MIN_N24` / `FC_VOLUME_MIN_N96` / `FC_VOLUME_MAX_PRICE` / `FC_VOLUME_MAX_SIGMA` | 60 / 40 / 160000 / 10 | automatic volume-list filter |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | (secrets) | bot used to read what you type in the channel (5.6b) |
 | `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on the volume list (instead of 10) |
 | `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid and exempt from the sold-median filter |
 | `FC_BID_SHEET` | bid_sheet.json | output file of the bid sheet |
