@@ -2625,13 +2625,28 @@ def split_embed(e: dict) -> list[dict]:
     return out
 
 
+def send_discord(payload: dict) -> "requests.Response":
+    """Post through the bot when it is configured (one identity for everything), else the webhook.
+    If the bot call fails the message still goes out through the webhook."""
+    if bot_on():
+        try:
+            r = _bot("POST", f"/channels/{BOT_CHANNEL}/messages", json=payload)
+            if r is not None and r.ok:
+                return r
+            print(f"[warn] bot post failed ({getattr(r, 'status_code', '?')}): "
+                  f"{getattr(r, 'text', '')[:200]} - using the webhook")
+        except Exception as e:
+            print(f"[warn] bot post failed ({e}) - using the webhook")
+    return requests.post(WEBHOOK_URL, json=payload, timeout=10)
+
+
 def post(embeds: list[dict], dry_run: bool) -> None:
     flat = [part for e in embeds for part in split_embed(e)]
     for e in flat:
         if dry_run:
             print(json.dumps(e, ensure_ascii=False, indent=2))
             continue
-        r = requests.post(WEBHOOK_URL, json={"embeds": [e]}, timeout=10)
+        r = send_discord({"embeds": [e]})
         if r.status_code == 400:                      # show what Discord objected to
             print(f"[error] Discord 400 for '{e.get('title')}': {r.text[:300]} "
                   f"(description {len(e.get('description', ''))} chars)")
@@ -2681,7 +2696,7 @@ def notice(text: str, dry_run: bool) -> None:
         if dry_run:
             print(f"[notice] {text}")
         else:
-            requests.post(WEBHOOK_URL, json={"content": text}, timeout=10).raise_for_status()
+            send_discord({"content": text}).raise_for_status()
     except Exception as e:                # a failed notice must never fail the scan
         print(f"[warn] could not post notice: {e}")
 
