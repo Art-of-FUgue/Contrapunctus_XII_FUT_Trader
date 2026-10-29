@@ -18,7 +18,7 @@ buy-signal and sell alerts to a Discord webhook.
 
 | Piece | What it does |
 |---|---|
-| `.github/workflows/scan.yml` | Launched every 15 min (a backup `cron` plus an outside timer via `workflow_dispatch`). One launch = **24 checks, 30 s apart** (`FC_RUNS`, `FC_RUN_GAP`). A scan is skipped when fut.gg has not published new prices (it publishes about every 5–6 min, so most of the 24 checks per launch are skipped; this feed cadence, not the scanner, is the limit on alert speed). The workflow installs `requests` and `curl_cffi`: fut.gg's CDN sometimes answers bots with 403, so requests use browser headers with Chrome impersonation and retry 3 times. Never two at once (`concurrency: fc-scan`). |
+| `.github/workflows/scan.yml` | Launched every 15 min (a backup `cron` plus an outside timer via `workflow_dispatch`). One launch = **30 checks, 30 s apart** (~15 min, so the next queued launch starts right after and the gap between launches is about a minute) (`FC_RUNS`, `FC_RUN_GAP`). A scan is skipped when fut.gg has not published new prices (it publishes about every 5–6 min, so most of the 30 checks per launch are skipped; this feed cadence, not the scanner, is the limit on alert speed). The workflow installs `requests` and `curl_cffi`: fut.gg's CDN sometimes answers bots with 403, so requests use browser headers with Chrome impersonation and retry 3 times. Never two at once (`concurrency: fc-scan`). |
 | `fc_market_scanner.py` | The scanner: fetch → judge → post → save. |
 | `sales_model.py` | Infers completed sales from floor moves (section 3). |
 | `data` branch | Holds the SQLite database as one **gzip-compressed** file `market_pc.db.gz`, force-pushed as a single commit after every launch so the repo never grows. Non-`main` branches use `data-<branch>`. The workflow restores it at the start and saves it at the end (even if the scan failed). |
@@ -209,6 +209,15 @@ For cards in `purchased.json` with a buy price:
 - **Spiked**: floor ≥ **15 %** above your buy price (`FC_OWNED_SPIKE_PCT`).
 - Entries that cannot be resolved to a single card are reported once in a "⚠️ purchased.json: fix these entries" embed.
 
+### 5.6b Telling the bot what you bought (type in the alert channel)
+With a Discord bot in the alert channel (`DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_ID`; the bot needs View Channel, Send Messages, Read Message History, and the **Message Content intent** switched on in the Developer Portal), type a message and the scanner reads it on its next scan (every ~30 s):
+- `Bischof, future stars, 81k` or `Carpenter, holo totw, 43000, 47k` (second number = your sell target) or `Ellie Carpenter holo totw 43k`. Optional prefix `bought`.
+- `sold Carpenter, holo totw` stops tracking it.
+- The text before the numbers is matched like `purchased.json` keys (name + promo + holo; all words must match). The bot replies to your message: ✅ with the card and the sell price it will alert at, or ❓ with why it couldn't pick one card.
+- **Price check:** type just a card (`Carpenter holo totw`, `puyol`, or `? name` / `price name` / `bid name`) and the bot replies with its floor, sold median (sales in 24 h / 4 days, noise) and the max bid for +3 / +5 / +8 % net (5 % tax + 1 % exit haircut). Fewer than 4 sales in 4 days: it says there is no reliable price. Text that matches no card is ignored (chat is safe), unless you start with `?`, `price` or `bid`; a name matching several cards gets the candidate list.
+- Stored in table `held` (14 days) and merged with `purchased.json` (the file wins on a clash), so the cards use the same sell alerts as 5.6: 💰 Sell Now at your target (else fair value, at least +3 % net) and 🚀 Spiked.
+- **With the bot configured, every post (alerts, reports, status line) goes out through the bot**, so there is one sender; if a bot post fails it is sent through the webhook instead (`DISCORD_WEBHOOK_URL` stays required as the fallback). Without the bot variables everything uses the webhook and the typing feature is off. The bot's name and picture are set in the Developer Portal.
+
 ### 5.7 🗞 12-hour summary (7am and 7pm Austin)
 Posted automatically twice a day (`FC_SUMMARY_HOURS`, default `7,19`; empty = off). Everything compares each card with **its own price 12 h ago** (unchained, so no index drift) over *liquid* cards (≥ 30 inferred sales in 4 days, ≥ 15k, not muted-new):
 - **Market**: median move, share of cards rising and card count per segment (All specials, Icons, Heroes, TOTW, Other promos, Holos), plus the median of the muted new cards.
@@ -238,9 +247,9 @@ The manual `watchlist.json` is empty; the list is built automatically.
   Up to 20 best cards (ranked by mean × win rate × number of paying holds) are watched; a card stays watched for 3 days after it last qualified.
 - Marks: ⭐ on your list / seed, 🔁 auto-picked.
 
-## 7. Userscript (`userscript/fut_card_refresh.user.js`, v1.3)
+## 7. Userscript (`userscript/fut_card_refresh.user.js`, v1.3.1)
 
-**Bid badge (v1.3, live):** every scan writes `bid_sheet.json` (per card with ≥ 4 sales in 96 h: sold median, floor, sales/24 h, noise, max bid for +3/+5/+8 % net after 5 % tax and 1 % exit haircut). The workflow publishes it on the `data` branch next to the database. On any `fut.gg/players/<id>` page the script fetches it from raw.githubusercontent.com (public repo, no token) and shows a corner badge. Numbers refresh by themselves; only the script install is manual.
+**Bid badge (v1.3, live):** every scan writes `bid_sheet.json` (per card with ≥ 4 sales in 96 h: sold median, floor, sales/24 h, noise, max bid for +3/+5/+8 % net after 5 % tax and 1 % exit haircut). The workflow publishes it on the `data` branch next to the database. On any `fut.gg/players/<id>` page the script fetches it from raw.githubusercontent.com (public repo, no token) and shows a corner badge. Numbers refresh by themselves; only the script install is manual. The card id is read from the `27-<card id>` part of the URL (v1.3.1; the first number in the URL is the player id, shared by the normal and holo versions).
 - **Refresh cards**: reads fut.gg's price index and downloads `bundle.json` (new cards + holo lookup). Commit it and `refresh-cards.yml` does the rest.
 - **➕ Bought** (on a card page): asks for your buy price and an optional sell target, stores them in Tampermonkey. **📋 Purchased** shows the list, exports `purchased.json` (copy/download), imports an existing file. It never holds a GitHub token; you commit the file yourself.
 
@@ -250,7 +259,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 |---|---|---|
 | `DISCORD_WEBHOOK_URL` | — | where alerts go (repo secret) |
 | `FC_PLATFORM` | `pc` | `pc` or `ps` |
-| `FC_RUNS` / `FC_RUN_GAP` | 24 / 30 s | scans per launch / spacing |
+| `FC_RUNS` / `FC_RUN_GAP` | 30 / 30 s | scans per launch / spacing |
 | `FC_MIN_PRICE` / `FC_MAX_PRICE` | 15k / 2M (workflow) | alert price range |
 | `FC_MAX_LINES` | 16 | cards per section |
 | `FC_NEW_CARD_DAYS` | 4 | new-card mute |
@@ -259,6 +268,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
 | `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted (liquid cards excepted) |
 | `FC_VOLUME_MIN_N24` / `FC_VOLUME_MIN_N96` / `FC_VOLUME_MAX_PRICE` / `FC_VOLUME_MAX_SIGMA` | 60 / 40 / 160000 / 10 | automatic volume-list filter |
+| `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | (secrets) | bot used to read what you type in the channel (5.6b) |
 | `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on the volume list (instead of 10) |
 | `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid and exempt from the sold-median filter |
 | `FC_BID_SHEET` | bid_sheet.json | output file of the bid sheet |

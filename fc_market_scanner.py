@@ -38,6 +38,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sqlite3
 import statistics
 import sys
@@ -392,6 +393,7 @@ def open_db(path: str) -> sqlite3.Connection:
     if "warned" not in {r[1] for r in db.execute("pragma table_info(watch_positions)")}:
         db.execute("alter table watch_positions add column warned int default 0")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
+    db.execute("create table if not exists held(card_id text primary key, price int, target int, ts real)")
     return db
 
 
@@ -1733,7 +1735,7 @@ def build_summary(db, now: float) -> list[dict]:
                          f"{sum(1 for x in v if x > 0) / len(v) * 100:.0f}% in profit")
     # -- cards you hold
     try:
-        held = load_purchased()
+        held = held_cards(db)
     except Exception:
         held = {}
     hl = [(cid, b) for cid, b in held.items() if b and cid in latest and cid in meta]
@@ -2491,13 +2493,28 @@ def split_embed(e: dict) -> list[dict]:
     return out
 
 
+def send_discord(payload: dict) -> "requests.Response":
+    """Post through the bot when it is configured (one identity for everything), else the webhook.
+    If the bot call fails the message still goes out through the webhook."""
+    if bot_on():
+        try:
+            r = _bot("POST", f"/channels/{BOT_CHANNEL}/messages", json=payload)
+            if r is not None and r.ok:
+                return r
+            print(f"[warn] bot post failed ({getattr(r, 'status_code', '?')}): "
+                  f"{getattr(r, 'text', '')[:200]} - using the webhook")
+        except Exception as e:
+            print(f"[warn] bot post failed ({e}) - using the webhook")
+    return requests.post(WEBHOOK_URL, json=payload, timeout=10)
+
+
 def post(embeds: list[dict], dry_run: bool) -> None:
     flat = [part for e in embeds for part in split_embed(e)]
     for e in flat:
         if dry_run:
             print(json.dumps(e, ensure_ascii=False, indent=2))
             continue
-        r = requests.post(WEBHOOK_URL, json={"embeds": [e]}, timeout=10)
+        r = send_discord({"embeds": [e]})
         if r.status_code == 400:                      # show what Discord objected to
             print(f"[error] Discord 400 for '{e.get('title')}': {r.text[:300]} "
                   f"(description {len(e.get('description', ''))} chars)")
@@ -2547,7 +2564,7 @@ def notice(text: str, dry_run: bool) -> None:
         if dry_run:
             print(f"[notice] {text}")
         else:
-            requests.post(WEBHOOK_URL, json={"content": text}, timeout=10).raise_for_status()
+            send_discord({"content": text}).raise_for_status()
     except Exception as e:                # a failed notice must never fail the scan
         print(f"[warn] could not post notice: {e}")
 
@@ -2557,6 +2574,203 @@ def fmt_gap(seconds: float) -> str:
     return f"{m}m" if m < 120 else f"{m // 60}h{m % 60:02d}m"
 
 
+# ---- tell the bot what you bought, by typing in the alert channel ---------------------------------------------
+# "Bischof, future stars, 81k"  or  "Carpenter, holo totw, 43k, 47k" (second number = your sell target)
+# "sold Carpenter, holo totw" removes it.  Needs a Discord bot (DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID) with the
+# Message Content intent switched on.  The cards land in the same sell-alert flow as purchased.json.
+BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
+BOT_CHANNEL = os.environ.get("DISCORD_CHANNEL_ID", "")
+BOT_API = "https://discord.com/api/v10"
+HELD_KEEP_DAYS = 14
+
+
+def bot_on() -> bool:
+    return bool(BOT_TOKEN and BOT_CHANNEL)
+
+
+def _bot(method: str, path: str, **kw):
+    r = None
+    for _ in range(3):
+        r = requests.request(method, BOT_API + path, headers={"Authorization": f"Bot {BOT_TOKEN}"}, timeout=10, **kw)
+        if r.status_code == 429:
+            time.sleep(min(float(r.json().get("retry_after", 1)), 5) + 0.1)
+            continue
+        break
+    return r
+
+
+def _num(s: str) -> int | None:
+    m = re.fullmatch(r"\s*(\d+(?:[.,]\d+)?)\s*([kKmM]?)\s*", s)
+    if not m:
+        return None
+    v = float(m.group(1).replace(",", "."))
+    return int(v * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()])
+
+
+def parse_held_message(text: str):
+    """-> (action, query, price, target) or None when the message is not about a card."""
+    t = text.strip()
+    sold = re.match(r"(?i)^sold\b[\s:,-]*", t)
+    if sold:
+        t = t[sold.end():]
+    else:
+        t = re.sub(r"(?i)^(bought|got|bid)\b[\s:,-]*", "", t)
+    words_l, nums = [], []
+    for x in re.split(r"[,;\n]", t):
+        toks = x.split()
+        tail = []
+        while len(toks) > 1 and re.fullmatch(r"\d+(?:[.,]\d+)?[kKmM]|\d{4,}", toks[-1]):
+            tail.insert(0, toks.pop())                       # "icon holo 1.2m": peel the price off the name
+        n = _num(" ".join(toks)) if len(toks) == 1 else None
+        if n:
+            nums.append(n)
+        elif toks:
+            words_l.append(" ".join(toks))
+        nums += [v for v in (_num(z) for z in tail) if v]
+    words = " ".join(words_l)
+    if not words or (not sold and not nums):
+        return None
+    if sold:
+        return "sold", words, None, None
+    return "bought", words, nums[0], (nums[1] if len(nums) > 1 else None)
+
+
+def parse_quote(text: str):
+    """A card typed without a price -> (query, forced). `forced` (prefix ?, price, bid, value) means a
+    miss gets an answer too; otherwise the bot stays quiet when the text matches no card."""
+    t = text.strip()
+    if not t or len(t) > 80 or "http" in t or "\n" in t:
+        return None
+    m = re.match(r"(?i)^(?:\?|(?:price|bid|value)\b)[\s:?-]*", t)
+    forced = bool(m)
+    if m:
+        t = t[m.end():]
+    t = t.strip(" ?!.")
+    return (t, forced) if t else None
+
+
+def quote_reply(db, cid: str, now: float) -> str:
+    """What to bid on a card: sold median, floor, and the max bid for +3 / +5 / +8 % net."""
+    row = db.execute("select price from prices where card_id=? order by ts desc limit 1", (cid,)).fetchone()
+    floor = row[0] if row else None
+    st = sm.sale_stats(db, cid, now, 96, 24)
+    head = f"💬 **{_card_label(cid)}**" + (f" · floor {k(floor)}" if floor else "")
+    if not st or st["n"] < BID_MIN_SALES:
+        return head + f"\nOnly {st['n'] if st else 0} sale(s) seen in 4 days: no reliable sold price, so no bid number."
+    fair = st["fair"]
+    bids = " · ".join(f"+{x}% net ≤ **{k(max_bid(fair, x))}**" for x in BID_NETS)
+    under = f" · floor {(floor / fair - 1) * 100:+.1f}% vs sold" if floor else ""
+    return (head + f"\nSold median **{k(fair)}** ({st['n24']} sales in 24 h, {st['n']} in 4 days, ±{st['sigma_pct']:.1f}%){under}"
+            f"\nMax bid: {bids}" + ("\n⚠️ thin: fewer than 4 sales in 24 h" if st["n24"] < 4 else ""))
+
+
+def held_cards(db) -> dict[str, int | None]:
+    """purchased.json plus the cards you reported in the channel (the file wins on a clash)."""
+    out = load_purchased()
+    for cid, price, target in db.execute("select card_id, price, target from held"):
+        if cid not in out:
+            out[cid] = price
+            if target:
+                PURCHASED_TARGETS[cid] = target
+    return out
+
+
+def _card_label(cid: str) -> str:
+    pl = _load_players()
+    row = pl.get(int(cid)) if cid.isdigit() else None
+    return (f"{row['cardName']} · {row['rarityName']}" + (" 🃏 Holo" if int(cid) in _load_holo(pl) else "")) if row else cid
+
+
+def _webhook_note(db, key: str, text: str) -> None:
+    """One-time notice through the webhook (the bot may be exactly what is broken)."""
+    if get_meta(db, key) == text:
+        return
+    set_meta(db, key, text)
+    try:
+        requests.post(WEBHOOK_URL, json={"content": text}, timeout=10)
+    except Exception as e:
+        print(f"[warn] notice failed: {e}")
+
+
+def poll_channel(db, cards_map: dict, now: float) -> None:
+    """Read new messages you typed in the alert channel and turn them into held cards."""
+    if not bot_on():
+        _webhook_note(db, "bot_state", "🤖 Bot is off: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID are empty in the scanner "
+                                       "(check the GitHub secret names). Alerts still use the webhook.")
+        return
+    db.execute("delete from held where ts < ?", (now - HELD_KEEP_DAYS * 86400,))
+    last = get_meta(db, "bot_last_msg")
+    path = f"/channels/{BOT_CHANNEL}/messages?limit=50" + (f"&after={last}" if last else "")
+    r = _bot("GET", path)
+    if r is None or not r.ok:
+        code, body = getattr(r, "status_code", "?"), getattr(r, "text", "")[:160]
+        print(f"[warn] bot poll failed: {code} {body}")
+        hint = {401: "token is wrong or was reset", 403: "the bot cannot see or read this channel (permissions)",
+                404: "channel id is wrong or the bot is not in that server"}.get(code, "")
+        _webhook_note(db, "bot_state", f"🤖 Bot cannot read the channel: HTTP {code} {hint} · {body}")
+        return
+    msgs = sorted(r.json(), key=lambda m: int(m["id"]))
+    if msgs:
+        set_meta(db, "bot_last_msg", msgs[-1]["id"])
+    elif not last:
+        set_meta(db, "bot_last_msg", "0")
+    if not last:
+        try:
+            _bot("POST", f"/channels/{BOT_CHANNEL}/messages", json={"content":
+                 "🤖 Bot online. Type a card name for a bid price (`Carpenter holo totw`), or `Name, promo, price` after you buy "
+                 "(`sold Name, promo` to stop)."})
+            set_meta(db, "bot_state", "online")
+        except Exception as e:
+            print(f"[warn] bot hello failed: {e}")
+        return                                             # first run: only remember where we are
+    if not msgs:
+        return
+    for m in msgs:
+        if m.get("author", {}).get("bot"):
+            continue
+        text = m.get("content", "")
+        if not text:
+            print("[warn] bot sees empty message text: switch on the Message Content intent in the Developer Portal")
+            _webhook_note(db, "bot_intent_note", "🤖 The bot sees your message but not its text: switch on **Message Content Intent** "
+                          "(Developer Portal → your app → Bot → Privileged Gateway Intents), save, and type again.")
+            continue
+        parsed = parse_held_message(text)
+        forced = True
+        if not parsed:
+            q = parse_quote(text)
+            if not q:
+                continue
+            parsed, forced = ("quote", q[0], None, None), q[1]
+        action, query, price, target = parsed
+        cid, why = resolve_card(query)
+        if not cid:
+            if action == "quote" and not forced and why.startswith(("no card found", "empty")):
+                continue                                   # ordinary chat, not a card
+            reply = f"❓ {why}"
+        elif action == "quote":
+            reply = quote_reply(db, cid, now)
+        elif action == "sold":
+            db.execute("delete from held where card_id=?", (cid,))
+            reply = f"👋 Stopped tracking **{_card_label(cid)}**."
+        else:
+            db.execute("insert or replace into held values (?,?,?,?)", (cid, price, target, now))
+            c = cards_map.get(cid)
+            st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+            floor_t = price / (1 - EA_TAX) * (1 + OWNED_MIN_NET / 100)
+            tgt = target or (max(st["fair"], floor_t) if st and st["n"] >= 4 else floor_t)
+            reply = (f"✅ Tracking **{_card_label(cid)}** · bought {k(price)} · sell alert at **{k(tgt)}**"
+                     + (" (your target)" if target else " (4-day sold, at least +3% net)" if st and st["n"] >= 4 else " (+3% net)")
+                     + (f" · floor now {k(c.price)}" if c else ""))
+        db.commit()
+        try:
+            _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                 json={"content": reply[:1900], "message_reference": {"message_id": m["id"]},
+                       "allowed_mentions": {"parse": []}})
+        except Exception as e:
+            print(f"[warn] bot reply failed: {e}")
+    db.commit()
+
+
 def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
               spikes_on: bool = True, notify: bool = True) -> bool:
     """One scan. Returns False (and does nothing) if fut.gg has no new prices."""
@@ -2564,7 +2778,11 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
     prev = db.execute("select max(ts) from prices").fetchone()[0]   # last saved scan
     try:
         watchlist = (watchlist or set()) | auto_watch_ids(db, now)   # manual + auto
-        purchased = load_purchased()                  # re-read each scan: edits apply at once
+        try:
+            poll_channel(db, {}, now)                 # things you typed in the channel: bought / sold
+        except Exception as e:
+            print(f"[warn] channel poll failed: {e}")
+        purchased = held_cards(db)                    # purchased.json + cards you typed in the channel; re-read each scan
         cards = fetch_market(watchlist | set(purchased), last_hash=get_meta(db, "dyn_hash"))
         if cards is None:
             print(f"[info] {local_stamp()} feed unchanged, skipped")

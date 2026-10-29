@@ -13,7 +13,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 17
+    timeout-minutes: 19
     env:
       DB_FILE: market_pc.db
       DATA_BRANCH: ${{ github.ref_name == 'main' && 'data' || format('data-{0}', github.ref_name) }}   # other branches get their own DB branch
@@ -56,10 +56,12 @@ jobs:
         run: python fc_market_scanner.py --once
         env:
           FC_PLATFORM: pc
-          FC_RUNS: "24"                # scans per launch, 30 s apart (~12 min of the 15 min cycle)
+          FC_RUNS: "30"                # scans per launch, 30 s apart (~15 min: the next launch queues and starts right after)
           FC_RUN_GAP: "30"             # seconds between scans (min 30); unchanged feeds are skipped
           FC_NOTIFY_EACH_RUN: "1"      # set to "0" to stop the per-run Discord line
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
           FC_MAX_LINES: "16"           # max cards per section (0 = unlimited)
           FC_MIN_PRICE: "15k"          # min card price of interest (e.g. 15k, 50k, 100k)
           FC_MAX_PRICE: "2M"             # max card price of interest (e.g. 1M, 2.5M, or empty for no max)
