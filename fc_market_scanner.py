@@ -2813,23 +2813,50 @@ def _card_label(cid: str) -> str:
     return (f"{row['cardName']} · {row['rarityName']}" + (" 🃏 Holo" if int(cid) in _load_holo(pl) else "")) if row else cid
 
 
+def _webhook_note(db, key: str, text: str) -> None:
+    """One-time notice through the webhook (the bot may be exactly what is broken)."""
+    if get_meta(db, key) == text:
+        return
+    set_meta(db, key, text)
+    try:
+        requests.post(WEBHOOK_URL, json={"content": text}, timeout=10)
+    except Exception as e:
+        print(f"[warn] notice failed: {e}")
+
+
 def poll_channel(db, cards_map: dict, now: float) -> None:
     """Read new messages you typed in the alert channel and turn them into held cards."""
     if not bot_on():
+        _webhook_note(db, "bot_state", "🤖 Bot is off: DISCORD_BOT_TOKEN / DISCORD_CHANNEL_ID are empty in the scanner "
+                                       "(check the GitHub secret names). Alerts still use the webhook.")
         return
     db.execute("delete from held where ts < ?", (now - HELD_KEEP_DAYS * 86400,))
     last = get_meta(db, "bot_last_msg")
     path = f"/channels/{BOT_CHANNEL}/messages?limit=50" + (f"&after={last}" if last else "")
     r = _bot("GET", path)
     if r is None or not r.ok:
-        print(f"[warn] bot poll failed: {getattr(r, 'status_code', '?')} {getattr(r, 'text', '')[:160]}")
+        code, body = getattr(r, "status_code", "?"), getattr(r, "text", "")[:160]
+        print(f"[warn] bot poll failed: {code} {body}")
+        hint = {401: "token is wrong or was reset", 403: "the bot cannot see or read this channel (permissions)",
+                404: "channel id is wrong or the bot is not in that server"}.get(code, "")
+        _webhook_note(db, "bot_state", f"🤖 Bot cannot read the channel: HTTP {code} {hint} · {body}")
         return
     msgs = sorted(r.json(), key=lambda m: int(m["id"]))
+    if msgs:
+        set_meta(db, "bot_last_msg", msgs[-1]["id"])
+    elif not last:
+        set_meta(db, "bot_last_msg", "0")
+    if not last:
+        try:
+            _bot("POST", f"/channels/{BOT_CHANNEL}/messages", json={"content":
+                 "🤖 Bot online. Type a card name for a bid price (`Carpenter holo totw`), or `Name, promo, price` after you buy "
+                 "(`sold Name, promo` to stop)."})
+            set_meta(db, "bot_state", "online")
+        except Exception as e:
+            print(f"[warn] bot hello failed: {e}")
+        return                                             # first run: only remember where we are
     if not msgs:
         return
-    set_meta(db, "bot_last_msg", msgs[-1]["id"])
-    if not last:
-        return                                             # first run: only remember where we are
     for m in msgs:
         if m.get("author", {}).get("bot"):
             continue
