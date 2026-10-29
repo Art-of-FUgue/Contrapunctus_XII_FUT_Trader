@@ -2824,6 +2824,34 @@ def _webhook_note(db, key: str, text: str) -> None:
         print(f"[warn] notice failed: {e}")
 
 
+CARD_CMDS = {"update cards", "new cards", "refresh cards", "check cards", "cards"}
+UPLOAD_URL = "https://github.com/Art-of-FUgue/Contrapunctus_XII_FUT_Trader/upload/main"
+SPECIAL_ID_FLOOR = 50_000_000    # promo / holo card ids start here; base cards are far below
+
+
+def cards_reply(db) -> str:
+    """Are there special-card ids in fut.gg's price index that your card list does not know yet?
+    (The list itself can only be refreshed from your own browser, see the userscript.)"""
+    players = _load_players()
+    manifest = _get_json(R2 + "manifest.json")
+    ids = _load_ids(manifest, players)
+    holo = _load_holo(players)
+    unlisted = sorted(i for i in ids if i >= SPECIAL_ID_FLOOR and i not in players and i not in holo)
+    prev = get_meta(db, "unlisted_ids")
+    set_meta(db, "unlisted_ids", json.dumps(unlisted))
+    steps = ("To update: open fut.gg in your browser, click **Refresh cards** (bottom left, Tampermonkey script), "
+             f"then upload the downloaded `bundle.json` here: {UPLOAD_URL} (Commit to main). The list is rebuilt and the new cards are posted in this channel.")
+    if prev is None:
+        return (f"🆕 {len(unlisted)} special-card ids in fut.gg's price index are not in your card list "
+                f"(promo cards that came out since the last refresh, plus untradable or holo leftovers). "
+                f"I'll tell you how many are new since this check next time.\n{steps}")
+    new = [i for i in unlisted if i not in set(json.loads(prev))]
+    if not new:
+        return (f"✅ Nothing new since the last check ({len(unlisted)} unlisted ids, unchanged). "
+                f"If you know a promo dropped, refresh anyway.\n{steps}")
+    return f"🆕 **{len(new)} new** special-card id(s) since the last check ({len(unlisted)} unlisted in total).\n{steps}"
+
+
 def poll_channel(db, cards_map: dict, now: float) -> None:
     """Read new messages you typed in the alert channel and turn them into held cards."""
     if not bot_on():
@@ -2865,6 +2893,19 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             print("[warn] bot sees empty message text: switch on the Message Content intent in the Developer Portal")
             _webhook_note(db, "bot_intent_note", "🤖 The bot sees your message but not its text: switch on **Message Content Intent** "
                           "(Developer Portal → your app → Bot → Privileged Gateway Intents), save, and type again.")
+            continue
+        if text.strip(" !?.").lower() in CARD_CMDS:
+            try:
+                reply = cards_reply(db)
+            except Exception as e:
+                reply = f"⚠️ Could not check fut.gg's price index: {e}"
+            db.commit()
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": reply[:1900], "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}, "flags": 4})   # 4 = no link preview
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
             continue
         parsed = parse_held_message(text)
         forced = True
