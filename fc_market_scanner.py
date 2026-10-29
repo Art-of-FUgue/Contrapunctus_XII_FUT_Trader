@@ -2635,6 +2635,35 @@ def parse_held_message(text: str):
     return "bought", words, nums[0], (nums[1] if len(nums) > 1 else None)
 
 
+def parse_quote(text: str):
+    """A card typed without a price -> (query, forced). `forced` (prefix ?, price, bid, value) means a
+    miss gets an answer too; otherwise the bot stays quiet when the text matches no card."""
+    t = text.strip()
+    if not t or len(t) > 80 or "http" in t or "\n" in t:
+        return None
+    m = re.match(r"(?i)^(?:\?|(?:price|bid|value)\b)[\s:?-]*", t)
+    forced = bool(m)
+    if m:
+        t = t[m.end():]
+    t = t.strip(" ?!.")
+    return (t, forced) if t else None
+
+
+def quote_reply(db, cid: str, now: float) -> str:
+    """What to bid on a card: sold median, floor, and the max bid for +3 / +5 / +8 % net."""
+    row = db.execute("select price from prices where card_id=? order by ts desc limit 1", (cid,)).fetchone()
+    floor = row[0] if row else None
+    st = sm.sale_stats(db, cid, now, 96, 24)
+    head = f"💬 **{_card_label(cid)}**" + (f" · floor {k(floor)}" if floor else "")
+    if not st or st["n"] < BID_MIN_SALES:
+        return head + f"\nOnly {st['n'] if st else 0} sale(s) seen in 4 days: no reliable sold price, so no bid number."
+    fair = st["fair"]
+    bids = " · ".join(f"+{x}% net ≤ **{k(max_bid(fair, x))}**" for x in BID_NETS)
+    under = f" · floor {(floor / fair - 1) * 100:+.1f}% vs sold" if floor else ""
+    return (head + f"\nSold median **{k(fair)}** ({st['n24']} sales in 24 h, {st['n']} in 4 days, ±{st['sigma_pct']:.1f}%){under}"
+            f"\nMax bid: {bids}" + ("\n⚠️ thin: fewer than 4 sales in 24 h" if st["n24"] < 4 else ""))
+
+
 def held_cards(db) -> dict[str, int | None]:
     """purchased.json plus the cards you reported in the channel (the file wins on a clash)."""
     out = load_purchased()
@@ -2679,12 +2708,20 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
                 print("[warn] bot sees empty message text: switch on the Message Content intent in the Developer Portal")
             continue
         parsed = parse_held_message(text)
+        forced = True
         if not parsed:
-            continue
+            q = parse_quote(text)
+            if not q:
+                continue
+            parsed, forced = ("quote", q[0], None, None), q[1]
         action, query, price, target = parsed
         cid, why = resolve_card(query)
         if not cid:
+            if action == "quote" and not forced and why.startswith(("no card found", "empty")):
+                continue                                   # ordinary chat, not a card
             reply = f"❓ {why}"
+        elif action == "quote":
+            reply = quote_reply(db, cid, now)
         elif action == "sold":
             db.execute("delete from held where card_id=?", (cid,))
             reply = f"👋 Stopped tracking **{_card_label(cid)}**."
