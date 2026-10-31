@@ -222,6 +222,10 @@ With a Discord bot in the alert channel (`DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_I
 Type in the alert channel (the bot replies to each message):
 - **Buy:** `Carpenter, holo totw, 43k` (optional 2nd number = your sell target; optional words `snipe`, `bid`, `bin`, `alert`, `own`, `flip` are stored as a note on how you got it). Opens the tracked position of 5.6b and also saves the **market context** at that moment: floor, 4-day sold median, how far under it you bought, sales in 24 h / 4 days, which list the card is on (volume / premium / general), price band, promo, holo, and the last scanner alert for that card in the previous 6 h (kind, age, price).
 - **Sell:** `sold Carpenter, holo totw, 47k` closes it and stores a row in table `trades` (buy/sell price and time, net after the 5 % tax with no extra haircut, profit in coins, hold time, context, note). The bot replies with the result. `sold Name` without a price only stops tracking (nothing recorded). A sale without an open buy is refused with a hint.
+- **Manual times** (units `m`/`min`, `h`/`hr`, `d`; always with `ago` or `held`, because a bare `30m` means 30 million coins):
+  - `Carpenter, holo totw, 43k 2h ago`: you bought it 2 hours before typing (buy time and the alert lookup use that moment).
+  - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
+  - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
 - **`trades`** (or `trades 30` for 30 days; default 7): summary of closed trades: profit, median net, win %, median hold; split by source (alert kind / note / own find), list, price band, promo; and how far under the sold price you bought.
 - **`undo`** reverts your last logged buy or sale.
 - Purpose: realized results (not hypothetical floor prices) to tune the scanner later: per-alert-type value, slippage between the alert price and your fill, which groups you actually profit on, and what your own finds have in common. Needs a few dozen trades before the numbers mean much. Trades are kept in the database indefinitely.
