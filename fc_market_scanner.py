@@ -2810,7 +2810,31 @@ def quote_reply(db, cid: str, now: float) -> str:
             f"\nMax bid: {bids}" + ("\n⚠️ thin: fewer than 4 sales in 24 h" if st["n24"] < 4 else ""))
 
 
-def buy_context(db, cid: str, price: int, now: float) -> dict:
+_UNIT_S = {"m": 60, "min": 60, "mins": 60, "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+           "d": 86400, "day": 86400, "days": 86400}
+_DUR = r"(\d+(?:[.,]\d+)?)\s*(min|mins|m|hours|hour|hrs|hr|h|days|day|d)\b"
+
+
+def _dur_s(num: str, unit: str) -> float:
+    return float(num.replace(",", ".")) * _UNIT_S[unit.lower()]
+
+
+def extract_times(text: str):
+    """Pull manual times out of a trade message: '2h ago' (when it happened) and 'held 3h' (hold time).
+    -> (text without them, seconds ago | None, hold seconds | None)."""
+    ago = held = None
+    m = re.search(r"(?i)\b" + _DUR + r"\s+ago\b", text)
+    if m:
+        ago = _dur_s(m.group(1), m.group(2))
+        text = text[:m.start()] + " " + text[m.end():]
+    m = re.search(r"(?i)\b(?:held|hold|for)\s+" + _DUR, text)
+    if m:
+        held = _dur_s(m.group(1), m.group(2))
+        text = text[:m.start()] + " " + text[m.end():]
+    return text, ago, held
+
+
+def buy_context(db, cid: str, price: int, now: float, at: float | None = None) -> dict:
     """The market around a buy: used to tune the scanner from the trades you log."""
     pl = _load_players().get(int(cid)) if cid.isdigit() else None
     row = db.execute("select price from prices where card_id=? order by ts desc limit 1", (cid,)).fetchone()
@@ -2821,13 +2845,13 @@ def buy_context(db, cid: str, price: int, now: float) -> dict:
     val = max(price, fair or 0)
     premium = val >= (100_000 if ("Icon" in rar or "Hero" in rar) else 300_000)
     lst = "volume" if cid in _VOL_AUTO else "premium" if premium else "general"
-    a = db.execute("select kind, ts, price from alerts where card_id=? and ts>=? and kind not in ('owned') "
-                   "order by ts desc limit 1", (cid, now - 6 * 3600)).fetchone()
+    a = db.execute("select kind, ts, price from alerts where card_id=? and ts>=? and ts<=? and kind not in ('owned') "
+                   "order by ts desc limit 1", (cid, (at or now) - 6 * 3600, (at or now) + 60)).fetchone()
     return {"floor": floor, "fair": fair, "n24": st["n24"] if st else 0, "n96": st["n"] if st else 0,
             "under_sold": round((fair - price) / fair * 100, 1) if fair else None,
             "list": lst, "band": price_band(price), "rarity": rar,
             "holo": bool(pl and int(cid) in _load_holo(_load_players())), "ovr": pl["overall"] if pl else None,
-            "alert": a[0] if a else None, "alert_age_min": round((now - a[1]) / 60) if a else None,
+            "alert": a[0] if a else None, "alert_age_min": round(((at or now) - a[1]) / 60) if a else None,
             "alert_price": a[2] if a else None}
 
 
@@ -2968,6 +2992,29 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
             continue
+        hm = re.fullmatch(r"(?i)(?:hold|held)\s+(.+?)[,\s]+" + _DUR, text.strip())
+        if hm:                                             # fix the hold time of your last trade in that card
+            cid_h, why_h = resolve_card(hm.group(1))
+            if not cid_h:
+                reply = f"❓ {why_h}"
+            else:
+                tr = db.execute("select id, sell_ts, buy_price, sell_price from trades where card_id=? order by id desc limit 1",
+                                (cid_h,)).fetchone()
+                if not tr:
+                    reply = f"❓ No closed trade for **{_card_label(cid_h)}** yet."
+                else:
+                    hs = _dur_s(hm.group(2), hm.group(3))
+                    db.execute("update trades set hold_h=?, buy_ts=? where id=?", (hs / 3600, tr[1] - hs, tr[0]))
+                    reply = f"🕒 **{_card_label(cid_h)}**: hold time set to **{hs / 3600:.1f} h** on your last trade."
+            db.commit()
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": reply[:1900], "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
+        text, ago_s, held_s = extract_times(text)
         parsed = parse_held_message(text)
         forced = True
         if not parsed:
@@ -2993,12 +3040,15 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
                          f"(then `sold {query}, {k(price)}`).")
             else:
                 buy, tgt0, bts, ctx, bnote = row
+                sell_ts = now - (ago_s or 0)
+                if held_s is not None:
+                    bts = sell_ts - held_s                    # hold time typed by you wins over the clock
                 net = (price * (1 - EA_TAX) / buy - 1) * 100
                 profit = int(price * (1 - EA_TAX) - buy)
-                hold = (now - bts) / 3600
+                hold = max(0.0, (sell_ts - bts) / 3600)
                 cur = db.execute("insert into trades(card_id, buy_price, buy_ts, sell_price, sell_ts, net, profit, hold_h, ctx, note) "
                                  "values (?,?,?,?,?,?,?,?,?,?)",
-                                 (cid, buy, bts, price, now, net, profit, hold, ctx, " ".join(x for x in (bnote, note) if x) or None))
+                                 (cid, buy, bts, price, sell_ts, net, profit, hold, ctx, " ".join(x for x in (bnote, note) if x) or None))
                 db.execute("delete from held where card_id=?", (cid,))
                 set_meta(db, "last_action", json.dumps({"t": "sell", "trade": cur.lastrowid, "card": cid,
                                                         "held": [cid, buy, tgt0, bts, ctx, bnote]}))
@@ -3007,9 +3057,10 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
                          f"({profit:+,} coins) · held {hs}\nSaved to your trade journal (`trades` shows the summary, `undo` reverts this).")
         else:
             prev = db.execute("select * from held where card_id=?", (cid,)).fetchone()
-            ctx = buy_context(db, cid, price, now)
+            buy_ts = now - (ago_s or 0)                       # "2h ago": you bought it earlier than you typed it
+            ctx = buy_context(db, cid, price, now, at=buy_ts)
             db.execute("insert or replace into held(card_id, price, target, ts, ctx, note) values (?,?,?,?,?,?)",
-                       (cid, price, target, now, json.dumps(ctx), note))
+                       (cid, price, target, buy_ts, json.dumps(ctx), note))
             set_meta(db, "last_action", json.dumps({"t": "buy", "card": cid, "prev": list(prev) if prev else None}))
             st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
             floor_t = price / (1 - EA_TAX) * (1 + OWNED_MIN_NET / 100)
