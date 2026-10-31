@@ -218,6 +218,14 @@ With a Discord bot in the alert channel (`DISCORD_BOT_TOKEN`, `DISCORD_CHANNEL_I
 - Stored in table `held` (14 days) and merged with `purchased.json` (the file wins on a clash), so the cards use the same sell alerts as 5.6: 💰 Sell Now at your target (else fair value, at least +3 % net) and 🚀 Spiked.
 - **With the bot configured, every post (alerts, reports, status line) goes out through the bot**, so there is one sender; if a bot post fails it is sent through the webhook instead (`DISCORD_WEBHOOK_URL` stays required as the fallback). Without the bot variables everything uses the webhook and the typing feature is off. The bot's name and picture are set in the Developer Portal.
 
+### 5.6c Trade journal (log what you bought and sold)
+Type in the alert channel (the bot replies to each message):
+- **Buy:** `Carpenter, holo totw, 43k` (optional 2nd number = your sell target; optional words `snipe`, `bid`, `bin`, `alert`, `own`, `flip` are stored as a note on how you got it). Opens the tracked position of 5.6b and also saves the **market context** at that moment: floor, 4-day sold median, how far under it you bought, sales in 24 h / 4 days, which list the card is on (volume / premium / general), price band, promo, holo, and the last scanner alert for that card in the previous 6 h (kind, age, price).
+- **Sell:** `sold Carpenter, holo totw, 47k` closes it and stores a row in table `trades` (buy/sell price and time, net after the 5 % tax with no extra haircut, profit in coins, hold time, context, note). The bot replies with the result. `sold Name` without a price only stops tracking (nothing recorded). A sale without an open buy is refused with a hint.
+- **`trades`** (or `trades 30` for 30 days; default 7): summary of closed trades: profit, median net, win %, median hold; split by source (alert kind / note / own find), list, price band, promo; and how far under the sold price you bought.
+- **`undo`** reverts your last logged buy or sale.
+- Purpose: realized results (not hypothetical floor prices) to tune the scanner later: per-alert-type value, slippage between the alert price and your fill, which groups you actually profit on, and what your own finds have in common. Needs a few dozen trades before the numbers mean much. Trades are kept in the database indefinitely.
+
 ### 5.7 🗞 12-hour summary (7am and 7pm Austin)
 Posted automatically twice a day (`FC_SUMMARY_HOURS`, default `7,19`; empty = off). Everything compares each card with **its own price 12 h ago** (unchained, so no index drift) over *liquid* cards (≥ 30 inferred sales in 4 days, ≥ 15k, not muted-new):
 - **Market**: median move, share of cards rising and card count per segment (All specials, Icons, Heroes, TOTW, Other promos, Holos), plus the median of the muted new cards.
