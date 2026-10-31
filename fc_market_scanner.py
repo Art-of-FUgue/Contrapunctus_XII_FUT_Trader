@@ -35,6 +35,7 @@ How it works
      periods above and posted as Discord embeds.
 """
 import argparse
+import collections
 import json
 import math
 import os
@@ -399,6 +400,11 @@ def open_db(path: str) -> sqlite3.Connection:
         db.execute("alter table watch_positions add column warned int default 0")
     db.execute("create table if not exists alerts(card_id text, kind text, ts real, price int)")
     db.execute("create table if not exists held(card_id text primary key, price int, target int, ts real)")
+    for col, typ in (("ctx", "text"), ("note", "text")):
+        if col not in {r[1] for r in db.execute("pragma table_info(held)")}:
+            db.execute(f"alter table held add column {col} {typ}")
+    db.execute("create table if not exists trades(id integer primary key autoincrement, card_id text, buy_price int, "
+               "buy_ts real, sell_price int, sell_ts real, net real, profit int, hold_h real, ctx text, note text)")
     return db
 
 
@@ -2739,14 +2745,21 @@ def _num(s: str) -> int | None:
     return int(v * {"": 1, "k": 1e3, "m": 1e6}[m.group(2).lower()])
 
 
+NOTE_WORDS = {"snipe", "sniped", "bid", "bin", "alert", "own", "flip"}   # how you got it: stored as a note
+
+
 def parse_held_message(text: str):
-    """-> (action, query, price, target) or None when the message is not about a card."""
+    """-> (action, query, price, target[, note]) or None when the message is not about a card.
+    sold: ('sold', query, sell price or None, None, note)."""
     t = text.strip()
     sold = re.match(r"(?i)^sold\b[\s:,-]*", t)
     if sold:
         t = t[sold.end():]
     else:
         t = re.sub(r"(?i)^(bought|got|bid)\b[\s:,-]*", "", t)
+    note = [w.lower() for w in re.findall(r"[A-Za-z]+", t) if w.lower() in NOTE_WORDS]
+    if note:
+        t = re.sub(r"(?i)\b(" + "|".join(NOTE_WORDS) + r")\b", " ", t)
     words_l, nums = [], []
     for x in re.split(r"[,;\n]", t):
         toks = x.split()
@@ -2762,9 +2775,10 @@ def parse_held_message(text: str):
     words = " ".join(words_l)
     if not words or (not sold and not nums):
         return None
+    note_s = " ".join(note) or None
     if sold:
-        return "sold", words, None, None
-    return "bought", words, nums[0], (nums[1] if len(nums) > 1 else None)
+        return "sold", words, (nums[0] if nums else None), None, note_s
+    return "bought", words, nums[0], (nums[1] if len(nums) > 1 else None), note_s
 
 
 def parse_quote(text: str):
@@ -2794,6 +2808,74 @@ def quote_reply(db, cid: str, now: float) -> str:
     under = f" · floor {(floor / fair - 1) * 100:+.1f}% vs sold" if floor else ""
     return (head + f"\nSold median **{k(fair)}** ({st['n24']} sales in 24 h, {st['n']} in 4 days, ±{st['sigma_pct']:.1f}%){under}"
             f"\nMax bid: {bids}" + ("\n⚠️ thin: fewer than 4 sales in 24 h" if st["n24"] < 4 else ""))
+
+
+def buy_context(db, cid: str, price: int, now: float) -> dict:
+    """The market around a buy: used to tune the scanner from the trades you log."""
+    pl = _load_players().get(int(cid)) if cid.isdigit() else None
+    row = db.execute("select price from prices where card_id=? order by ts desc limit 1", (cid,)).fetchone()
+    floor = row[0] if row else None
+    st = sm.sale_stats(db, cid, now, 96, 24)
+    fair = int(st["fair"]) if st and st["n"] >= 4 else None
+    rar = pl["rarityName"] if pl else "?"
+    val = max(price, fair or 0)
+    premium = val >= (100_000 if ("Icon" in rar or "Hero" in rar) else 300_000)
+    lst = "volume" if cid in _VOL_AUTO else "premium" if premium else "general"
+    a = db.execute("select kind, ts, price from alerts where card_id=? and ts>=? and kind not in ('owned') "
+                   "order by ts desc limit 1", (cid, now - 6 * 3600)).fetchone()
+    return {"floor": floor, "fair": fair, "n24": st["n24"] if st else 0, "n96": st["n"] if st else 0,
+            "under_sold": round((fair - price) / fair * 100, 1) if fair else None,
+            "list": lst, "band": price_band(price), "rarity": rar,
+            "holo": bool(pl and int(cid) in _load_holo(_load_players())), "ovr": pl["overall"] if pl else None,
+            "alert": a[0] if a else None, "alert_age_min": round((now - a[1]) / 60) if a else None,
+            "alert_price": a[2] if a else None}
+
+
+def journal_text(db, days: int = 7) -> str:
+    """Realized results of the trades you logged: by how you found them, list, price band and rarity."""
+    since = time.time() - days * 86400
+    rows = db.execute("select net, profit, hold_h, ctx, note, card_id from trades where sell_ts>=?", (since,)).fetchall()
+    open_n = db.execute("select count(*) from held").fetchone()[0]
+    if not rows:
+        return f"📒 No closed trades in the last {days} days ({open_n} open). Log a sale with `sold Name, promo, price`."
+    nets = [r[0] for r in rows]
+    tot = sum(r[1] for r in rows)
+    lines = [f"📒 **Your trades · last {days} d** · {len(rows)} closed ({open_n} open)",
+             f"Profit **{tot:+,}** coins after tax · median net {(_med(nets) or 0):+.1f}% · win {sum(x > 0 for x in nets) / len(nets) * 100:.0f}% "
+             f"· median hold {(_med([r[2] for r in rows]) or 0):.1f} h"]
+    ctxs = [(json.loads(r[3] or "{}"), r) for r in rows]
+
+    def split(title, keyf):
+        g = collections.defaultdict(list)
+        for c, r in ctxs:
+            g[keyf(c, r)].append(r[0])
+        parts = [f"{k_}: {len(v)} · {(_med(v) or 0):+.1f}%" for k_, v in sorted(g.items(), key=lambda kv: -len(kv[1]))]
+        lines.append(f"{title}: " + " | ".join(parts))
+    split("By source", lambda c, r: ("alert: " + c["alert"]) if c.get("alert") else (r[4] or "own find"))
+    split("By list", lambda c, r: c.get("list", "?"))
+    split("By price", lambda c, r: c.get("band", "?"))
+    split("By promo", lambda c, r: str(c.get("rarity", "?")).replace("Team of the week", "TOTW") + (" holo" if c.get("holo") else ""))
+    under = [c["under_sold"] for c, r in ctxs if c.get("under_sold") is not None]
+    if under:
+        lines.append(f"You bought a median **{_med(under):+.1f}%** under the 4-day sold price")
+    return "\n".join(lines)[:1900]
+
+
+def undo_last(db) -> str:
+    """Revert the last buy/sell you logged."""
+    la = get_meta(db, "last_action")
+    if not la:
+        return "Nothing to undo."
+    a = json.loads(la)
+    set_meta(db, "last_action", "")
+    if a["t"] == "buy":
+        db.execute("delete from held where card_id=?", (a["card"],))
+        if a.get("prev"):
+            db.execute("insert or replace into held values (?,?,?,?,?,?)", a["prev"])
+        return f"↩️ Removed your last buy of **{_card_label(a['card'])}**" + (" (the earlier entry is back)." if a.get("prev") else ".")
+    db.execute("delete from trades where id=?", (a["trade"],))
+    db.execute("insert or replace into held(card_id, price, target, ts, ctx, note) values (?,?,?,?,?,?)", a["held"])
+    return f"↩️ Reopened **{_card_label(a['card'])}**: the sale was removed from the journal."
 
 
 def held_cards(db) -> dict[str, int | None]:
@@ -2866,33 +2948,77 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             _webhook_note(db, "bot_intent_note", "🤖 The bot sees your message but not its text: switch on **Message Content Intent** "
                           "(Developer Portal → your app → Bot → Privileged Gateway Intents), save, and type again.")
             continue
+        low = text.strip(" !?.").lower()
+        if low == "undo":
+            reply = undo_last(db)
+            db.commit()
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": reply[:1900], "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
+        jm = re.fullmatch(r"(?:trades|journal)(?:\s+(\d{1,3}))?", low)
+        if jm:
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": journal_text(db, int(jm.group(1) or 7)), "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
         parsed = parse_held_message(text)
         forced = True
         if not parsed:
             q = parse_quote(text)
             if not q:
                 continue
-            parsed, forced = ("quote", q[0], None, None), q[1]
-        action, query, price, target = parsed
+            parsed, forced = ("quote", q[0], None, None, None), q[1]
+        action, query, price, target, note = parsed
         cid, why = resolve_card(query)
         if not cid:
-            if action == "quote" and not forced and why.startswith(("no card found", "empty")):
+            if action == "quote" and not forced and (why.startswith(("no card found", "empty")) or len(query) < 4):
                 continue                                   # ordinary chat, not a card
             reply = f"❓ {why}"
         elif action == "quote":
             reply = quote_reply(db, cid, now)
         elif action == "sold":
-            db.execute("delete from held where card_id=?", (cid,))
-            reply = f"👋 Stopped tracking **{_card_label(cid)}**."
+            row = db.execute("select price, target, ts, ctx, note from held where card_id=?", (cid,)).fetchone()
+            if price is None:
+                db.execute("delete from held where card_id=?", (cid,))
+                reply = f"👋 Stopped tracking **{_card_label(cid)}** (no sell price given, so no trade was recorded)."
+            elif not row or not row[0]:
+                reply = (f"❓ No open buy for **{_card_label(cid)}**. Log it first: `bought {query}, <price>` "
+                         f"(then `sold {query}, {k(price)}`).")
+            else:
+                buy, tgt0, bts, ctx, bnote = row
+                net = (price * (1 - EA_TAX) / buy - 1) * 100
+                profit = int(price * (1 - EA_TAX) - buy)
+                hold = (now - bts) / 3600
+                cur = db.execute("insert into trades(card_id, buy_price, buy_ts, sell_price, sell_ts, net, profit, hold_h, ctx, note) "
+                                 "values (?,?,?,?,?,?,?,?,?,?)",
+                                 (cid, buy, bts, price, now, net, profit, hold, ctx, " ".join(x for x in (bnote, note) if x) or None))
+                db.execute("delete from held where card_id=?", (cid,))
+                set_meta(db, "last_action", json.dumps({"t": "sell", "trade": cur.lastrowid, "card": cid,
+                                                        "held": [cid, buy, tgt0, bts, ctx, bnote]}))
+                hs = f"{hold:.1f} h" if hold < 48 else f"{hold / 24:.1f} d"
+                reply = (f"💰 **{_card_label(cid)}** · bought {k(buy)} → sold {k(price)} · **{net:+.1f}%** net after tax "
+                         f"({profit:+,} coins) · held {hs}\nSaved to your trade journal (`trades` shows the summary, `undo` reverts this).")
         else:
-            db.execute("insert or replace into held values (?,?,?,?)", (cid, price, target, now))
-            c = cards_map.get(cid)
+            prev = db.execute("select * from held where card_id=?", (cid,)).fetchone()
+            ctx = buy_context(db, cid, price, now)
+            db.execute("insert or replace into held(card_id, price, target, ts, ctx, note) values (?,?,?,?,?,?)",
+                       (cid, price, target, now, json.dumps(ctx), note))
+            set_meta(db, "last_action", json.dumps({"t": "buy", "card": cid, "prev": list(prev) if prev else None}))
             st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
             floor_t = price / (1 - EA_TAX) * (1 + OWNED_MIN_NET / 100)
             tgt = target or (max(st["fair"], floor_t) if st and st["n"] >= 4 else floor_t)
             reply = (f"✅ Tracking **{_card_label(cid)}** · bought {k(price)} · sell alert at **{k(tgt)}**"
                      + (" (your target)" if target else " (4-day sold, at least +3% net)" if st and st["n"] >= 4 else " (+3% net)")
-                     + (f" · floor now {k(c.price)}" if c else ""))
+                     + (f" · floor now {k(ctx['floor'])}" if ctx.get("floor") else "")
+                     + (f"\nContext saved: {ctx['list']} list" + (f", {ctx['under_sold']:+.1f}% under 4-day sold" if ctx.get("under_sold") is not None else "")
+                        + (f", after a {ctx['alert']} alert {ctx['alert_age_min']} min ago" if ctx.get("alert") else ", no alert for it")))
         db.commit()
         try:
             _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
