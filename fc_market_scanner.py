@@ -2675,7 +2675,7 @@ def compute_regime(db, cards, now: float) -> dict:
     return out
 
 
-def _depth_bin(d: float) -> str:
+def _shadow_depth(d: float) -> str:
     d = abs(d)
     return "8-10" if d < 10 else "10-15" if d < 15 else "15+"
 
@@ -2692,7 +2692,7 @@ def record_shadow(db, items, regime: dict, now: float) -> None:
         need = vol_req if kind == "volume" else fast_req
         under = f.get("under")
         l1 = (-rel >= need) and (kind == "volume" or f.get("liquid") or under is None or under >= under_req)
-        key = f"{kind}|{grp}|{_depth_bin(rel)}"
+        key = f"{kind}|{grp}|{_shadow_depth(rel)}"
         g = gates.get(key)
         l2 = 1 if (not g or g[0]) else 0
         why = []
@@ -2736,7 +2736,7 @@ def update_gates(db, now: float) -> None:
     buckets = collections.defaultdict(list)
     for kind, grp, drop, x3 in db.execute("select kind, grp, drop_pct, x3 from shadow_alerts where x3 is not null and x3 != 999 "
                                           "and ts >= ?", (now - GATE_WINDOW_H * 3600,)):
-        buckets[f"{kind}|{grp}|{_depth_bin(drop)}"].append(x3)
+        buckets[f"{kind}|{grp}|{_shadow_depth(drop)}"].append(x3)
     for key, v in buckets.items():
         med = statistics.median(v)
         if len(v) < GATE_MIN_N:
