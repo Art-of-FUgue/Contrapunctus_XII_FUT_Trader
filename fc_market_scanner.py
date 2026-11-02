@@ -753,12 +753,13 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
         lines.append(f"{d.get('icon', '🎯')} `{d['pct']:+.1f}%` · {d['why']}{d.get('extra', '')}{open_link(c)}")
         if d.get("target"):
             lines.append(f"↳ {d['target']}")
+        lines.append(facts_line(c))
         if d.get("est_ts"):
             eh = d["est_hours"]
             eh_str = f"{eh:.1f}h" if eh % 1 != 0 else f"{int(eh)}h"
             lines.append(f"↳ ⏱ est. sell <t:{int(d['est_ts'])}:t> (~{eh_str}, <t:{int(d['est_ts'])}:R>)")
         lines.append(name_block(c))
-    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched"]
+    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched", BEH_LEGEND]
     e = {"title": f"🎯 Watchlist Buy Signal · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
          "footer": {"text": f"Buy signal: {AUTO_DIP_PCT:.0f}%+ under 24 h median · "
@@ -1342,6 +1343,7 @@ def build_dips(items) -> list[dict]:
             first = first or c
             lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
             lines.append(f"{tier_emoji(pct)} `{pct:+.1f}%` · vs {k(s['ref'])} **{COMPARE_HOURS} h ago**{_sell_text(s)}{open_link(c)}")
+            lines.append(facts_line(c))
             lines.append(name_block(c))
     lines += ["", "🔴 15%+ · 🟠 12–15% · 🟢 8–12% below"]
     e = {"title": f"📉 Dip Alert · vs {COMPARE_HOURS} h ago · {PLATFORM_LABEL}",
@@ -1373,14 +1375,44 @@ def build_spikes(items) -> list[dict]:
     return [e]
 
 
-def drop_tier(c: Card, beh: str | None, under: float, fair: float) -> str:
-    """Hint line for a fast drop: how far the new floor sits under the 4-day sold median (🟢 8%+, 🟡 5-8%;
-    past 5 s+ drops paid +27% net at 8%+ and about break-even under 5%), plus size, behaviour type, holo."""
+# ---- one common shape for every buy alert ---------------------------------------------------------------------
+#   ### price · name · promo
+#   <trigger line: what moved>
+#   ↳ <target line: where to sell, net after tax, break-even>
+#   ↳ 🏷 <card type> · <list> · <size> · <sales/24 h>
+#   name code block
+_FACTS: dict[str, dict] = {}
+BEH_LEGEND = "🏷 Active = floor moves often · Mixed · Quiet = floor rarely moves"
+
+
+def fill_facts(db, items, beh_types: dict, vol: set, watch: set, now: float) -> None:
+    """Card type, list and sales rate of every card that is about to be alerted."""
+    _FACTS.clear()
+    for c in items:
+        if c.card_id in _FACTS:
+            continue
+        st = sm.sale_stats(db, c.card_id, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+        lst = ("watchlist" if c.card_id in watch else "volume" if c.card_id in vol
+               else "premium" if _in_premium_list(c) else "general")
+        _FACTS[c.card_id] = {"beh": beh_types.get(c.card_id), "list": lst, "n24": st["n24"] if st else 0,
+                             "fair": st["fair"] if st and st["n"] >= 4 else None}
+
+
+def facts_line(c: Card) -> str:
+    f = _FACTS.get(c.card_id, {})
     size = "<40k" if c.price < 40_000 else "40–100k" if c.price < 100_000 else "100k+"
+    return (f"↳ 🏷 **{f.get('beh') or 'type n/a'}** · {f.get('list', '?')}{'' if f.get('list') == 'watchlist' else ' list'} · {size} · "
+            f"{f.get('n24', 0)} sales/24 h" + (" · holo" if "Holo" in c.kind else ""))
+
+
+def drop_tier(c: Card, beh: str | None, under: float, fair: float) -> str:
+    """Target line of a fast / volume drop: where the new floor sits against the 4-day sold median
+    (🟢 8%+ under, 🟡 5-8%, ⚪ liquid card with no sold filter; past 8%+ drops paid +27% net at 3 h),
+    the net if sold there after tax, and the break-even price."""
     mark = "🟢" if under >= 8 else "🟡" if under >= FAST_MIN_UNDER_SOLD else "⚪"
     rel = f"{under:.0f}% under" if under >= 0 else f"{-under:.0f}% over"
-    return (f"{mark} **{rel}** 4-day sold {k(fair)}{' · liquid, flip fast' if mark == '⚪' else ''} · {size} · {beh or 'type unknown'}"
-            + (" · holo" if "Holo" in c.kind else ""))
+    net = (fair * (1 - EA_TAX) / c.price - 1) * 100
+    return (f"{mark} **{rel}** 4-day sold {k(fair)} · 🎯 net {net:+.1f}% at sold · break-even {k(c.price / (1 - EA_TAX))}")
 
 
 def build_flashes(spike_items, dip_items) -> list[dict]:
@@ -1410,19 +1442,21 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             grp = _limit(sorted(grp, key=lambda i: i[2]))             # deepest first
             lines += ["", _group_header(kind, len(grp))]
             for c, f, pct in grp:
-                lines.append(f"### ~~{k(f['prev_price'])}~~ → {k(c.price)} · {c.name} · {c.kind}")
+                lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
                 ago = f" ({f['age_min']:.0f} min ago)" if f.get("age_min") else ""
-                lines.append(f"📉 `{pct:.1f}%` · vs **{w}**{ago}{open_link(c)}"
-                             + (f"\n↳ {f['tier']}" if f.get("tier") else ""))
+                lines.append(f"📉 `{pct:.1f}%` · was **{k(f['prev_price'])}** at {w}{ago}{open_link(c)}")
+                if f.get("tier"):
+                    lines.append(f"↳ {f['tier']}")
+                lines.append(facts_line(c))
                 lines.append(name_block(c))
         if vol:
             lines += ["", "Volume list: high-turnover cards (automatic), no sold-median filter · "
-                          "small margin, quick flip"]
+                          "small margin, quick flip", BEH_LEGEND]
             title, color, foot = f"📦 Volume Drop · vs {w} · {PLATFORM_LABEL}", 0x3498DB, \
                 f"Volume Drop · {FAST_VOLUME_DIP_PCT:.0f}%+ below {w}"
         else:
             lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted (cards with ≥{FAST_LIQUID_N24} sales/24 h excepted) · "
-                          "🟢 8%+ under (best past results) · 🟡 5–8% under · ⚪ no sold filter"]
+                          "🟢 8%+ under (best past results) · 🟡 5–8% under · ⚪ no sold filter", BEH_LEGEND]
             title, color, foot = f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", 0x1ABC9C, \
                 f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"
         e = {"title": title, "description": "\n".join(lines), "color": color, "footer": {"text": foot}}
@@ -1459,8 +1493,7 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
         lines += ["", _group_header(kind, len(grp))]
         for c, s in grp:
             first = first or c
-            head = f"{k(c.price)} · {c.name} · {c.kind}"
-            lines.append(f"### 🚨 **{head}**" if hot else f"### {head}")
+            lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
             lines.append(
                 f"{net_tier(s['net']) if 'net' in s else tier_emoji(s['dip_pct'])} `{s['dip_pct']:+.1f}%` · "
                 f"vs {_premium_ref(s)} {k(s['sales_median'])}"
@@ -1468,7 +1501,9 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
                 f"{_sell_text(s)}{open_link(c)}"
             )
             lines.append(f"↳ {target_line(c.price, s['sales_median'], _premium_ref(s).strip('*'))}")
+            lines.append(facts_line(c))
             lines.append(name_block(c))
+    lines += ["", BEH_LEGEND]
     if hot:
         lines += ["", "vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%"]
     else:
@@ -2450,6 +2485,11 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         spikes = fresh_spikes(db, spikes, now, "spike")
         flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
     auto_watch_update(db, cards, now, muted_new | (watch - auto))   # auto picks are re-screened each time
+    try:
+        fill_facts(db, [c for c, *_ in dips] + [c for c, *_ in flash_dips] + [c for c, *_ in premium_dips]
+                   + [c for c, *_ in watch_hits], beh_types, vol_list, watch | auto, now)
+    except Exception as e:
+        print(f"[warn] card facts failed: {e}")
     embeds = (
         build_dips(dips)
         + (build_spikes(spikes) if spikes_on else [])

@@ -150,6 +150,14 @@ median move is subtracted, so a market-wide slide does not look like 200 separat
 `EA_TAX = 5 %`. "Net" always means profit after the 5 % tax. Alert order in Discord: dips, fast drops, volume drops, premium
 dips, watchlist buy, watchlist sell, owned-card alerts, then the red premium alert **last** (so it sits at the bottom, where you look first).
 
+### 5.0 One common shape for buy alerts
+Fast Drop, Volume Drop, Premium Dip, Premium below 4-day sold and Watchlist Buy (and the off-by-default 6 h dip) all show a card in the same four lines:
+1. `### price · name · promo` (watch alerts add ⭐ / 🔁)
+2. **Trigger**: what moved, e.g. `📉 -8.5% · was 38.2k at the previous update (5 min ago)` or `🟠 -12% · vs 24 h median / 4-day sold …` with `[open]`.
+3. **Target**: `↳` where to sell: the sold (or 24 h median) price, net after tax and break-even. Fast / Volume drops show it with 🟢 / 🟡 / ⚪ for how far under the 4-day sold price the floor is.
+4. **Card facts**: `↳ 🏷 Active|Mixed|Quiet · volume|premium|general|watchlist list · size · sales/24 h · holo`. Active = the floor moves often, Quiet = it rarely moves, `type n/a` = not classified yet (too few snapshots). Filled at scan time for every alerted card (`fill_facts`).
+Then the player name in a code block (copy button). Watchlist Buy adds its estimated-sell-time line between the facts and the name.
+
 ### 5.1 📉 Dip Alert · vs 6 h ago (regular cards) — **OFF by default** (`FC_DIP6H_ALERTS=1` turns it back on)
 Turned off because 6 h dips did not pay after tax in practice, **but the rule still runs silently**: every 6 h dip is scored and logged to `outcomes` (floor 1/3/6 h later), and each dip-ledger event stores its `d6` (% vs the 6 h-ago reference) so longer-hold / buy-window research keeps its data. When on:
 - Reference = median of the hour before "6 h ago" (needs ≥ 12 snapshots in 24 h).
@@ -162,7 +170,7 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 - Reference = the price at the previous fut.gg update (median of the snapshots in the last `FC_FLASH_WINDOW_MIN` minutes, default 1, else the newest earlier snapshot). **fut.gg publishes new prices only about every 5–6 minutes** (measured: median spacing 6 min, 90 % under 7 min), so in practice this is "the drop since the last update" and each line shows how many minutes ago that was. Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
 - **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) skips this filter, because it can be flipped right away. The hint line of such a card shows ⚪ and how far the floor sits from the sold median.
-- **Hint line:** 🟢 8 %+ under sold · 🟡 5–8 % under, with the sold price, size (<40k / 40–100k / 100k+), behaviour type and "holo".
+- **Hint lines** (see 5.0): 🟢 8 %+ under sold · 🟡 5–8 % under · ⚪ liquid / volume card with no sold filter, then the card-facts line (behaviour type, list, size, sales/24 h, holo).
 - Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
 
 ### 5.2b 📦 Volume Drop · vs the previous price update (volume list)
