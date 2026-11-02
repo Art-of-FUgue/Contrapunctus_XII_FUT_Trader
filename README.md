@@ -234,6 +234,7 @@ Type in the alert channel (the bot replies to each message):
   - `Carpenter, holo totw, 43k 2h ago`: you bought it 2 hours before typing (buy time and the alert lookup use that moment).
   - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
   - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
+- **`shadow`**: report of the adaptive-criteria shadow mode (5.10).
 - **`trades`** (or `trades 30` for 30 days; default 7): summary of closed trades: profit, median net, win %, median hold; split by source (alert kind / note / own find), list, price band, promo; and how far under the sold price you bought.
 - **`undo`** reverts your last logged buy or sale.
 - Purpose: realized results (not hypothetical floor prices) to tune the scanner later: per-alert-type value, slippage between the alert price and your fill, which groups you actually profit on, and what your own finds have in common. Needs a few dozen trades before the numbers mean much. Trades are kept in the database indefinitely.
@@ -256,6 +257,12 @@ Equal-weighted, chain-linked price basket (cards ≥ 10k, ≥ 5 cards per step) 
 - Per-scan "🔄 scan ran" status line in Discord (`FC_NOTIFY_EACH_RUN`).
 
 ---
+
+### 5.10 Adaptive criteria (SHADOW MODE: records only, changes nothing)
+Every fast / volume alert is logged in `shadow_alerts` with what two adaptive layers would have done, plus its result 1 h and 3 h later (net after tax and haircut). Switch off with `FC_ADAPT_SHADOW=0`.
+- **Layer 1, market regime** (`regime` table, hourly): from established cards (≥ 10k, not muted-new) the mean 24 h move (clipped ±30 %), median 6 h / 24 h move and the share of changed cards that fell. `falling` = mean ≤ −1.5 % or ≥ 65 % falling; `soft` = mean ≤ −0.5 % or ≥ 55 %; else `calm`. Required drop for a fast drop / volume drop / minimum % under 4-day sold: calm 10 / 8 / 5, soft 12 / 10 / 6, falling 15 / 12 / 8.
+- **Layer 2, learned pausing** (`gate` table, hourly): alerts are bucketed by kind (fast / volume) × segment (Icons, Heroes, TOTW, Other promos, Holos) × depth (8–10, 10–15, 15+ %). A bucket is paused while the median 3 h net of its last 48 h of resolved alerts (all of them, passed or not, so there is no selection bias) is below +1 %, needs ≥ 12 resolved alerts to be judged, and resumes only at ≥ +2 % (hysteresis).
+- `would_pass` = both layers pass; `reason` says why not. The bot command `shadow` shows the market now, paused buckets, and the median 3 h net / win rate of the alerts that would stay vs be suppressed over the last 48 h. Plan: compare after 1–2 weeks and switch it on only if the suppressed alerts were clearly the worse ones.
 
 ## 6. The dynamic watchlist
 
