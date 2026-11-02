@@ -403,6 +403,12 @@ def open_db(path: str) -> sqlite3.Connection:
     for col, typ in (("ctx", "text"), ("note", "text")):
         if col not in {r[1] for r in db.execute("pragma table_info(held)")}:
             db.execute(f"alter table held add column {col} {typ}")
+    db.execute("create table if not exists regime(hour_ts integer primary key, mode text, med6 real, med24 real, "
+               "share_down real, n integer)")
+    db.execute("create table if not exists shadow_alerts(id integer primary key autoincrement, ts real, card_id text, "
+               "kind text, grp text, price int, drop_pct real, under real, mode text, l1 int, l2 int, would_pass int, "
+               "reason text, x1 real, x3 real)")
+    db.execute("create table if not exists gate(key text primary key, on_ int, med real, n int, ts real)")
     db.execute("create table if not exists trades(id integer primary key autoincrement, card_id text, buy_price int, "
                "buy_ts real, sell_price int, sell_ts real, net real, profit int, hold_h real, ctx text, note text)")
     return db
@@ -2594,10 +2600,15 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
                         if liquid or under >= FAST_MIN_UNDER_SOLD:      # drops that stay near/above sold lost money
-                            flash_dips.append((c, dict(f, vol=in_vol, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
+                            flash_dips.append((c, dict(f, vol=in_vol, under=under, liquid=liquid, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
+    try:
+        if ADAPT_SHADOW:
+            record_shadow(db, flash_dips, compute_regime(db, cards, now), now)   # shadow only: no alert is changed
+    except Exception as e:
+        print(f"[warn] shadow mode failed: {e}")
     premium_dips = fresh_dips(db, premium_dips, now, "prem")
 
     # chance of a sale within the horizon, and log each dip for later review (outcomes table)
@@ -2750,6 +2761,148 @@ def notice(text: str, dry_run: bool) -> None:
 def fmt_gap(seconds: float) -> str:
     m = int(seconds // 60)
     return f"{m}m" if m < 120 else f"{m // 60}h{m % 60:02d}m"
+
+
+
+# ---- adaptive criteria, SHADOW MODE ---------------------------------------------------------------------------
+# Layer 1 reads the market (how many established cards are falling) and says how deep a drop must be.
+# Layer 2 pauses a kind of alert (kind x promo group x depth) while its own recent 3 h results are poor.
+# Nothing here changes what is posted: every alert is recorded with what the adaptive rules would have done,
+# and the result 1 h / 3 h later, so passed and suppressed alerts can be compared (bot command `shadow`).
+ADAPT_SHADOW = os.environ.get("FC_ADAPT_SHADOW", "1") != "0"
+REGIME_REQ = {            # mode: (fast drop %, volume drop %, min % under 4-day sold for a fast drop)
+    "calm": (10.0, 8.0, 5.0), "soft": (12.0, 10.0, 6.0), "falling": (15.0, 12.0, 8.0)}
+GATE_MIN_N = 12           # resolved alerts needed before a bucket can be paused
+GATE_STAY_MED = 1.0       # a bucket stays on while its median 3 h net is at least this %
+GATE_RESUME_MED = 2.0     # ...and a paused one needs this to come back (hysteresis)
+GATE_WINDOW_H = 48
+
+
+def compute_regime(db, cards, now: float) -> dict:
+    """Hourly market reading from established cards (>= 10k, not muted-new): median / mean move over 6 h and
+    24 h and the share of changed cards that fell. Mode: calm / soft / falling."""
+    last = get_meta(db, "regime_ts")
+    if last and now - float(last) < 3600 and get_meta(db, "regime"):
+        return json.loads(get_meta(db, "regime"))
+    new = new_card_ids(db, now)
+    cur = {c.card_id: c.price for c in cards if c.price >= 10_000 and c.card_id not in new}
+
+    def window(t):
+        return dict(db.execute("select card_id, avg(price) from prices where ts between ? and ? group by card_id",
+                               (t - 1800, t + 1800)))
+    p6, p24 = window(now - 6 * 3600), window(now - 24 * 3600)
+    ch6 = [(cur[c] / p6[c] - 1) * 100 for c in cur if p6.get(c, 0) >= 10_000]
+    ch24 = [(cur[c] / p24[c] - 1) * 100 for c in cur if p24.get(c, 0) >= 10_000]
+    moved = [x for x in ch24 if abs(x) >= 0.5]
+    mean24 = statistics.mean(max(-30, min(30, x)) for x in ch24) if ch24 else 0.0
+    share = sum(x < 0 for x in moved) / len(moved) if moved else 0.5
+    mode = "falling" if (mean24 <= -1.5 or share >= 0.65) else "soft" if (mean24 <= -0.5 or share >= 0.55) else "calm"
+    out = {"mode": mode, "med6": round(statistics.median(ch6), 2) if ch6 else 0.0, "mean24": round(mean24, 2),
+           "med24": round(statistics.median(ch24), 2) if ch24 else 0.0, "share_down": round(share, 2), "n": len(ch24)}
+    db.execute("insert or replace into regime values (?,?,?,?,?,?)",
+               (int(now // 3600 * 3600), mode, out["med6"], out["mean24"], out["share_down"], out["n"]))
+    db.execute("delete from regime where hour_ts < ?", (now - 60 * 86400,))
+    set_meta(db, "regime", json.dumps(out))
+    set_meta(db, "regime_ts", now)
+    return out
+
+
+def _depth_bin(d: float) -> str:
+    d = abs(d)
+    return "8-10" if d < 10 else "10-15" if d < 15 else "15+"
+
+
+def record_shadow(db, items, regime: dict, now: float) -> None:
+    """Log every fast / volume alert with the decision the adaptive rules would have made."""
+    if not ADAPT_SHADOW:
+        return
+    fast_req, vol_req, under_req = REGIME_REQ[regime["mode"]]
+    gates = {k_: (on, med, n) for k_, on, med, n in db.execute("select key, on_, med, n from gate")}
+    for c, f, rel in items:
+        kind = "volume" if f.get("vol") else "fast"
+        grp = _index_segment(c.kind)
+        need = vol_req if kind == "volume" else fast_req
+        under = f.get("under")
+        l1 = (-rel >= need) and (kind == "volume" or f.get("liquid") or under is None or under >= under_req)
+        key = f"{kind}|{grp}|{_depth_bin(rel)}"
+        g = gates.get(key)
+        l2 = 1 if (not g or g[0]) else 0
+        why = []
+        if -rel < need:
+            why.append(f"drop {-rel:.0f}% < {need:.0f}% needed ({regime['mode']} market)")
+        elif not l1:
+            why.append(f"only {under:.0f}% under sold, {under_req:.0f}% needed ({regime['mode']} market)")
+        if not l2:
+            why.append(f"{key} paused: recent median {g[1]:+.1f}% over {g[2]}")
+        db.execute("insert into shadow_alerts(ts, card_id, kind, grp, price, drop_pct, under, mode, l1, l2, would_pass, reason) "
+                   "values (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (now, c.card_id, kind, grp, c.price, rel, under, regime["mode"], int(bool(l1)), l2,
+                    int(bool(l1) and bool(l2)), "; ".join(why) or None))
+    db.execute("delete from shadow_alerts where ts < ?", (now - 30 * 86400,))
+    db.commit()
+
+
+def resolve_shadow(db, now: float) -> None:
+    for col, secs in (("x1", 3600), ("x3", 3 * 3600)):
+        rows = db.execute(f"select id, card_id, ts, price from shadow_alerts where {col} is null and ts + ? <= ?",
+                          (secs + 700, now)).fetchall()
+        for sid, cid, ts, price in rows:
+            px = [r[0] for r in db.execute("select price from prices where card_id=? and ts between ? and ?",
+                                           (cid, ts + secs - 600, ts + secs + 600))]
+            if px:
+                val = _net_pct(statistics.median(px), price)
+            elif now - ts - secs > 2 * 3600:
+                val = 999.0
+            else:
+                continue
+            db.execute(f"update shadow_alerts set {col}=? where id=?", (val, sid))
+    db.commit()
+
+
+def update_gates(db, now: float) -> None:
+    """Hourly: pause / resume each bucket from the last 48 h of resolved 3 h results (all alerts, passed or not)."""
+    last = get_meta(db, "gate_ts")
+    if last and now - float(last) < 3600:
+        return
+    old = {k_: on for k_, on in db.execute("select key, on_ from gate")}
+    buckets = collections.defaultdict(list)
+    for kind, grp, drop, x3 in db.execute("select kind, grp, drop_pct, x3 from shadow_alerts where x3 is not null and x3 != 999 "
+                                          "and ts >= ?", (now - GATE_WINDOW_H * 3600,)):
+        buckets[f"{kind}|{grp}|{_depth_bin(drop)}"].append(x3)
+    for key, v in buckets.items():
+        med = statistics.median(v)
+        if len(v) < GATE_MIN_N:
+            on = 1
+        else:
+            on = int(med >= (GATE_STAY_MED if old.get(key, 1) else GATE_RESUME_MED))
+        db.execute("insert or replace into gate values (?,?,?,?,?)", (key, on, med, len(v), now))
+    db.execute("delete from gate where ts < ?", (now - 2 * 86400,))
+    set_meta(db, "gate_ts", now)
+    db.commit()
+
+
+def shadow_text(db, hours: int = 48) -> str:
+    """What the adaptive rules would have done: the market reading, paused buckets, passed vs suppressed alerts."""
+    now = time.time()
+    rg = json.loads(get_meta(db, "regime") or "{}")
+    lines = ["🧪 **Adaptive criteria (shadow mode, nothing is changed)**"]
+    if rg:
+        fr, vr, ur = REGIME_REQ[rg["mode"]]
+        lines.append(f"Market now: **{rg['mode']}** · 24 h mean {rg['mean24']:+.1f}% · {rg['share_down'] * 100:.0f}% of moving cards falling "
+                     f"→ would require fast ≥{fr:.0f}%, volume ≥{vr:.0f}%, ≥{ur:.0f}% under sold")
+    paused = db.execute("select key, med, n from gate where on_=0").fetchall()
+    lines.append("Paused buckets: " + (", ".join(f"{k_} ({m:+.1f}%, n={n})" for k_, m, n in paused) if paused else "none"))
+    rows = db.execute("select would_pass, x3 from shadow_alerts where ts >= ?", (now - hours * 3600,)).fetchall()
+    tot = len(rows)
+    if not tot:
+        lines.append(f"No fast / volume alerts recorded in the last {hours} h yet.")
+    else:
+        for flag, lab in ((1, "would stay"), (0, "would be suppressed")):
+            sel = [r for r in rows if r[0] == flag]
+            res = [r[1] for r in sel if r[1] is not None and r[1] != 999]
+            lines.append(f"{lab}: {len(sel)} of {tot} alerts" + (f" · 3 h net median {statistics.median(res):+.1f}% · win "
+                         f"{sum(x > 0 for x in res) / len(res) * 100:.0f}% (n={len(res)})" if len(res) >= 5 else " · (results not in yet)"))
+    return "\n".join(lines)[:1900]
 
 
 # ---- tell the bot what you bought, by typing in the alert channel ---------------------------------------------
@@ -3023,6 +3176,14 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
             continue
+        if low in ("shadow", "adaptive"):
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": shadow_text(db), "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
         jm = re.fullmatch(r"(?:trades|journal)(?:\s+(\d{1,3}))?", low)
         if jm:
             try:
@@ -3169,6 +3330,11 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
             resolve_dip_events(db, now)
         except Exception as e:
             print(f"[warn] dip ledger resolve failed: {e}")
+        try:
+            resolve_shadow(db, now)
+            update_gates(db, now)
+        except Exception as e:
+            print(f"[warn] shadow resolve failed: {e}")
         last_ts = get_meta(db, "dyn_ts")
         if last_ts:
             print(f"[info] feed updated {now - float(last_ts):.0f}s after the previous update")
