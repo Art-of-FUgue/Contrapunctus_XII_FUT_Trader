@@ -3003,6 +3003,63 @@ def quote_reply(db, cid: str, now: float) -> str:
             f"\nMax bid: {bids}" + ("\n⚠️ thin: fewer than 4 sales in 24 h" if st["n24"] < 4 else ""))
 
 
+CHART_RE = re.compile(r"(?i)^(?:graph|chart|plot)\s+(.+?)(?:\s+(\d{1,2})\s*d(?:ays?)?)?\s*$")
+
+
+def make_chart(db, cid: str, now: float, days: int = 3):
+    """Hourly floor price of one card (min / median per hour) with the 4-day sold median and inferred
+    sales marked. -> (png bytes, caption) or (None, reason)."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.dates as mdates
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+    except Exception as e:
+        return None, f"chart library is not installed on the scanner ({e.__class__.__name__})"
+    t0 = now - days * 86400
+    rows = db.execute("select ts, price from prices where card_id=? and ts>=? order by ts", (cid, t0)).fetchall()
+    if len(rows) < 6:
+        return None, f"only {len(rows)} price points for **{_card_label(cid)}** in {days} days"
+    hours: dict[int, list[int]] = {}
+    for ts, pr in rows:
+        hours.setdefault(int(ts // 3600), []).append(pr)
+    hx = sorted(hours)
+    tz = ZoneInfo("America/Chicago")
+    xs = [datetime.fromtimestamp(h * 3600, tz) for h in hx]
+    lo = [min(hours[h]) for h in hx]
+    md = [sorted(hours[h])[len(hours[h]) // 2] for h in hx]
+    hi = [max(hours[h]) for h in hx]
+    sales = db.execute("select ts, price from sales_inferred where card_id=? and kind='sale' and ts>=?", (cid, t0)).fetchall()
+    st = sm.sale_stats(db, cid, now, 96, 24)
+    fig, ax = plt.subplots(figsize=(9, 4.2), dpi=110)
+    ax.fill_between(xs, lo, hi, color="#5865F2", alpha=0.15, lw=0)
+    ax.plot(xs, md, color="#5865F2", lw=1.8, label="floor (hourly median)")
+    ax.plot(xs, lo, color="#5865F2", lw=0.8, alpha=0.6, label="hourly low")
+    if sales:
+        ax.scatter([datetime.fromtimestamp(t, tz) for t, _ in sales], [p for _, p in sales], s=14, color="#E67E22",
+                   zorder=3, label=f"inferred sales ({len(sales)})")
+    if st and st["n"] >= BID_MIN_SALES:
+        ax.axhline(st["fair"], color="#2ECC71", ls="--", lw=1.2, label=f"sold median {k(st['fair'])}")
+    ax.yaxis.set_major_formatter(lambda v, _: k(v))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%a %H:%M", tz=tz))
+    ax.xaxis.set_major_locator(mdates.HourLocator(byhour=range(0, 24, 6 if days <= 3 else 12), tz=tz))
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best", fontsize=8)
+    fig.autofmt_xdate()
+    ax.set_title(f"{_card_label(cid)} · last {days} days (Central time)", fontsize=11)
+    fig.tight_layout()
+    import io
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    cur = rows[-1][1]
+    cap = (f"📈 **{_card_label(cid)}** · now {k(cur)} · {days}d range {k(min(lo))} – {k(max(hi))}"
+           f" ({(cur / md[0] - 1) * 100:+.1f}% vs start)")
+    return buf.getvalue(), cap
+
+
 _UNIT_S = {"m": 60, "min": 60, "mins": 60, "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
            "d": 86400, "day": 86400, "days": 86400}
 _DUR = r"(\d+(?:[.,]\d+)?)\s*(min|mins|m|hours|hour|hrs|hr|h|days|day|d)\b"
@@ -3214,6 +3271,23 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
                            "allowed_mentions": {"parse": []}})
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
+            continue
+        cm = CHART_RE.match(text.strip())
+        if cm:
+            cid_c, why_c = resolve_card(cm.group(1))
+            png, cap = (None, why_c) if not cid_c else make_chart(db, cid_c, now, int(cm.group(2) or 3))
+            try:
+                ref = {"message_id": m["id"]}
+                if png:
+                    _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                         data={"payload_json": json.dumps({"content": cap[:1900], "message_reference": ref,
+                                                           "allowed_mentions": {"parse": []}})},
+                         files={"files[0]": ("chart.png", png, "image/png")})
+                else:
+                    _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                         json={"content": f"❓ {cap}"[:1900], "message_reference": ref, "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot chart failed: {e}")
             continue
         text, ago_s, held_s = extract_times(text)
         parsed = parse_held_message(text)
