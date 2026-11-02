@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FUT card chart</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/plotly.js/2.35.2/plotly.min.js"></script>
+<style>
+:root{--bg:#fff;--fg:#1f2328;--mut:#656d76;--line:#d0d7de;--accent:#5865F2}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--fg:#e6edf3;--mut:#8b949e;--line:#30363d}}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:16px}
+h1{font-size:18px;margin:0 0 10px}
+.bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
+input{flex:1 1 260px;padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);font-size:15px}
+button{padding:7px 12px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);cursor:pointer}
+button.on{background:var(--accent);border-color:var(--accent);color:#fff}
+#info{color:var(--mut);font-size:13px;margin:6px 0}
+#chart{height:460px}
+</style></head><body><main>
+<h1>FUT card chart</h1>
+<div class="bar">
+  <input id="q" list="names" placeholder="Search a card (e.g. Carpenter totw holo)" autocomplete="off">
+  <datalist id="names"></datalist>
+  <span id="rng"></span>
+</div>
+<div id="info">Loading…</div>
+<div id="chart"></div>
+<script>
+const DATA="https://raw.githubusercontent.com/Art-of-FUgue/Contrapunctus_XII_FUT_Trader/data/history.json";
+let H=null,cur=null,days=3;
+const k=v=>v==null?"":v>=1e6?(v/1e6).toFixed(2)+"M":v>=1e3?(v/1e3).toFixed(v>=1e5?0:1)+"k":""+v;
+const rng=document.getElementById("rng");
+[1,2,3,5].forEach(d=>{const b=document.createElement("button");b.textContent=d+"d";b.dataset.d=d;
+  b.onclick=()=>{days=d;draw()};rng.appendChild(b)});
+function draw(){
+  if(!H||!cur)return;
+  const c=H.cards[cur];if(!c)return;
+  rng.querySelectorAll("button").forEach(b=>b.classList.toggle("on",+b.dataset.d===days));
+  const now=H.ts*1000,from=now-days*864e5;
+  const x=c.av.map((_,i)=>new Date((H.t0+i)*36e5+18e5));
+  const css=getComputedStyle(document.body),fg=css.color,grid=css.getPropertyValue("--line");
+  const tr=[
+    {x,y:c.lo,mode:"lines",line:{width:0},hoverinfo:"skip",showlegend:false,connectgaps:false},
+    {x,y:c.hi,mode:"lines",line:{width:0},fill:"tonexty",fillcolor:"rgba(88,101,242,.15)",name:"hourly high",
+     hovertemplate:"high %{y:,}<extra></extra>",connectgaps:false},
+    {x,y:c.av,mode:"lines",line:{color:"#5865F2",width:2},name:"floor (hourly avg)",hovertemplate:"avg %{y:,}<extra></extra>"},
+    {x,y:c.lo,mode:"lines",line:{color:"#5865F2",width:1},opacity:.6,name:"hourly low",hovertemplate:"low %{y:,}<extra></extra>"}
+  ];
+  if(c.s)tr.push({x:c.s.map(s=>new Date(s[0]*1000)),y:c.s.map(s=>s[1]),mode:"markers",
+    marker:{color:"#E67E22",size:7},name:"inferred sales ("+c.s.length+")",hovertemplate:"sale %{y:,}<extra></extra>"});
+  if(c.f)tr.push({x:[x[0],x[x.length-1]],y:[c.f,c.f],mode:"lines",line:{color:"#2ECC71",dash:"dash",width:1.5},
+    name:"sold median "+k(c.f),hovertemplate:"sold median %{y:,}<extra></extra>"});
+  const vis=c.av.map((v,i)=>[x[i],c.lo[i],c.hi[i]]).filter(r=>r[0]>=from&&r[1]!=null);
+  const ys=vis.flatMap(r=>[r[1],r[2]]).concat((c.s||[]).filter(s=>s[0]*1000>=from).map(s=>s[1]));
+  let yr=null;
+  if(ys.length){const lo=Math.min(...ys),hi=Math.max(...ys),pad=(hi-lo)*.06||hi*.02;yr=[lo-pad,hi+pad]}
+  Plotly.react("chart",tr,{margin:{l:60,r:16,t:10,b:40},paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",
+    font:{color:fg},hovermode:"x unified",legend:{orientation:"h",y:-.15},
+    xaxis:{range:[new Date(from),new Date(now)],gridcolor:grid},
+    yaxis:{range:yr,gridcolor:grid,tickformat:"~s"}},{responsive:true,displaylogo:false});
+  const last=c.av.filter(v=>v!=null).pop(),first=c.av.map((v,i)=>[x[i],v]).find(r=>r[0]>=from&&r[1]!=null);
+  document.getElementById("info").textContent=c.l+" · now "+k(last)+(first?" ("+((last/first[1]-1)*100).toFixed(1)+"% over "+days+"d)":"")+
+    (c.f?" · sold median "+k(c.f):"")+" · data "+Math.round((Date.now()-H.ts*1000)/60000)+" min old";
+  history.replaceState(null,"","?card="+cur+"&d="+days);
+}
+function pick(v){
+  v=v.trim().toLowerCase();if(!v)return;
+  if(H.cards[v]){cur=v;draw();return}
+  const hit=Object.entries(H.cards).filter(([,c])=>c.l.toLowerCase()===v)[0]||
+    Object.entries(H.cards).filter(([,c])=>v.split(/\s+/).every(w=>c.l.toLowerCase().includes(w)))[0];
+  if(hit){cur=hit[0];draw()}
+}
+fetch(DATA,{cache:"no-store"}).then(r=>r.json()).then(j=>{
+  H=j;
+  document.getElementById("names").innerHTML=Object.values(H.cards).map(c=>c.l).sort().map(l=>`<option value="${l.replace(/"/g,"&quot;")}">`).join("");
+  const u=new URLSearchParams(location.search);
+  if(u.get("d"))days=+u.get("d")||3;
+  const id=u.get("card");
+  if(id&&H.cards[id]){cur=id;draw()}else document.getElementById("info").textContent="Pick a card above.";
+}).catch(e=>document.getElementById("info").textContent="Could not load history.json ("+e+")");
+const q=document.getElementById("q");
+q.addEventListener("change",()=>pick(q.value));
+q.addEventListener("keydown",e=>{if(e.key==="Enter")pick(q.value)});
+</script></main></body></html>

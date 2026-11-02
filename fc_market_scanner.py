@@ -1831,6 +1831,64 @@ def write_bid_sheet(db, cards, now: float) -> int:
     return len(out)
 
 
+HISTORY_FILE = os.environ.get("FC_HISTORY_FILE", "history.json")
+HISTORY_DAYS = 5
+CHART_PAGE = "https://{owner}.github.io/{repo}/chart.html?card={cid}"
+
+
+def chart_url(cid: str) -> str:
+    owner, _, repo = (os.environ.get("GITHUB_REPOSITORY") or "Art-of-FUgue/Contrapunctus_XII_FUT_Trader").partition("/")
+    return CHART_PAGE.format(owner=owner.lower(), repo=repo, cid=cid)
+
+
+def write_history(db, now: float) -> int:
+    """history.json: hourly floor (low / high / average) and inferred sales of every card for the last
+    HISTORY_DAYS days. The interactive chart page (docs/chart.html) reads it from the data branch."""
+    t0 = now - HISTORY_DAYS * 86400
+    h0 = int(t0 // 3600)
+    n_h = int(now // 3600) - h0 + 1
+    cards: dict[str, dict] = {}
+    for cid, h, lo, hi, av in db.execute(
+            "select card_id, cast(ts/3600 as int), min(price), max(price), avg(price) from prices "
+            "where ts>=? group by card_id, cast(ts/3600 as int)", (t0,)):
+        c = cards.get(cid)
+        if c is None:
+            c = cards[cid] = {"lo": [None] * n_h, "hi": [None] * n_h, "av": [None] * n_h}
+        i = h - h0
+        if 0 <= i < n_h:
+            c["lo"][i], c["hi"][i], c["av"][i] = lo, hi, int(av)
+    for cid, ht, pr in db.execute("select card_id, hour_ts, price from prices_hourly where hour_ts>=?", (t0,)):
+        c = cards.get(cid)                                 # older hours: only the one stored hourly price
+        if c is None:
+            c = cards[cid] = {"lo": [None] * n_h, "hi": [None] * n_h, "av": [None] * n_h}
+        i = int(ht // 3600) - h0
+        if c is not None and 0 <= i < n_h and c["av"][i] is None:
+            c["lo"][i] = c["hi"][i] = c["av"][i] = pr
+    for cid, ts, pr in db.execute("select card_id, ts, price from sales_inferred where kind='sale' and ts>=? order by ts", (t0,)):
+        if cid in cards:
+            cards[cid].setdefault("s", []).append([int(ts), pr])
+    for cid, c in cards.items():
+        st = sm.sale_stats(db, cid, now, 96, 24)
+        c["f"] = int(st["fair"]) if st and st["n"] >= BID_MIN_SALES else None
+        c["l"] = _card_label(cid)
+        if not c.get("s"):
+            c.pop("s", None)
+    if not cards:
+        return 0
+    tmp = HISTORY_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"ts": int(now), "t0": h0, "cards": cards}, f, separators=(",", ":"))
+    os.replace(tmp, HISTORY_FILE)
+    return len(cards)
+
+
+def _write_history_safe(db) -> None:
+    try:
+        print(f"[info] history.json: {write_history(db, time.time())} cards")
+    except Exception as e:
+        print(f"[warn] history.json failed: {e}")
+
+
 def maybe_post_summary(db, now: float, dry_run: bool) -> None:
     """Post the summary at the Austin hours in FC_SUMMARY_HOURS (default 7 and 19), once per slot."""
     if not SUMMARY_HOURS.strip():
@@ -2888,11 +2946,18 @@ def make_chart(db, cid: str, now: float, days: int = 3):
         return None, f"chart library is not installed on the scanner ({e.__class__.__name__})"
     t0 = now - days * 86400
     rows = db.execute("select ts, price from prices where card_id=? and ts>=? order by ts", (cid, t0)).fetchall()
-    if len(rows) < 6:
-        return None, f"only {len(rows)} price points for **{_card_label(cid)}** in {days} days"
     hours: dict[int, list[int]] = {}
+    for ht, pr in db.execute("select hour_ts, price from prices_hourly where card_id=? and hour_ts>=?", (cid, t0)):
+        hours[int(ht // 3600)] = [pr]                      # older hours keep one stored price per hour
     for ts, pr in rows:
-        hours.setdefault(int(ts // 3600), []).append(pr)
+        hours.setdefault(int(ts // 3600), [])
+    for h in {int(ts // 3600) for ts, _ in rows}:
+        hours[h] = []
+    for ts, pr in rows:
+        hours[int(ts // 3600)].append(pr)
+    if len(hours) < 6:
+        return None, f"only {len(hours)} hourly price points for **{_card_label(cid)}** in {days} days"
+    rows = rows or [(max(hours) * 3600, hours[max(hours)][-1])]
     hx = sorted(hours)
     tz = ZoneInfo("America/Chicago")
     xs = [datetime.fromtimestamp(h * 3600, tz) for h in hx]
@@ -3147,6 +3212,7 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             try:
                 ref = {"message_id": m["id"]}
                 if png:
+                    cap += f"\n🔎 [Interactive chart]({chart_url(cid_c)})"
                     _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
                          data={"payload_json": json.dumps({"content": cap[:1900], "message_reference": ref,
                                                            "allowed_mentions": {"parse": []}})},
@@ -3347,6 +3413,7 @@ def main() -> None:
     if args.once:
         if args.runs <= 1:
             run_cycle(db, args.dry_run, watchlist)   # errors fail the run, visible in Actions
+            _write_history_safe(db)
             return
         if args.run_gap < 30:
             raise SystemExit("--run-gap must be at least 30 seconds")
@@ -3362,6 +3429,7 @@ def main() -> None:
             except Exception as e:
                 failed += 1
                 print(f"[warn] run {i + 1} failed: {e}")
+        _write_history_safe(db)
         if failed == args.runs:
             raise SystemExit("every scan failed")
         return
