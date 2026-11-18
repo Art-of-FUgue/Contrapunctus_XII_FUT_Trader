@@ -237,6 +237,7 @@ Type in the alert channel (the bot replies to each message):
   - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
   - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
 - **`shadow`**: report of the adaptive-criteria shadow mode (5.10).
+- **`calls`**: how the 📞 calls of the last 7 days did (5.11).
 - **`trades`** (or `trades 30` for 30 days; default 7): summary of closed trades: profit, median net, win %, median hold; split by source (alert kind / note / own find), list, price band, promo; and how far under the sold price you bought.
 - **`undo`** reverts your last logged buy or sale.
 - Purpose: realized results (not hypothetical floor prices) to tune the scanner later: per-alert-type value, slippage between the alert price and your fill, which groups you actually profit on, and what your own finds have in common. Needs a few dozen trades before the numbers mean much. Trades are kept in the database indefinitely.
@@ -260,11 +261,19 @@ Equal-weighted, chain-linked price basket (cards ≥ 10k, ≥ 5 cards per step) 
 
 ---
 
-### 5.10 Adaptive criteria (SHADOW MODE: records only, changes nothing)
+### 5.10 Adaptive criteria (shadow mode: records, and since 5.11 marks suppressed drops as low-confidence)
 Every fast / volume alert is logged in `shadow_alerts` with what two adaptive layers would have done, plus its result 1 h and 3 h later (net after tax and haircut). Switch off with `FC_ADAPT_SHADOW=0`.
 - **Layer 1, market regime** (`regime` table, hourly): from established cards (≥ 10k, not muted-new) the mean 24 h move (clipped ±30 %), median 6 h / 24 h move and the share of changed cards that fell. `falling` = mean ≤ −1.5 % or ≥ 65 % falling; `soft` = mean ≤ −0.5 % or ≥ 55 %; else `calm`. Required drop for a fast drop / volume drop / minimum % under 4-day sold: calm 10 / 8 / 5, soft 12 / 10 / 6, falling 15 / 12 / 8.
 - **Layer 2, learned pausing** (`gate` table, hourly): alerts are bucketed by kind (fast / volume) × segment (Icons, Heroes, TOTW, Other promos, Holos) × depth (8–10, 10–15, 15+ %). A bucket is paused while the median 3 h net of its last 48 h of resolved alerts (all of them, passed or not, so there is no selection bias) is below +1 %, needs ≥ 12 resolved alerts to be judged, and resumes only at ≥ +2 % (hysteresis).
 - `would_pass` = both layers pass; `reason` says why not. The bot command `shadow` shows the market now, paused buckets, and the median 3 h net / win rate of the alerts that would stay vs be suppressed over the last 48 h. Plan: compare after 1–2 weeks and switch it on only if the suppressed alerts were clearly the worse ones.
+
+### 5.11 Low-confidence drops and calls
+- **🔹 Low-confidence drops** (`FC_LOWCONF`, default on): fast / volume drops that the adaptive rules of 5.10 would suppress are no longer hidden. They go into one grey embed, one line each with the reason, no call, and a footer with how past low-confidence drops did (median 3 h net, win rate over 14 days). `FC_LOWCONF=0` posts them as normal drops again.
+- **📞 Calls** (`FC_CALLS`, default on): every fast / volume drop that stays confident may carry a call line: **buy ≤ cap**, **list price** (stretch = the patient best price), **hold ~N h**, expected net %, win rate and sample size, bad case (20th percentile) and when to give up (list at the floor after twice the hold).
+  - Calibration (`calibrate_calls`, hourly, `call_cal` in meta) from the resolved dip ledger (`dip_events`): events are bucketed by depth under the 24 h median (8-12, 12-15, 15-20, 20-30, 30+ %), **sudden vs persistent** (persistent = the previous update was already 8 %+ under the median: those do not pay) and segment. For each bucket the hold (1, 3, 6 or 12 h) with the best median net is used (a shorter hold unless the longer one is clearly better, +0.5 %).
+  - The list price is the one that nets the bucket's median at that hold, capped at 105 % of the 4-day sold price. The buy cap is the lower of 102 % of the alert price and the bid that still nets ≥ +3 % at the list price. No call when the bucket has < 12 cases, its median net is < +3 %, or the capped target nets < +3 %. A segment's own numbers are used only with ≥ 60 cases (else the pooled bucket); < 30 cases is labelled ⚠️ thin.
+  - Out-of-sample check (calibrated on the first 60 % of the ledger, scored on the last 40 %): 609 calls, realised median net +5.5 % vs promised +5.9 %, 68 % winners.
+  - Every call is stored in `calls` and scored when its hold has passed (net at the hold time, whether the floor reached the list price). The bot command `calls` shows the summary and the latest calls.
 
 ## 6. The dynamic watchlist
 
@@ -297,6 +306,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
 | `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted (liquid cards excepted) |
 | `FC_VOLUME_MIN_N24` / `FC_VOLUME_MIN_N96` / `FC_VOLUME_MAX_PRICE` / `FC_VOLUME_MAX_SIGMA` | 60 / 40 / 160000 / 10 | automatic volume-list filter |
+| `FC_LOWCONF` / `FC_CALLS` | `1` / `1` | post shadow-suppressed drops as 🔹 low-confidence; add 📞 calls to confident drops (5.11) |
 | `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | (secrets) | bot used to read what you type in the channel (5.6b) |
 | `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on the volume list (instead of 10) |
 | `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid and exempt from the sold-median filter |
