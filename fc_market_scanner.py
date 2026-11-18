@@ -400,6 +400,9 @@ def open_db(path: str) -> sqlite3.Connection:
             db.execute(f"alter table held add column {col} {typ}")
     db.execute("create table if not exists regime(hour_ts integer primary key, mode text, med6 real, med24 real, "
                "share_down real, n integer)")
+    db.execute("create table if not exists calls(id integer primary key autoincrement, ts real, card_id text, price int, "
+               "buy_cap int, target int, stretch int, hold_h real, exp_net real, win real, n int, key text, "
+               "r_net real, hit int, done int default 0)")
     db.execute("create table if not exists shadow_alerts(id integer primary key autoincrement, ts real, card_id text, "
                "kind text, grp text, price int, drop_pct real, under real, mode text, l1 int, l2 int, would_pass int, "
                "reason text, x1 real, x3 real)")
@@ -1453,6 +1456,8 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
                 lines.append(f"📉 `{pct:.1f}%` · was **{k(f['prev_price'])}** at {w}{ago}{open_link(c)}")
                 if f.get("tier"):
                     lines.append(f"↳ {f['tier']}")
+                if f.get("call"):
+                    lines.append(f["call"])
                 lines.append(facts_line(c))
                 lines.append(name_block(c))
         if vol:
@@ -1832,7 +1837,7 @@ def write_bid_sheet(db, cards, now: float) -> int:
 
 
 HISTORY_FILE = os.environ.get("FC_HISTORY_FILE", "history.json")
-HISTORY_DAYS = 5
+CHART_DAYS = 5
 CHART_PAGE = "https://{owner}.github.io/{repo}/chart.html?card={cid}"
 
 
@@ -1843,8 +1848,8 @@ def chart_url(cid: str) -> str:
 
 def write_history(db, now: float) -> int:
     """history.json: hourly floor (low / high / average) and inferred sales of every card for the last
-    HISTORY_DAYS days. The interactive chart page (docs/chart.html) reads it from the data branch."""
-    t0 = now - HISTORY_DAYS * 86400
+    CHART_DAYS days. The interactive chart page (docs/chart.html) reads it from the data branch."""
+    t0 = now - CHART_DAYS * 86400
     h0 = int(t0 // 3600)
     n_h = int(now // 3600) - h0 + 1
     cards: dict[str, dict] = {}
@@ -2530,9 +2535,16 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
+    low_dips: list = []
     try:
         if ADAPT_SHADOW:
-            record_shadow(db, flash_dips, compute_regime(db, cards, now), now)   # shadow only: no alert is changed
+            verdict = record_shadow(db, flash_dips, compute_regime(db, cards, now), now)
+            if LOWCONF:                                   # what the adaptive rules would suppress is posted quietly
+                keep = []
+                for it in flash_dips:
+                    ok, why = verdict.get(it[0].card_id, (True, ""))
+                    (keep if ok else low_dips).append(it if ok else (*it, why))
+                flash_dips = keep
     except Exception as e:
         print(f"[warn] shadow mode failed: {e}")
     premium_dips = fresh_dips(db, premium_dips, now, "prem")
@@ -2555,14 +2567,19 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         flash_spikes = fresh_spikes(db, flash_spikes, now, "flash")
     auto_watch_update(db, cards, now, muted_new | (watch - auto))   # auto picks are re-screened each time
     try:
-        fill_facts(db, [c for c, *_ in dips] + [c for c, *_ in flash_dips] + [c for c, *_ in premium_dips]
+        fill_facts(db, [c for c, *_ in dips] + [c for c, *_ in flash_dips] + [x[0] for x in low_dips] + [c for c, *_ in premium_dips]
                    + [c for c, *_ in watch_hits], beh_types, vol_list, watch | auto, now)
     except Exception as e:
         print(f"[warn] card facts failed: {e}")
+    try:
+        attach_calls(db, flash_dips, stats, now)
+    except Exception as e:
+        print(f"[warn] calls failed: {e}")
     embeds = (
         build_dips(dips)
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips)
+        + build_low_confidence(db, low_dips, now)
         + build_premium_dips(premium_dips)    # 💎 premium dips on the 24 h median fallback
     )
 
@@ -2738,10 +2755,12 @@ def _shadow_depth(d: float) -> str:
     return "8-10" if d < 10 else "10-15" if d < 15 else "15+"
 
 
-def record_shadow(db, items, regime: dict, now: float) -> None:
-    """Log every fast / volume alert with the decision the adaptive rules would have made."""
+def record_shadow(db, items, regime: dict, now: float) -> dict:
+    """Log every fast / volume alert with the decision the adaptive rules would have made.
+    -> {card_id: (would_pass, reason)} so the scan can mark the suppressed ones low-confidence."""
+    out: dict = {}
     if not ADAPT_SHADOW:
-        return
+        return out
     fast_req, vol_req, under_req = REGIME_REQ[regime["mode"]]
     gates = {k_: (on, med, n) for k_, on, med, n in db.execute("select key, on_, med, n from gate")}
     for c, f, rel in items:
@@ -2764,8 +2783,10 @@ def record_shadow(db, items, regime: dict, now: float) -> None:
                    "values (?,?,?,?,?,?,?,?,?,?,?,?)",
                    (now, c.card_id, kind, grp, c.price, rel, under, regime["mode"], int(bool(l1)), l2,
                     int(bool(l1) and bool(l2)), "; ".join(why) or None))
+        out[c.card_id] = (bool(l1) and bool(l2), "; ".join(why))
     db.execute("delete from shadow_alerts where ts < ?", (now - 30 * 86400,))
     db.commit()
+    return out
 
 
 def resolve_shadow(db, now: float) -> None:
@@ -2807,11 +2828,181 @@ def update_gates(db, now: float) -> None:
     db.commit()
 
 
+LOWCONF = os.environ.get("FC_LOWCONF", "1") != "0"      # shadow-suppressed alerts: posted quietly instead of hidden
+CALLS_ON = os.environ.get("FC_CALLS", "1") != "0"
+CALL_MIN_N = 12                  # fewer similar past drops than this: no call
+CALL_SEG_N = 60                  # segment-specific numbers need this many similar past drops
+CALL_FIRM_N = 30                 # below this the call is labelled thin
+CALL_MIN_NET = 3.0               # a call needs at least this expected net % at its hold time
+CALL_BINS = ((8, 12), (12, 15), (15, 20), (20, 30), (30, 100))
+CALL_HORIZONS = (("xm60", 1.0), ("x3", 3.0), ("x6", 6.0), ("x12", 12.0))
+
+
+def _call_bin(dip: float) -> str | None:
+    for lo, hi in CALL_BINS:
+        if lo <= -dip < hi:
+            return f"{lo}-{hi}"
+    return None
+
+
+def calibrate_calls(db, now: float) -> None:
+    """Hourly: from the resolved dip-ledger events, per (depth bin, sudden / persistent, segment) find the hold time
+    with the best median net, plus win rate, bad case (20th percentile) and the patient best price (best3)."""
+    last = get_meta(db, "call_cal_ts")
+    if last and now - float(last) < 3600:
+        return
+    groups: dict = collections.defaultdict(list)
+    for dip, seg, persist, xm60, x3, x6, x12, best3 in db.execute(
+            "select dip, seg, persist, xm60, x3, x6, x12, best3 from dip_events where x3 is not null"):
+        b = _call_bin(dip)
+        if not b:
+            continue
+        row = {"xm60": xm60, "x3": x3, "x6": x6, "x12": x12, "best3": best3}
+        for sg in (seg, "*"):
+            groups[f"{b}|{persist}|{sg}"].append(row)
+    cal = {}
+    for key, rows in groups.items():
+        best = None
+        for col, hrs in CALL_HORIZONS:
+            v = sorted(r[col] for r in rows if r[col] is not None and r[col] != 999)
+            if len(v) < CALL_MIN_N:
+                continue
+            med = statistics.median(v)
+            if best is None or med > best["med"] + 0.5:          # prefer the shorter hold unless clearly better
+                best = {"col": col, "h": hrs, "med": med, "win": sum(x > 0 for x in v) / len(v),
+                        "p20": v[len(v) // 5], "n": len(v)}
+        if best:
+            b3 = sorted(r["best3"] for r in rows if r["best3"] is not None and r["best3"] != 999)
+            best["best3"] = statistics.median(b3) if b3 else None
+            cal[key] = best
+    set_meta(db, "call_cal", json.dumps(cal))
+    set_meta(db, "call_cal_ts", now)
+    db.commit()
+
+
+def _price_for_net(buy: float, net: float) -> int:
+    """Sell price that nets `net` % when bought at `buy` (inverse of _net_pct)."""
+    return int(buy * (1 + (net + EXIT_HAIRCUT_PCT) / 100) / (1 - EA_TAX))
+
+
+def make_call(db, c: Card, f: dict, usual: float | None, now: float):
+    """A call for one confident drop: buy cap, list price, expected hold, bad case. None when too little data
+    or the expected net is below CALL_MIN_NET. -> (text, row dict)"""
+    if not usual or usual <= 0:
+        return None
+    dip = (c.price / usual - 1) * 100
+    b = _call_bin(dip)
+    if not b:
+        return None
+    persist = 1 if f.get("prev_price", 10 ** 12) <= usual * (1 - EVENT_DIP_PCT / 100) else 0
+    cal = json.loads(get_meta(db, "call_cal") or "{}")
+    seg = _index_segment(c.kind)
+    ent = cal.get(f"{b}|{persist}|{seg}")
+    key = f"{b}|{persist}|{seg}"
+    if not ent or ent["n"] < CALL_SEG_N:                        # a segment needs enough cases of its own, else pooled
+        alt = cal.get(f"{b}|{persist}|*")
+        if alt:
+            ent, key = alt, f"{b}|{persist}|*"
+    if not ent or ent["n"] < CALL_MIN_N or ent["med"] < CALL_MIN_NET:
+        return None
+    target = _price_for_net(c.price, ent["med"])
+    under = f.get("under")
+    if under is not None and under > -50:
+        fair = c.price / (1 - under / 100) if under < 99 else None
+        if fair:
+            target = min(target, int(fair * 1.05))              # never ask for much more than the 4-day sold price
+    exp_net = _net_pct(target, c.price)
+    if exp_net < CALL_MIN_NET:
+        return None
+    stretch = _price_for_net(c.price, ent["best3"]) if ent.get("best3") and ent["best3"] > ent["med"] else None
+    cap = min(int(c.price * 1.02), max_bid(target, CALL_MIN_NET))
+    thin = ent["n"] < CALL_FIRM_N
+    give = max(2 * ent["h"], 3.0)
+    hold = f"{ent['h']:.0f} h"
+    txt = (f"📞 **Call:** buy ≤ **{k(cap)}** · list **{k(target)}**" + (f" (stretch {k(stretch)})" if stretch else "")
+           + f" · hold ~**{hold}** · expect **{exp_net:+.0f}% net** (win {ent['win'] * 100:.0f}%, "
+           + (f"⚠️ thin n={ent['n']}" if thin else f"n={ent['n']}") + f") · bad case {ent['p20']:+.0f}% · "
+           f"not sold after {give:.0f} h: list at the floor")
+    return txt, {"cap": cap, "target": target, "stretch": stretch, "hold_h": ent["h"], "exp_net": exp_net,
+                 "win": ent["win"], "n": ent["n"], "key": key}
+
+
+def attach_calls(db, items, stats: dict, now: float) -> None:
+    if not CALLS_ON:
+        return
+    for c, f, rel in items:
+        got = make_call(db, c, f, (stats.get(c.card_id) or {}).get("usual"), now)
+        if not got:
+            continue
+        f["call"] = got[0]
+        r = got[1]
+        db.execute("insert into calls(ts, card_id, price, buy_cap, target, stretch, hold_h, exp_net, win, n, key) "
+                   "values (?,?,?,?,?,?,?,?,?,?,?)",
+                   (now, c.card_id, c.price, r["cap"], r["target"], r["stretch"], r["hold_h"], r["exp_net"],
+                    r["win"], r["n"], r["key"]))
+    db.execute("delete from calls where ts < ?", (now - 60 * 86400,))
+    db.commit()
+
+
+def resolve_calls(db, now: float) -> None:
+    """Score each call once its hold time has passed: net if sold at the floor then, and whether the floor
+    reached the list price at any point in the hold window (needs the raw prices, kept about a day)."""
+    rows = db.execute("select id, card_id, ts, price, target, hold_h from calls where done=0 and ts + hold_h*3600 + 900 <= ?",
+                      (now,)).fetchall()
+    for cid, card, ts, price, target, hold in [(r[0], r[1], r[2], r[3], r[4], r[5]) for r in rows]:
+        end = ts + hold * 3600
+        px = [r[0] for r in db.execute("select price from prices where card_id=? and ts between ? and ?",
+                                       (card, end - 600, end + 600))]
+        win = [r[0] for r in db.execute("select price from prices where card_id=? and ts between ? and ?", (card, ts, end))]
+        if px and win:
+            db.execute("update calls set r_net=?, hit=?, done=1 where id=?",
+                       (_net_pct(statistics.median(px), price), int(max(win) >= target), cid))
+        elif now - end > 3 * 3600:
+            db.execute("update calls set done=2 where id=?", (cid,))
+    db.commit()
+
+
+def calls_text(db, days: int = 7) -> str:
+    now = time.time()
+    rows = db.execute("select ts, card_id, buy_cap, target, hold_h, exp_net, r_net, hit from calls where ts >= ? "
+                      "order by ts desc", (now - days * 86400,)).fetchall()
+    if not rows:
+        return f"📞 No calls issued in the last {days} days yet."
+    done = [r for r in rows if r[6] is not None]
+    lines = [f"📞 **Calls, last {days} days**: {len(rows)} issued, {len(done)} scored"]
+    if done:
+        res = [r[6] for r in done]
+        lines.append(f"At the hold time: median net {statistics.median(res):+.1f}% (promised {statistics.median(r[5] for r in done):+.1f}%) · "
+                     f"win {sum(x > 0 for x in res) / len(res) * 100:.0f}% · list price reached {sum(r[7] for r in done) / len(done) * 100:.0f}% of the time")
+    for r in rows[:6]:
+        res = f"{r[6]:+.0f}%" + (" ✅ hit" if r[7] else "") if r[6] is not None else "pending"
+        lines.append(f"• {_card_label(r[1])[:40]} · buy ≤ {k(r[2])} → {k(r[3])} in ~{r[4]:.0f} h · {res}")
+    return "\n".join(lines)[:1900]
+
+
+def build_low_confidence(db, items, now: float) -> list[dict]:
+    """Drops the adaptive rules would suppress: one grey line each, no call."""
+    if not items:
+        return []
+    past = [r[0] for r in db.execute("select x3 from shadow_alerts where would_pass=0 and x3 is not null and x3 != 999 "
+                                     "and ts >= ?", (now - 14 * 86400,))]
+    hist = (f"Past low-confidence drops: median {statistics.median(past):+.1f}% net at 3 h, "
+            f"win {sum(x > 0 for x in past) / len(past) * 100:.0f}% (n={len(past)})") if len(past) >= 30 else ""
+    lines = ["Shadow filter says: weak setup (market state or a losing bucket). Posted for completeness, no call."]
+    for c, f, rel, why in sorted(items, key=lambda i: i[2])[:12]:
+        vol = "📦" if f.get("vol") else "⚡"
+        lines.append(f"{vol} {k(c.price)} · {c.name} · {c.kind} · `{rel:.0f}%`{open_link(c)}\n↳ {why}")
+    if hist:
+        lines += ["", hist]
+    return [{"title": f"🔹 Low-confidence drops · {PLATFORM_LABEL}", "description": "\n".join(lines)[:3900],
+             "color": 0x95A5A6, "footer": {"text": "Switch off with FC_LOWCONF=0 (then they are posted as normal drops)"}}]
+
+
 def shadow_text(db, hours: int = 48) -> str:
     """What the adaptive rules would have done: the market reading, paused buckets, passed vs suppressed alerts."""
     now = time.time()
     rg = json.loads(get_meta(db, "regime") or "{}")
-    lines = ["🧪 **Adaptive criteria (shadow mode, nothing is changed)**"]
+    lines = ["🧪 **Adaptive criteria** (alerts it would suppress are posted as 🔹 low-confidence, without a call)"]
     if rg:
         fr, vr, ur = REGIME_REQ[rg["mode"]]
         lines.append(f"Market now: **{rg['mode']}** · 24 h mean {rg['mean24']:+.1f}% · {rg['share_down'] * 100:.0f}% of moving cards falling "
@@ -3166,6 +3357,14 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
             continue
+        if low in ("calls", "call"):
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": calls_text(db), "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
         if low in ("shadow", "adaptive"):
             try:
                 _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
@@ -3340,6 +3539,8 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         try:
             resolve_shadow(db, now)
             update_gates(db, now)
+            calibrate_calls(db, now)
+            resolve_calls(db, now)
         except Exception as e:
             print(f"[warn] shadow resolve failed: {e}")
         last_ts = get_meta(db, "dyn_ts")
