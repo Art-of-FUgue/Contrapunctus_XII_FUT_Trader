@@ -377,6 +377,9 @@ def open_db(path: str) -> sqlite3.Connection:
                "ts real, price int, usual int, dip real, mkt real, typ text, seg text, band text, "
                "persist int, fair int, sale_near int, wd int, hr int, x3 real, x6 real, x12 real)")
     db.execute("create index if not exists dx on dip_events(card_id, ts)")
+    for tbl in ("dip_events", "shadow_alerts"):                   # alive: 1 = the dip listing was still there at the next update
+        if "alive" not in {r[1] for r in db.execute(f"pragma table_info({tbl})")}:
+            db.execute(f"alter table {tbl} add column alive int")
     have = {r[1] for r in db.execute("pragma table_info(dip_events)")}
     for col in ("xm15", "xm60", "best3", "d6"):             # quick-flip outcomes, and the 6 h-ago dip %, added later
         if col not in have:
@@ -2963,6 +2966,8 @@ def update_gates(db, now: float) -> None:
 LOWCONF = os.environ.get("FC_LOWCONF", "1") != "0"      # shadow-suppressed alerts: posted quietly instead of hidden
 CALLS_ON = os.environ.get("FC_CALLS", "1") != "0"
 CALL_MIN_N = 12                  # fewer similar past drops than this: no call
+CALL_GONE_W = 0.6                # weight of an event whose listing was gone by the next update (a 1-minute buyer catches ~60 % of them)
+CALL_FILL_FACTOR = 0.8           # scale on buckets without measured fills yet (one-day check: fills cost about 20 % of the edge)
 CALL_SEG_N = 60                  # segment-specific numbers need this many similar past drops
 CALL_FIRM_N = 30                 # below this the call is labelled thin
 CALL_MIN_NET = 3.0               # a call needs at least this expected net % at its hold time
@@ -2977,36 +2982,79 @@ def _call_bin(dip: float) -> str | None:
     return None
 
 
+def _wquant(pairs, q: float) -> float:
+    """Weighted quantile of (value, weight) pairs."""
+    pairs = sorted(pairs)
+    tot = sum(w for _, w in pairs)
+    acc = 0.0
+    for x, w in pairs:
+        acc += w
+        if acc >= tot * q:
+            return x
+    return pairs[-1][0]
+
+
+def resolve_alive(db, now: float) -> None:
+    """Was the cheap listing still at the floor at the next update (4-15 min after the alert)? Gone = the floor is
+    then more than 2 % above the alert price: someone else bought it. Stored on dip events and shadow alerts."""
+    for tbl in ("dip_events", "shadow_alerts"):
+        rows = db.execute(f"select id, card_id, ts, price from {tbl} where alive is null and ts + 900 <= ? "
+                          f"and ts >= ?", (now, now - 3 * 86400)).fetchall()
+        for rid, cid, ts, price in rows:
+            r = db.execute("select price from prices where card_id=? and ts between ? and ? order by ts limit 1",
+                           (cid, ts + 240, ts + 900)).fetchone()
+            if r:
+                val = 1 if r[0] <= price * 1.02 else 0
+            elif now - ts > 2 * 3600:
+                val = -1                                       # no snapshot to judge by
+            else:
+                continue
+            db.execute(f"update {tbl} set alive=? where id=?", (val, rid))
+    db.commit()
+
+
 def calibrate_calls(db, now: float) -> None:
     """Hourly: from the resolved dip-ledger events, per (depth bin, sudden / persistent, segment) find the hold time
-    with the best median net, plus win rate, bad case (20th percentile) and the patient best price (best3)."""
+    with the best median net, plus win rate, bad case (20th percentile) and the patient best price (best3).
+    Fills: events whose listing was gone by the next update count CALL_GONE_W (a fast buyer still catches part of them);
+    buckets with too few events that have the alive flag are scaled by CALL_FILL_FACTOR until it is measured."""
     last = get_meta(db, "call_cal_ts")
     if last and now - float(last) < 3600:
         return
     groups: dict = collections.defaultdict(list)
-    for dip, seg, persist, xm60, x3, x6, x12, best3 in db.execute(
-            "select dip, seg, persist, xm60, x3, x6, x12, best3 from dip_events where x3 is not null"):
+    gone_n = flag_n = 0
+    for dip, seg, persist, xm60, x3, x6, x12, best3, alive in db.execute(
+            "select dip, seg, persist, xm60, x3, x6, x12, best3, alive from dip_events where x3 is not null"):
         b = _call_bin(dip)
         if not b:
             continue
-        row = {"xm60": xm60, "x3": x3, "x6": x6, "x12": x12, "best3": best3}
+        row = {"xm60": xm60, "x3": x3, "x6": x6, "x12": x12, "best3": best3,
+               "w": CALL_GONE_W if alive == 0 else 1.0, "f": alive in (0, 1)}
+        if row["f"] and dip <= -12 and persist == 0:
+            flag_n += 1
+            gone_n += alive == 0
         for sg in (seg, "*"):
             groups[f"{b}|{persist}|{sg}"].append(row)
     cal = {}
     for key, rows in groups.items():
         best = None
+        nflag = sum(r["f"] for r in rows)
+        adj = 1.0 if nflag >= CALL_MIN_N else CALL_FILL_FACTOR
         for col, hrs in CALL_HORIZONS:
-            v = sorted(r[col] for r in rows if r[col] is not None and r[col] != 999)
+            v = [(r[col], r["w"]) for r in rows if r[col] is not None and r[col] != 999]
             if len(v) < CALL_MIN_N:
                 continue
-            med = statistics.median(v)
+            med = _wquant(v, 0.5) * adj
             if best is None or med > best["med"] + 0.5:          # prefer the shorter hold unless clearly better
-                best = {"col": col, "h": hrs, "med": med, "win": sum(x > 0 for x in v) / len(v),
-                        "p20": v[len(v) // 5], "n": len(v)}
+                tw = sum(w for _, w in v)
+                best = {"col": col, "h": hrs, "med": med, "win": sum(w for x, w in v if x > 0) / tw,
+                        "p20": _wquant(v, 0.2), "n": len(v), "adj": adj}
         if best:
-            b3 = sorted(r["best3"] for r in rows if r["best3"] is not None and r["best3"] != 999)
-            best["best3"] = statistics.median(b3) if b3 else None
+            b3 = [(r["best3"], r["w"]) for r in rows if r["best3"] is not None and r["best3"] != 999]
+            best["best3"] = _wquant(b3, 0.5) * adj if b3 else None
             cal[key] = best
+    if flag_n >= 30:
+        cal["_gone"] = gone_n / flag_n
     set_meta(db, "call_cal", json.dumps(cal))
     set_meta(db, "call_cal_ts", now)
     db.commit()
@@ -3051,10 +3099,13 @@ def make_call(db, c: Card, f: dict, usual: float | None, now: float):
     thin = ent["n"] < CALL_FIRM_N
     give = max(2 * ent["h"], 3.0)
     hold = f"{ent['h']:.0f} h"
+    gone = cal.get("_gone")
     txt = (f"📞 **Call:** buy ≤ **{k(cap)}** · list **{k(target)}**" + (f" (stretch {k(stretch)})" if stretch else "")
            + f" · hold ~**{hold}** · expect **{exp_net:+.0f}% net** (win {ent['win'] * 100:.0f}%, "
            + (f"⚠️ thin n={ent['n']}" if thin else f"n={ent['n']}") + f") · bad case {ent['p20']:+.0f}% · "
-           f"not sold after {give:.0f} h: list at the floor")
+           f"not sold after {give:.0f} h: list at the floor"
+           + (f"\n↳ ⏱ about {gone * 100:.0f}% of such listings are gone by the next update: buy within a minute or skip" if gone else "")
+           + ("" if ent.get("adj", 1.0) == 1.0 else " · estimate scaled ×%.1f until fills are measured" % ent["adj"]))
     return txt, {"cap": cap, "target": target, "stretch": stretch, "hold_h": ent["h"], "exp_net": exp_net,
                  "win": ent["win"], "n": ent["n"], "key": key}
 
@@ -3672,6 +3723,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
         try:
             resolve_shadow(db, now)
             update_gates(db, now)
+            resolve_alive(db, now)
             calibrate_calls(db, now)
             resolve_calls(db, now)
         except Exception as e:
