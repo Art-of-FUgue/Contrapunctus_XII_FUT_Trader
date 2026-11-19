@@ -250,7 +250,7 @@ Posted automatically twice a day (`FC_SUMMARY_HOURS`, default `7,19`; empty = of
 - **Alert scorecard**: for each alert type in the last 12 h (first alert per card, older than 1 h), the net after tax + haircut if sold now at today's floor: average, median and share in profit. This is a hindsight check on the rules, not what you could actually list at.
 - **Cards you hold** (`purchased.json`): floor now and net if sold now.
 
-### 5.8 📊 Market Index · 24 h trend (every 3 h)
+### 5.8 📊 Market Index · 24 h trend (off by default since the 12 h summary carries the same segment table; `FC_INDEX_POST_HOURS=3` brings it back)
 Equal-weighted, chain-linked price basket (cards ≥ 10k, ≥ 5 cards per step) per segment, shown over 1 h / 6 h / 12 h / 24 h with a sparkline and the mood of the last 6 h.
 
 ### 5.9 Off or limited
@@ -266,6 +266,10 @@ Every fast / volume alert is logged in `shadow_alerts` with what two adaptive la
 - **Layer 1, market regime** (`regime` table, hourly): from established cards (≥ 10k, not muted-new) the mean 24 h move (clipped ±30 %), median 6 h / 24 h move and the share of changed cards that fell. `falling` = mean ≤ −1.5 % or ≥ 65 % falling; `soft` = mean ≤ −0.5 % or ≥ 55 %; else `calm`. Required drop for a fast drop / volume drop / minimum % under 4-day sold: calm 10 / 8 / 5, soft 12 / 10 / 6, falling 15 / 12 / 8.
 - **Layer 2, learned pausing** (`gate` table, hourly): alerts are bucketed by kind (fast / volume) × segment (Icons, Heroes, TOTW, Other promos, Holos) × depth (8–10, 10–15, 15+ %). A bucket is paused while the median 3 h net of its last 48 h of resolved alerts (all of them, passed or not, so there is no selection bias) is below +1 %, needs ≥ 12 resolved alerts to be judged, and resumes only at ≥ +2 % (hysteresis).
 - `would_pass` = both layers pass; `reason` says why not. The bot command `shadow` shows the market now, paused buckets, and the median 3 h net / win rate of the alerts that would stay vs be suppressed over the last 48 h. Plan: compare after 1–2 weeks and switch it on only if the suppressed alerts were clearly the worse ones.
+
+### 5.12 Fewer repeats
+- **Cooldown for held / watchlist posts**: 💰 Your Card (spike and sell-now) and 🎯 Watchlist Buy post once per card, then stay quiet for `FC_QUIET_HOURS` (6) unless the price moved `FC_QUIET_MOVE_PCT` (5 %) since the last post. Before this, a held card re-posted every few minutes (141 posts a day for one card).
+- Shorter embeds: the Active / Mixed / Quiet legend is gone (the tag on each card stays), the Fast Drop footer is one line, "was X at the previous update" is "was X", and a drop that carries a 📞 call drops the net / break-even half of its tier line.
 
 ### 5.11 Low-confidence drops and calls
 - **🔹 Low-confidence drops** (`FC_LOWCONF`, default on): fast / volume drops that the adaptive rules of 5.10 would suppress are no longer hidden. They go into one grey embed, one line each with the reason, no call, and a footer with how past low-confidence drops did (median 3 h net, win rate over 14 days). `FC_LOWCONF=0` posts them as normal drops again.
@@ -320,7 +324,8 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_WATCH_REASSESS_HOURS` / `FC_WATCH_EXPIRE_HOURS` | 36 / 72 | watch position timing |
 | `FC_OWNED_SPIKE_PCT` | 15 | owned-card spike threshold |
 | `FC_SUMMARY_HOURS` | `7,19` | Austin hours for the 12-hour summary |
-| `FC_INDEX_POST_HOURS` | 3 | market index cadence (0 = off) |
+| `FC_INDEX_POST_HOURS` | 0 | market index cadence in hours (0 = off; the 12 h summary has the segment table, the index is still recorded) |
+| `FC_QUIET_HOURS` / `FC_QUIET_MOVE_PCT` | 6 / 5 | a held or watchlist card posts once, then waits this many hours unless its price moved this many % since the last post |
 | `FC_WINDOWS_POST_HOURS` | 0 | buy-window report cadence (0 = off) |
 | `FC_SPIKE_ALERTS` | 0 | enable spike alerts |
 | `FC_TIMEZONE` | `America/Chicago` | displayed time zone |
