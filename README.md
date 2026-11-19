@@ -169,8 +169,8 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 ### 5.2 ⚡ Fast Drop · vs the previous price update
 - Reference = the price at the previous fut.gg update (median of the snapshots in the last `FC_FLASH_WINDOW_MIN` minutes, default 1, else the newest earlier snapshot). **fut.gg publishes new prices only about every 5–6 minutes** (measured: median spacing 6 min, 90 % under 7 min), so in practice this is "the drop since the last update" and each line shows how many minutes ago that was. Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
-- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) skips this filter, because it can be flipped right away. The hint line of such a card shows ⚪ and how far the floor sits from the sold median.
-- **Hint lines** (see 5.0): 🟢 8 %+ under sold · 🟡 5–8 % under · ⚪ liquid / volume card with no sold filter, then the card-facts line (behaviour type, list, size, sales/24 h, holo).
+- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) has a looser filter instead: the floor must be at least **3 % under** the 4-day sold median (`FC_FAST_LIQUID_MIN_UNDER`), because it can be flipped right away. Past alerts that sat **over** the sold price lost money (median 3 h net −2 % at 0–5 % over, −8 % at 15–30 % over, −16 % beyond 30 % over, 3,300 alerts), so a drop that only comes back from a spike no longer alerts. The hint line of such a card shows ⚪ and how far the floor sits under the sold median.
+- **Hint lines** (see 5.0): 🟢 8 %+ under sold · 🟡 5–8 % under · ⚪ liquid / volume card, 3–5 % under sold, then the card-facts line (behaviour type, list, size, sales/24 h, holo).
 - Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
 
 ### 5.2b 📦 Volume Drop · vs the previous price update (volume list)
@@ -314,7 +314,8 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_LOWCONF` / `FC_CALLS` | `1` / `1` | post shadow-suppressed drops as 🔹 low-confidence; add 📞 calls to confident drops (5.11) |
 | `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | (secrets) | bot used to read what you type in the channel (5.6b) |
 | `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on the volume list (instead of 10) |
-| `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid and exempt from the sold-median filter |
+| `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid (looser sold filter) |
+| `FC_FAST_LIQUID_MIN_UNDER` | 3 | liquid / volume cards: minimum % under the 4-day sold median |
 | `FC_BID_SHEET` | bid_sheet.json | output file of the bid sheet |
 | `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
 | `FC_PREMIUM_ICON_HERO_MIN` / `FC_PREMIUM_PROMO_MIN` | 100k / 300k | premium list thresholds |
