@@ -483,6 +483,17 @@ def repeat_blocked(db, card_id: str, kind: str, price: float, now: float) -> boo
     return bool(row and row[0] > 0 and abs(price / row[0] - 1) * 100 < REPEAT_MOVE_PCT)
 
 
+QUIET_HOURS = float(os.environ.get("FC_QUIET_HOURS", "6"))        # a card you hold / watch posts once, then waits this long...
+QUIET_MOVE_PCT = float(os.environ.get("FC_QUIET_MOVE_PCT", "5"))  # ...unless its price moved this much since the last post
+
+
+def quiet_blocked(db, card_id: str, kind: str, price: float, now: float) -> bool:
+    """Per-card cooldown for owned / watchlist posts: no repeat inside QUIET_HOURS unless the price moved QUIET_MOVE_PCT."""
+    row = db.execute("select price from alerts where card_id=? and kind=? and ts>=? order by ts desc limit 1",
+                     (card_id, kind, now - QUIET_HOURS * 3600)).fetchone()
+    return bool(row and row[0] > 0 and abs(price / row[0] - 1) * 100 < QUIET_MOVE_PCT)
+
+
 def fresh_dips(db, items, now: float, kind: str):
     out = []
     try:
@@ -696,7 +707,7 @@ def watch_dip(db, card: Card, now: float):
         return None
     pct = (card.price - usual) / usual * 100
     kind = "watch"
-    if repeat_blocked(db, card.card_id, kind, card.price, now):
+    if quiet_blocked(db, card.card_id, kind, card.price, now):
         return None
     est_h = estimate_sell_hours(db, card, tgt[0], now)
     est_ts = now + est_h * 3600
@@ -776,7 +787,7 @@ def build_watch_dips(items, auto: set[str]) -> list[dict]:
             eh_str = f"{eh:.1f}h" if eh % 1 != 0 else f"{int(eh)}h"
             lines.append(f"↳ ⏱ est. sell <t:{int(d['est_ts'])}:t> (~{eh_str}, <t:{int(d['est_ts'])}:R>)")
         lines.append(name_block(c))
-    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched", BEH_LEGEND]
+    lines += ["", "⭐ = on your watchlist · 🔁 = auto-watched"]
     e = {"title": f"🎯 Watchlist Buy Signal · {PLATFORM_LABEL}",
          "description": "\n".join(lines), "color": 0x9B59B6,
          "footer": {"text": f"Buy signal: {AUTO_DIP_PCT:.0f}%+ under 24 h median · "
@@ -1032,10 +1043,7 @@ def owned_spikes(db, cards_map: dict, purchased: dict, now: float) -> list:
         up = (c.price - buy) / buy * 100
         if up < OWNED_SPIKE_PCT:
             continue
-        row = db.execute("select price from alerts where card_id=? and kind='owned' and ts>=? "
-                         "order by ts desc limit 1",
-                         (cid, now - float(DIP_COOLDOWN_MIN) * 60)).fetchone()
-        if row and c.price < row[0] * (1 + DIP_REALERT_PCT / 100):
+        if quiet_blocked(db, cid, "owned", c.price, now):
             continue
         db.execute("insert into alerts values (?,?,?,?)", (cid, "owned", now, c.price))
         net = (c.price * (1 - EA_TAX) - buy) / buy * 100
@@ -1064,7 +1072,7 @@ def owned_sells(db, cards_map: dict, purchased: dict, now: float) -> list:
                 target, ref = fair[0], fair[1]
             else:
                 target, ref = floor_t, f"+{OWNED_MIN_NET:.0f}% net"
-        if c.price < target or repeat_blocked(db, cid, "owned_sell", c.price, now):
+        if c.price < target or quiet_blocked(db, cid, "owned_sell", c.price, now):
             continue
         db.execute("insert into alerts values (?,?,?,?)", (cid, "owned_sell", now, c.price))
         out.append((c, {"buy": buy, "target": target, "ref": ref,
@@ -1461,21 +1469,19 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             for c, f, pct in grp:
                 lines.append(f"### {k(c.price)} · {c.name} · {c.kind}")
                 ago = f" ({f['age_min']:.0f} min ago)" if f.get("age_min") else ""
-                lines.append(f"📉 `{pct:.1f}%` · was **{k(f['prev_price'])}** at {w}{ago}{open_link(c)}")
+                lines.append(f"📉 `{pct:.1f}%` · was **{k(f['prev_price'])}**{ago}{open_link(c)}")
                 if f.get("tier"):
-                    lines.append(f"↳ {f['tier']}")
+                    lines.append(f"↳ {f['tier'].split(' · 🎯')[0] if f.get('call') else f['tier']}")   # the call already has net and prices
                 if f.get("call"):
                     lines.append(f["call"])
                 lines.append(facts_line(c))
                 lines.append(name_block(c))
         if vol:
-            lines += ["", "Volume list: high-turnover cards (automatic), no sold-median filter · "
-                          "small margin, quick flip", BEH_LEGEND]
+            lines += ["", "Volume list: high-turnover cards, no sold filter · small margin, quick flip"]
             title, color, foot = f"📦 Volume Drop · vs {w} · {PLATFORM_LABEL}", 0x3498DB, \
                 f"Volume Drop · {FAST_VOLUME_DIP_PCT:.0f}%+ below {w}"
         else:
-            lines += ["", f"Only drops landing {FAST_MIN_UNDER_SOLD:.0f}%+ under the 4-day sold price are posted (cards with ≥{FAST_LIQUID_N24} sales/24 h excepted) · "
-                          "🟢 8%+ under (best past results) · 🟡 5–8% under · ⚪ no sold filter", BEH_LEGEND]
+            lines += ["", "🟢 8%+ under 4-day sold · 🟡 5–8% · ⚪ liquid card, no sold filter"]
             title, color, foot = f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", 0x1ABC9C, \
                 f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"
         e = {"title": title, "description": "\n".join(lines), "color": color, "footer": {"text": foot}}
@@ -1522,7 +1528,6 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
             lines.append(f"↳ {target_line(c.price, s['sales_median'], _premium_ref(s).strip('*'))}")
             lines.append(facts_line(c))
             lines.append(name_block(c))
-    lines += ["", BEH_LEGEND]
     if hot:
         lines += ["", "vs sold: 🔴 net 20%+ · 🟠 10–20% · 🟢 5–10%"]
     else:
@@ -1542,7 +1547,7 @@ def build_premium_dips(items, hot: bool = False) -> list[dict]:
 
 
 # ---- market index: how the whole market is moving -------------------------------
-INDEX_POST_HOURS = float(os.environ.get("FC_INDEX_POST_HOURS", "3"))   # 0 = never post the index
+INDEX_POST_HOURS = float(os.environ.get("FC_INDEX_POST_HOURS", "0"))   # 0 = never post the index
 INDEX_HOURS = 24                     # the index is 100 at the start of this window
 INDEX_MIN_PRICE = 10_000             # cards cheaper than this are too noisy for the basket
 INDEX_MIN_CARDS = 5                  # a segment needs this many cards in a step to move
