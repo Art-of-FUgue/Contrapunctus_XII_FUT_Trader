@@ -153,6 +153,7 @@ FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as m
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
 FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
 FAST_LIQUID_N24 = int(os.environ.get("FC_FAST_LIQUID_N24", "10"))           # liquid card: this many sales/24 h skips the sold-median filter
+FAST_LIQUID_MIN_UNDER = float(os.environ.get("FC_FAST_LIQUID_MIN_UNDER", "3"))   # liquid / volume cards: at least this % under 4-day sold
 FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a volume-list card
 
 
@@ -2670,7 +2671,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     liquid = bool(sold) and (in_vol or sold["n24"] >= FAST_LIQUID_N24) and sold["fair"] > 0
                     if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
-                        if liquid or under >= FAST_MIN_UNDER_SOLD:      # drops that stay near/above sold lost money
+                        if under >= (FAST_LIQUID_MIN_UNDER if liquid else FAST_MIN_UNDER_SOLD):   # still over the sold price: lost money
                             flash_dips.append((c, dict(f, vol=in_vol, under=under, liquid=liquid, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
@@ -2918,7 +2919,8 @@ def record_shadow(db, items, regime: dict, now: float) -> dict:
         elif not l1:
             why.append(f"only {under:.0f}% under sold, {under_req:.0f}% needed ({regime['mode']} market)")
         if not l2:
-            why.append(f"{key} paused: recent median {g[1]:+.1f}% over {g[2]}")
+            kd, gp, dp = key.split("|")
+            why.append(f"{kd} {gp} {dp.replace('-', '–')}% bucket paused (last {GATE_WINDOW_H} h: median {g[1]:+.1f}% over {g[2]} alerts)")
         db.execute("insert into shadow_alerts(ts, card_id, kind, grp, price, drop_pct, under, mode, l1, l2, would_pass, reason) "
                    "values (?,?,?,?,?,?,?,?,?,?,?,?)",
                    (now, c.card_id, kind, grp, c.price, rel, under, regime["mode"], int(bool(l1)), l2,
