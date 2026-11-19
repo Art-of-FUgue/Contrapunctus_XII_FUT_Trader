@@ -3024,6 +3024,40 @@ def resolve_calls(db, now: float) -> None:
     db.commit()
 
 
+def holding_text(db, cards_map: dict, now: float) -> str:
+    """The cards you reported buying and have not sold: floor now, net after tax, target, time held."""
+    held = held_cards(db)
+    if not held:
+        return "📦 You are not holding anything. Log a buy with `Name, promo, price`."
+    meta = {r[0]: r for r in db.execute("select card_id, ts, note from held")}
+    rows = []
+    for cid, buy in held.items():
+        c = cards_map.get(cid)
+        label = _card_label(cid)[:60]
+        age = f" · held {(now - meta[cid][1]) / 3600:.0f} h" if cid in meta and meta[cid][1] else ""
+        if not c or c.price <= 0 or not buy:
+            rows.append((0, f"• {label} · bought {k(buy) if buy else '?'} · not listed right now{age}", 0, 0))
+            continue
+        net = (c.price * (1 - EA_TAX) - buy) / buy * 100
+        target = PURCHASED_TARGETS.get(cid)
+        ref = "your target"
+        if not target:
+            ws = card_stats(db, c, now)
+            fair = sell_target(db, c, now, ws["usual"] if ws else None)
+            floor_t = buy / (1 - EA_TAX) * (1 + OWNED_MIN_NET / 100)
+            target, ref = (fair[0], fair[1]) if fair and fair[0] >= floor_t else (floor_t, f"+{OWNED_MIN_NET:.0f}% net")
+        icon = "✅" if c.price >= target else "🟢" if net > 0 else "🔴"
+        to_t = (target / c.price - 1) * 100
+        rows.append((net, f"{icon} **{label}** · bought {k(buy)} → floor **{k(c.price)}** · `{net:+.1f}%` net · "
+                          f"target {k(target)} ({ref}, {to_t:+.0f}% away){age}", (c.price * (1 - EA_TAX) - buy), buy))
+    rows.sort(key=lambda r: -r[0])
+    tot_p = sum(r[2] for r in rows)
+    tot_b = sum(r[3] for r in rows)
+    head = f"📦 **Holding {len(rows)} card(s)**" + (f" · unrealized {tot_p:+,.0f} coins ({tot_p / tot_b * 100:+.1f}% net) on {k(tot_b)} invested"
+                                                  if tot_b else "")
+    return "\n".join([head] + [r[1] for r in rows])[:1900]
+
+
 def calls_text(db, days: int = 7) -> str:
     now = time.time()
     rows = db.execute("select ts, card_id, buy_cap, target, hold_h, exp_net, r_net, hit from calls where ts >= ? "
@@ -3415,6 +3449,14 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             try:
                 _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
                      json={"content": reply[:1900], "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
+        if low in ("holding", "holdings", "held", "portfolio", "inventory", "active cards"):
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": holding_text(db, cards_map, now), "message_reference": {"message_id": m["id"]},
                            "allowed_mentions": {"parse": []}})
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")

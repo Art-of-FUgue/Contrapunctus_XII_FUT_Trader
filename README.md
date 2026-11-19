@@ -237,6 +237,7 @@ Type in the alert channel (the bot replies to each message):
   - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
   - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
 - **`shadow`**: report of the adaptive-criteria shadow mode (5.10).
+- **`holding`** (also `holdings`, `held`, `portfolio`, `inventory`): the cards you logged as bought and have not sold, with the floor now, net after tax, target, distance to it and time held, plus the unrealized total.
 - **`calls`**: how the 📞 calls of the last 7 days did (5.11).
 - **`trades`** (or `trades 30` for 30 days; default 7): summary of closed trades: profit, median net, win %, median hold; split by source (alert kind / note / own find), list, price band, promo; and how far under the sold price you bought.
 - **`undo`** reverts your last logged buy or sale.
