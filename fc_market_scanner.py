@@ -150,9 +150,9 @@ def _limit(items: list) -> list:
 # ---- micro-spike / dip / crash (single scan-to-scan delta, ~15 min window) -
 FLASH_SPIKE_PCT = 8.0            # jump between last two snapshots to count as micro-spike
 FLASH_DIP_PCT = float(os.environ.get("FC_FLASH_DIP_PCT", "10"))   # fast drop vs the last 5 minutes (8-10% drops did not pay after tax)
-FAST_MIN_UNDER_SOLD = float(os.environ.get("FC_FAST_MIN_UNDER_SOLD", "5"))   # the new floor must be this % under the 4-day sold median
+FAST_MIN_NET = float(os.environ.get("FC_FAST_MIN_NET", "5"))   # selling at the 4-day sold median must net at least this % after the 5 % EA tax
 FAST_LIQUID_N24 = int(os.environ.get("FC_FAST_LIQUID_N24", "10"))           # liquid card: this many sales/24 h skips the sold-median filter
-FAST_LIQUID_MIN_UNDER = float(os.environ.get("FC_FAST_LIQUID_MIN_UNDER", "3"))   # liquid / volume cards: at least this % under 4-day sold
+FAST_LIQUID_MIN_NET = float(os.environ.get("FC_FAST_LIQUID_MIN_NET", "3"))   # liquid / volume cards: same, looser
 FAST_VOLUME_DIP_PCT = float(os.environ.get("FC_FAST_VOLUME_DIP_PCT", "8"))  # drop % that is enough on a volume-list card
 
 
@@ -1430,9 +1430,9 @@ def drop_tier(c: Card, beh: str | None, under: float, fair: float) -> str:
     """Target line of a fast / volume drop: where the new floor sits against the 4-day sold median
     (🟢 8%+ under, 🟡 5-8%, ⚪ liquid card with no sold filter; past 8%+ drops paid +27% net at 3 h),
     the net if sold there after tax, and the break-even price."""
-    mark = "🟢" if under >= 8 else "🟡" if under >= FAST_MIN_UNDER_SOLD else "⚪"
-    rel = f"{under:.0f}% under" if under >= 0 else f"{-under:.0f}% over"
     net = (fair * (1 - EA_TAX) / c.price - 1) * 100
+    mark = "🟢" if net >= 8 else "🟡" if net >= FAST_MIN_NET else "⚪"
+    rel = f"{under:.0f}% under" if under >= 0 else f"{-under:.0f}% over"
     return (f"{mark} **{rel}** 4-day sold {k(fair)} · 🎯 net {net:+.1f}% at sold · break-even {k(c.price / (1 - EA_TAX))}")
 
 
@@ -1477,9 +1477,9 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
             title, color, foot = f"📦 Volume Drop · vs {w} · {PLATFORM_LABEL}", 0x3498DB, \
                 f"Volume Drop · {FAST_VOLUME_DIP_PCT:.0f}%+ below {w}"
         else:
-            lines += ["", "🟢 8%+ under 4-day sold · 🟡 5–8% · ⚪ liquid card, no sold filter"]
+            lines += ["", "🟢 net 8%+ at 4-day sold · 🟡 net 5–8% · ⚪ liquid card, net 3–5% (after 5% tax)"]
             title, color, foot = f"⚡ Fast Drop · vs {w} · {PLATFORM_LABEL}", 0x1ABC9C, \
-                f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · {FAST_MIN_UNDER_SOLD:.0f}%+ under 4-day sold"
+                f"Fast Drop · {FLASH_DIP_PCT:.0f}%+ below {w} · net {FAST_MIN_NET:.0f}%+ after tax at the 4-day sold price"
         e = {"title": title, "description": "\n".join(lines), "color": color, "footer": {"text": foot}}
         img = next((c.image_url for c, _, _ in drops if c.image_url), None)
         if img:
@@ -2539,7 +2539,8 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                     liquid = bool(sold) and (in_vol or sold["n24"] >= FAST_LIQUID_N24) and sold["fair"] > 0
                     if sold and (liquid or sold["n"] >= FAST_MIN_SALES) and sold["fair"] > 0:
                         under = (sold["fair"] - c.price) / sold["fair"] * 100
-                        if under >= (FAST_LIQUID_MIN_UNDER if liquid else FAST_MIN_UNDER_SOLD):   # still over the sold price: lost money
+                        net_sold = (sold["fair"] * (1 - EA_TAX) / c.price - 1) * 100     # profit after tax if it sells at the sold price
+                        if net_sold >= (FAST_LIQUID_MIN_NET if liquid else FAST_MIN_NET):
                             flash_dips.append((c, dict(f, vol=in_vol, under=under, liquid=liquid, tier=drop_tier(c, beh_types.get(c.card_id), under, sold["fair"])), rel))
 
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
