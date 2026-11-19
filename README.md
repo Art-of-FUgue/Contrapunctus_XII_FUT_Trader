@@ -169,8 +169,8 @@ Turned off because 6 h dips did not pay after tax in practice, **but the rule st
 ### 5.2 ⚡ Fast Drop · vs the previous price update
 - Reference = the price at the previous fut.gg update (median of the snapshots in the last `FC_FLASH_WINDOW_MIN` minutes, default 1, else the newest earlier snapshot). **fut.gg publishes new prices only about every 5–6 minutes** (measured: median spacing 6 min, 90 % under 7 min), so in practice this is "the drop since the last update" and each line shows how many minutes ago that was. Cards ≥ 10k, not on the premium list.
 - Fires at **≥ 10 %** below it after market adjustment (`FC_FLASH_DIP_PCT`; was 8 %, but 8–10 % drops returned ≈ +1 % net on cards under 100k). There is no separate crash tier. Same per-type cooldowns as dips (Active 5 / Mixed 10 / Quiet 15 min).
-- **Sold-median filter:** the alert is posted **only if the new floor is ≥ 5 % under the 4-day sold median** (recency-weighted, needs ≥ 8 sales; `FC_FAST_MIN_UNDER_SOLD`). In the 26 h sample, drops landing ≥ 8 % under sold returned about +27 % net at 3 h (14 of 14 won), while drops within 5 % of it (or above) returned ≈ −1.5 % to −3.5 % — about a third of all fast drops. Cards without enough sales data are not alerted (the thin-card filter already requires ≥ 15). **Exception — liquid cards:** a card with ≥ 10 inferred sales in the last 24 h (`FC_FAST_LIQUID_N24`) has a looser filter instead: the floor must be at least **3 % under** the 4-day sold median (`FC_FAST_LIQUID_MIN_UNDER`), because it can be flipped right away. Past alerts that sat **over** the sold price lost money (median 3 h net −2 % at 0–5 % over, −8 % at 15–30 % over, −16 % beyond 30 % over, 3,300 alerts), so a drop that only comes back from a spike no longer alerts. The hint line of such a card shows ⚪ and how far the floor sits under the sold median.
-- **Hint lines** (see 5.0): 🟢 8 %+ under sold · 🟡 5–8 % under · ⚪ liquid / volume card, 3–5 % under sold, then the card-facts line (behaviour type, list, size, sales/24 h, holo).
+- **Net-profit filter:** the alert is posted **only if selling at the 4-day sold median (recency-weighted, needs ≥ 8 sales) would net at least +5 % after the 5 % EA tax** (`FC_FAST_MIN_NET`), the same "net at sold" figure the post shows. That means the floor must sit about 9.5 % or more under sold. **Liquid cards** (≥ 10 inferred sales in 24 h, `FC_FAST_LIQUID_N24`, and every volume-list card) need only **+3 % net** (`FC_FAST_LIQUID_MIN_NET`, about 7.6 % under sold) because they can be flipped right away. On past alerts this rule keeps about 320 of 490 alerts a day and lifts the median 3 h result from +4.8 % to +6.7 % (win rate 72 % to 77 %); the dropped ones averaged +1.9 %. A drop still over the sold price never alerts (past ones lost −2 % to −16 %). Cards without enough sales data are not alerted.
+- **Hint lines** (see 5.0): 🟢 net 8 %+ at sold · 🟡 net 5–8 % · ⚪ liquid / volume card, net 3–5 %, then the card-facts line (behaviour type, list, size, sales/24 h, holo).
 - Reading it: the profit comes from being first. When the cheap listing is still there on the next scan the 3 h result was negative (price reset lower); when it was gone (sniped) the floor bounced back.
 
 ### 5.2b 📦 Volume Drop · vs the previous price update (volume list)
@@ -310,13 +310,13 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_DIP_COOLDOWN_ACTIVE/MIXED/QUIET` | 5 / 10 / 15 min | dip cooldown by type |
 | `FC_FLASH_WINDOW_MIN` | 1 | reference window of the fast drop (falls back to the previous snapshot) |
 | `FC_FLASH_DIP_PCT` | 10 | fast-drop minimum % below the previous update |
-| `FC_FAST_MIN_UNDER_SOLD` | 5 | a fast drop must land this % under the 4-day sold median or it is not posted (liquid cards excepted) |
+| `FC_FAST_MIN_NET` | 5 | a fast drop must net at least this % after tax if sold at the 4-day sold median (liquid cards: `FC_FAST_LIQUID_MIN_NET`) |
 | `FC_VOLUME_MIN_N24` / `FC_VOLUME_MIN_N96` / `FC_VOLUME_MAX_PRICE` / `FC_VOLUME_MAX_SIGMA` | 60 / 40 / 160000 / 10 | automatic volume-list filter |
 | `FC_LOWCONF` / `FC_CALLS` | `1` / `1` | post shadow-suppressed drops as 🔹 low-confidence; add 📞 calls to confident drops (5.11) |
 | `DISCORD_BOT_TOKEN` / `DISCORD_CHANNEL_ID` | (secrets) | bot used to read what you type in the channel (5.6b) |
 | `FC_FAST_VOLUME_DIP_PCT` | 8 | drop % that is enough for a card on the volume list (instead of 10) |
 | `FC_FAST_LIQUID_N24` | 10 | sales/24 h that make a card liquid (looser sold filter) |
-| `FC_FAST_LIQUID_MIN_UNDER` | 3 | liquid / volume cards: minimum % under the 4-day sold median |
+| `FC_FAST_LIQUID_MIN_NET` | 3 | liquid / volume cards: minimum net % after tax at the sold median |
 | `FC_BID_SHEET` | bid_sheet.json | output file of the bid sheet |
 | `FC_DIP6H_ALERTS` | 0 | turn the 6 h dip alert back on (1) |
 | `FC_PREMIUM_ICON_HERO_MIN` / `FC_PREMIUM_PROMO_MIN` | 100k / 300k | premium list thresholds |
