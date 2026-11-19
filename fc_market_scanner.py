@@ -2859,7 +2859,7 @@ REGIME_REQ = {            # mode: (fast drop %, volume drop %, min % under 4-day
 GATE_MIN_N = 12           # resolved alerts needed before a bucket can be paused
 GATE_STAY_MED = 1.0       # a bucket stays on while its median 3 h net is at least this %
 GATE_RESUME_MED = 2.0     # ...and a paused one needs this to come back (hysteresis)
-ADAPT_OVERRIDE_UNDER = float(os.environ.get("FC_ADAPT_OVERRIDE_UNDER", "5"))   # this far under 4-day sold: never low-confidence
+ADAPT_OVERRIDE_UNDER = float(os.environ.get("FC_ADAPT_OVERRIDE_UNDER", "999"))   # this far under 4-day sold: never low-confidence (999 = off, the default)
 GATE_WINDOW_H = 48
 
 
