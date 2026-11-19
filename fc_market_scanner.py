@@ -2727,6 +2727,7 @@ REGIME_REQ = {            # mode: (fast drop %, volume drop %, min % under 4-day
 GATE_MIN_N = 12           # resolved alerts needed before a bucket can be paused
 GATE_STAY_MED = 1.0       # a bucket stays on while its median 3 h net is at least this %
 GATE_RESUME_MED = 2.0     # ...and a paused one needs this to come back (hysteresis)
+ADAPT_OVERRIDE_UNDER = float(os.environ.get("FC_ADAPT_OVERRIDE_UNDER", "5"))   # this far under 4-day sold: never low-confidence
 GATE_WINDOW_H = 48
 
 
@@ -2781,6 +2782,8 @@ def record_shadow(db, items, regime: dict, now: float) -> dict:
         key = f"{kind}|{grp}|{_shadow_depth(rel)}"
         g = gates.get(key)
         l2 = 1 if (not g or g[0]) else 0
+        strong = under is not None and under >= ADAPT_OVERRIDE_UNDER      # clearly under the sold price: always confident
+        ok = (bool(l1) and bool(l2)) or strong
         why = []
         if -rel < need:
             why.append(f"drop {-rel:.0f}% < {need:.0f}% needed ({regime['mode']} market)")
@@ -2792,8 +2795,8 @@ def record_shadow(db, items, regime: dict, now: float) -> dict:
         db.execute("insert into shadow_alerts(ts, card_id, kind, grp, price, drop_pct, under, mode, l1, l2, would_pass, reason) "
                    "values (?,?,?,?,?,?,?,?,?,?,?,?)",
                    (now, c.card_id, kind, grp, c.price, rel, under, regime["mode"], int(bool(l1)), l2,
-                    int(bool(l1) and bool(l2)), "; ".join(why) or None))
-        out[c.card_id] = (bool(l1) and bool(l2), "; ".join(why))
+                    int(ok), ("; ".join(why) or None) if not strong else None))
+        out[c.card_id] = (ok, "; ".join(why))
     db.execute("delete from shadow_alerts where ts < ?", (now - 30 * 86400,))
     db.commit()
     return out
