@@ -378,9 +378,6 @@ def open_db(path: str) -> sqlite3.Connection:
                "ts real, price int, usual int, dip real, mkt real, typ text, seg text, band text, "
                "persist int, fair int, sale_near int, wd int, hr int, x3 real, x6 real, x12 real)")
     db.execute("create index if not exists dx on dip_events(card_id, ts)")
-    for tbl in ("dip_events", "shadow_alerts"):                   # alive: 1 = the dip listing was still there at the next update
-        if "alive" not in {r[1] for r in db.execute(f"pragma table_info({tbl})")}:
-            db.execute(f"alter table {tbl} add column alive int")
     have = {r[1] for r in db.execute("pragma table_info(dip_events)")}
     for col in ("xm15", "xm60", "best3", "d6"):             # quick-flip outcomes, and the 6 h-ago dip %, added later
         if col not in have:
@@ -418,6 +415,9 @@ def open_db(path: str) -> sqlite3.Connection:
     db.execute("create table if not exists gate(key text primary key, on_ int, med real, n int, ts real)")
     db.execute("create table if not exists trades(id integer primary key autoincrement, card_id text, buy_price int, "
                "buy_ts real, sell_price int, sell_ts real, net real, profit int, hold_h real, ctx text, note text)")
+    for tbl in ("dip_events", "shadow_alerts"):                   # alive: 1 = the dip listing was still there at the next update
+        if "alive" not in {r[1] for r in db.execute(f"pragma table_info({tbl})")}:
+            db.execute(f"alter table {tbl} add column alive int")
     return db
 
 
