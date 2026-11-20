@@ -237,6 +237,7 @@ Type in the alert channel (the bot replies to each message):
   - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
   - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
 - **`shadow`**: report of the adaptive-criteria shadow mode (5.10).
+- **`fills`**: how often you got the cards you reacted on (5.13).
 - **`holding`** (also `holdings`, `held`, `portfolio`, `inventory`): the cards you logged as bought and have not sold, with the floor now, net after tax, target, distance to it and time held, plus the unrealized total.
 - **`calls`**: how the 📞 calls of the last 7 days did (5.11).
 - **`trades`** (or `trades 30` for 30 days; default 7): summary of closed trades: profit, median net, win %, median hold; split by source (alert kind / note / own find), list, price band, promo; and how far under the sold price you bought.
@@ -268,6 +269,13 @@ Every fast / volume alert is logged in `shadow_alerts` with what two adaptive la
 - **Layer 2, learned pausing** (`gate` table, hourly): alerts are bucketed by kind (fast / volume) × segment (Icons, Heroes, TOTW, Other promos, Holos) × depth (8–10, 10–15, 15+ %). A bucket is paused while the median 3 h net of its last 48 h of resolved alerts (all of them, passed or not, so there is no selection bias) is below +1 %, needs ≥ 12 resolved alerts to be judged, and resumes only at ≥ +2 % (hysteresis).
 - **Override** (`FC_ADAPT_OVERRIDE_UNDER`, **off by default** = 999; set 5 to use it): a drop that lands at least 5 % under the 4-day sold median always counts as confident, whatever the market state or its bucket. Check on 8,647 suppressed alerts: those 5–8 % under returned +1.5 % median net at 3 h (59 % won), 8–15 % under +2.9 % (65 %), 15 %+ under +5.1 % (72 %); the suppressed group only looked flat because 3,381 of them sat over the sold price (−3 %), and those no longer alert at all. So how far under the sold price a card is predicts the result better than the market state or the bucket.
 - `would_pass` = both layers pass; `reason` says why not. The bot command `shadow` shows the market now, paused buckets, and the median 3 h net / win rate of the alerts that would stay vs be suppressed over the last 48 h. Plan: compare after 1–2 weeks and switch it on only if the suppressed alerts were clearly the worse ones.
+
+### 5.13 Reaction buttons and the fill tracker
+- With the bot on (`FC_TRACK_FILLS`, default on) every ⚡ Fast Drop / 📦 Volume Drop is **its own message** (one card each), and the bot pre-adds three reactions: **✅ bought**, **❌ missed** (listing gone, someone else got it), **💤 offline** (could not act). Tap one; no typing needed.
+- Each scan the bot reads the last 100 channel messages and picks up your reactions on drop alerts of the last 12 h. **✅ logs the buy at the alert price** (note "reaction", it then appears in `holding` and gets sell alerts; type `bought Name, promo, price` to correct the price). ❌ and 💤 only feed the statistics. If you add several, ✅ wins over ❌ over 💤.
+- Bot permissions needed in the channel: Read Message History (already) and **Add Reactions** (to pre-add the buttons; without it the bot says so once and you add the emoji by hand).
+- Table `posts` stores message id, card, alert price, drop and under-sold %, outcome and when the reaction was first seen. The bot command `fills` shows tries vs ✅, by drop size, by whether the listing was already gone at the next update (compare with `FC_CALL`'s 60 % catch assumption `CALL_GONE_W`) and the median time from alert to your ✅. Nothing feeds the calls automatically yet; the numbers are there to set `CALL_GONE_W` by hand once there are 30+ tries.
+- Messages per day go up because drops are no longer grouped; `FC_TRACK_FILLS=0` restores the grouped embeds.
 
 ### 5.12 Fewer repeats
 - **Cooldown for held / watchlist posts**: 💰 Your Card (spike and sell-now) and 🎯 Watchlist Buy post once per card, then stay quiet for `FC_QUIET_HOURS` (6) unless the price moved `FC_QUIET_MOVE_PCT` (5 %) since the last post. Before this, a held card re-posted every few minutes (141 posts a day for one card).

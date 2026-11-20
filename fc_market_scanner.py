@@ -406,6 +406,8 @@ def open_db(path: str) -> sqlite3.Connection:
             db.execute(f"alter table held add column {col} {typ}")
     db.execute("create table if not exists regime(hour_ts integer primary key, mode text, med6 real, med24 real, "
                "share_down real, n integer)")
+    db.execute("create table if not exists posts(msg_id text primary key, card_id text, price int, ts real, kind text, "
+               "drop_pct real, under real, outcome text, seen_ts real)")
     db.execute("create table if not exists calls(id integer primary key autoincrement, ts real, card_id text, price int, "
                "buy_cap int, target int, stretch int, hold_h real, exp_net real, win real, n int, key text, "
                "r_net real, hit int, done int default 0)")
@@ -1494,6 +1496,14 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
         return e
 
     drops = list(dip_items)
+    if TRACK_FILLS and bot_on():                  # one message per card, so a reaction belongs to exactly one card
+        for d in sorted(drops, key=lambda i: i[2]):
+            e = drop_embed([d], bool(d[1].get("vol")))
+            e["footer"] = {"text": e["footer"]["text"] + "  ·  React: ✅ bought · ❌ missed · 💤 offline"}
+            e["_track"] = {"card": d[0].card_id, "price": d[0].price, "kind": "volume" if d[1].get("vol") else "fast",
+                           "drop": d[2], "under": d[1].get("under")}
+            embeds.append(e)
+        return embeds
     general = [d for d in drops if not d[1].get("vol")]
     volume = [d for d in drops if d[1].get("vol")]
     if general:
@@ -2786,18 +2796,124 @@ def send_discord(payload: dict) -> "requests.Response":
     return requests.post(WEBHOOK_URL, json=payload, timeout=10)
 
 
-def post(embeds: list[dict], dry_run: bool) -> None:
-    flat = [part for e in embeds for part in split_embed(e)]
-    for e in flat:
-        if dry_run:
-            print(json.dumps(e, ensure_ascii=False, indent=2))
+TRACK_FILLS = os.environ.get("FC_TRACK_FILLS", "1") != "0"      # drop alerts as one message per card, with reaction buttons
+REACT_EMOJI = {"bought": "✅", "missed": "❌", "offline": "💤"}
+_REACT_BY_EMOJI = {v: k_ for k_, v in REACT_EMOJI.items()}
+
+
+def add_reactions(mid: str) -> bool:
+    """Pre-add the three buttons so one tap is enough. False when the bot may not add reactions."""
+    from urllib.parse import quote
+    for em in REACT_EMOJI.values():
+        r = _bot("PUT", f"/channels/{BOT_CHANNEL}/messages/{mid}/reactions/{quote(em, safe='')}/@me")
+        if r is None or r.status_code == 403:
+            return False
+        time.sleep(0.3)
+    return True
+
+
+def post(embeds: list[dict], dry_run: bool, db=None) -> None:
+    tracked = 0
+    for e0 in embeds:
+        track = e0.pop("_track", None)
+        for e in split_embed(e0):
+            if dry_run:
+                print(json.dumps(e, ensure_ascii=False, indent=2))
+                continue
+            r = send_discord({"embeds": [e]})
+            if r.status_code == 400:                      # show what Discord objected to
+                print(f"[error] Discord 400 for '{e.get('title')}': {r.text[:300]} "
+                      f"(description {len(e.get('description', ''))} chars)")
+            r.raise_for_status()
+            if track and db is not None and bot_on():
+                try:
+                    mid = r.json().get("id")
+                    if mid:
+                        db.execute("insert or ignore into posts(msg_id, card_id, price, ts, kind, drop_pct, under) "
+                                   "values (?,?,?,?,?,?,?)", (mid, track["card"], track["price"], time.time(),
+                                                              track["kind"], track["drop"], track["under"]))
+                        db.commit()
+                        if tracked < 10 and get_meta(db, "react_perm") != "no":
+                            tracked += 1
+                            if not add_reactions(mid):
+                                set_meta(db, "react_perm", "no")
+                                _webhook_note(db, "react_note", "ℹ️ The bot cannot add reactions here (it needs the "
+                                              "**Add Reactions** permission). Alerts can still be reacted to by hand: "
+                                              "✅ bought · ❌ missed · 💤 offline.")
+                except Exception as ex:
+                    print(f"[warn] could not track post: {ex}")
+            time.sleep(1)
+
+
+def read_reactions(db, now: float) -> None:
+    """Your ✅ / ❌ / 💤 on recent drop alerts. ✅ logs the buy at the alert price (type the real price to correct it)."""
+    if not bot_on():
+        return
+    rows = {r[0]: r for r in db.execute("select msg_id, card_id, price, ts, outcome, seen_ts from posts where ts >= ?",
+                                         (now - 12 * 3600,))}
+    db.execute("delete from posts where ts < ?", (now - 45 * 86400,))
+    if not rows:
+        return
+    r = _bot("GET", f"/channels/{BOT_CHANNEL}/messages", params={"limit": 100})
+    if r is None or not r.ok:
+        return
+    held = held_cards(db)
+    for m in r.json():
+        row = rows.get(m.get("id"))
+        if not row:
             continue
-        r = send_discord({"embeds": [e]})
-        if r.status_code == 400:                      # show what Discord objected to
-            print(f"[error] Discord 400 for '{e.get('title')}': {r.text[:300]} "
-                  f"(description {len(e.get('description', ''))} chars)")
-        r.raise_for_status()
-        time.sleep(1)
+        mine = set()
+        for rx in m.get("reactions") or []:
+            name = (rx.get("emoji") or {}).get("name")
+            if name in _REACT_BY_EMOJI and rx.get("count", 0) - (1 if rx.get("me") else 0) > 0:
+                mine.add(name)
+        if not mine:
+            continue
+        out = _REACT_BY_EMOJI["✅" if "✅" in mine else "❌" if "❌" in mine else "💤"]
+        if out == row[4]:
+            continue
+        db.execute("update posts set outcome=?, seen_ts=coalesce(seen_ts, ?) where msg_id=?", (out, now, row[0]))
+        cid, price = row[1], row[2]
+        if out == "bought" and cid not in held:
+            ctx = buy_context(db, cid, price, now)
+            db.execute("insert or replace into held(card_id, price, target, ts, ctx, note) values (?,?,?,?,?,?)",
+                       (cid, price, None, now, json.dumps(ctx), "reaction"))
+            print(f"[info] reaction: bought {cid} at {price}")
+    db.commit()
+
+
+def fills_text(db, days: int = 14) -> str:
+    now = time.time()
+    rows = db.execute("select p.msg_id, p.card_id, p.ts, p.drop_pct, p.outcome, p.seen_ts, p.kind, "
+                      "(select alive from shadow_alerts s where s.card_id=p.card_id and abs(s.ts-p.ts)<240 limit 1) "
+                      "from posts p where p.ts>=?", (now - days * 86400,)).fetchall()
+    if not rows:
+        return "🎯 No tracked drop alerts yet. Each ⚡/📦 drop is now one message: react ✅ bought · ❌ missed · 💤 offline."
+    reacted = [r for r in rows if r[4]]
+    act = [r for r in reacted if r[4] in ("bought", "missed")]
+    cnt = collections.Counter(r[4] for r in reacted)
+    lines = [f"🎯 **Fills · last {days} d** · {len(rows)} drop alerts, {len(reacted)} reacted "
+             f"(✅ {cnt['bought']} · ❌ {cnt['missed']} · 💤 {cnt['offline']})"]
+    if len(act) >= 5:
+        lines.append(f"You got it **{cnt['bought'] / len(act) * 100:.0f}%** of the times you tried ({len(act)} tries)")
+        for lo, hi, nm in ((0, 15, "under 15%"), (15, 25, "15–25%"), (25, 100, "25%+")):
+            sel = [r for r in act if lo <= abs(r[3]) < hi]
+            if len(sel) >= 3:
+                lines.append(f"• drop {nm}: {sum(r[4] == 'bought' for r in sel)}/{len(sel)} bought")
+        gone = [r for r in act if r[7] == 0]
+        there = [r for r in act if r[7] == 1]
+        if len(gone) >= 3:
+            lines.append(f"• listing gone by the next update: you still got {sum(r[4] == 'bought' for r in gone)}/{len(gone)} "
+                         f"({sum(r[4] == 'bought' for r in gone) / len(gone) * 100:.0f}%; the calls assume {CALL_GONE_W * 100:.0f}%)")
+        if len(there) >= 3:
+            lines.append(f"• still there at the next update: {sum(r[4] == 'bought' for r in there)}/{len(there)} bought")
+        lat = sorted(r[5] - r[2] for r in act if r[4] == "bought" and r[5])
+        if lat:
+            lines.append(f"• median time from alert to your ✅: {statistics.median(lat) / 60:.1f} min (seen at the next scan)")
+    else:
+        lines.append("Not enough reactions yet for rates (need 5 or more ✅/❌).")
+    return "\n".join(lines)[:1900]
+
 
 
 # ------------------------------------------------------------------- demo --
@@ -3597,6 +3713,14 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
             continue
+        if low in ("fills", "fill"):
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": fills_text(db), "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
         if low in ("calls", "call"):
             try:
                 _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
@@ -3739,6 +3863,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
             poll_channel(db, {}, now)                 # things you typed in the channel: bought / sold
         except Exception as e:
             print(f"[warn] channel poll failed: {e}")
+        try:
+            read_reactions(db, now)                   # ✅ / ❌ / 💤 on drop alerts
+        except Exception as e:
+            print(f"[warn] reaction read failed: {e}")
         purchased = held_cards(db)                    # purchased.json + cards you typed in the channel; re-read each scan
         cards = fetch_market(watchlist | set(purchased), last_hash=get_meta(db, "dyn_hash"))
         if cards is None:
@@ -3753,7 +3881,7 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
                                "description": "\n".join("• " + x for x in PURCHASED_PROBLEMS),
                                "color": 0xE67E22})
             set_meta(db, "purchased_warn", sig)
-        post(embeds, dry_run)
+        post(embeds, dry_run, db)
         save_snapshot(db, cards, now)
         try:
             write_bid_sheet(db, cards, now)
