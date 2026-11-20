@@ -37,6 +37,7 @@ How it works
 import argparse
 import collections
 import json
+import math
 import os
 import random
 import re
@@ -405,6 +406,10 @@ def open_db(path: str) -> sqlite3.Connection:
                "drop_pct real, under real, outcome text, seen_ts real)")
     db.execute("create table if not exists weekly_calls(week text, card_id text, buy_ts real, buy_price int, norm_pct real, "
                "norm int, thu_ts real, thu_price int, fri_ts real, fri_price int, primary key(week, card_id))")
+    db.execute("create table if not exists market_state(hour_ts integer primary key, ts real, ch1 real, ch3 real, ch6 real, "
+               "ch12 real, ch24 real, down6 real, down24 real, up24 real, n int, new_cards int, sales24 int, lvl real, extra text)")
+    db.execute("create table if not exists market_pred(hour_ts integer, h int, med real, p_up real, n int, key text, "
+               "actual real, primary key(hour_ts, h))")
     db.execute("create table if not exists calls(id integer primary key autoincrement, ts real, card_id text, price int, "
                "buy_cap int, target int, stretch int, hold_h real, exp_net real, win real, n int, key text, "
                "r_net real, hit int, done int default 0)")
@@ -2562,6 +2567,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     dips = fresh_dips(db, dips, now, "dip") if DIP6H_ALERTS else dips   # off: still scored and logged below
     flash_dips = fresh_dips(db, flash_dips, now, "flashdip")
     low_dips: list = []
+    mkt_embeds: list = []
     try:
         if ADAPT_SHADOW:
             verdict = record_shadow(db, flash_dips, compute_regime(db, cards, now), now)
@@ -2597,6 +2603,27 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
                    + [c for c, *_ in watch_hits], beh_types, vol_list, watch | auto, now)
     except Exception as e:
         print(f"[warn] card facts failed: {e}")
+    try:                                              # market state, predictor, and the market-aware drop requirement
+        ms = market_state(db, cards, now)
+        predict_market(db, ms, now)
+        resolve_market(db, now)
+        paused, pwhy, pemb = crash_breaker(db, ms, now)
+        if pemb:
+            mkt_embeds.append(pemb)
+        ch6 = ms.get("ch6")
+        keep = []
+        for it in flash_dips:
+            under = it[1].get("under")
+            if paused:
+                low_dips.append((*it, pwhy))
+            elif DYN_K and ch6 is not None and ch6 <= DYN_START and under is not None and under < DYN_K * abs(ch6):
+                low_dips.append((*it, f"market {ch6:+.1f}% in 6 h: needs {DYN_K:g}x that under 4-day sold "
+                                      f"({under:.0f}% < {DYN_K * abs(ch6):.0f}%)"))
+            else:
+                keep.append(it)
+        flash_dips = keep
+    except Exception as e:
+        print(f"[warn] market state failed: {e}")
     try:
         attach_calls(db, flash_dips, stats, now)
     except Exception as e:
@@ -2606,6 +2633,7 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
         + (build_spikes(spikes) if spikes_on else [])
         + build_flashes(flash_spikes if spikes_on else [], flash_dips)
         + build_low_confidence(db, low_dips, now)
+        + mkt_embeds
         + build_premium_dips(premium_dips)    # 💎 premium dips on the 24 h median fallback
     )
 
@@ -3292,6 +3320,169 @@ def weekly_text(db, weeks: int = 6) -> str:
     return "\n".join(lines)[:1900]
 
 
+# ------------------------------------------------ market state, predictor, crash breaker --
+MS_HORIZONS = (6, 12, 24)
+CRASH_PAUSE = float(os.environ.get("FC_CRASH_PAUSE", "-8"))       # 6 h market change at or below this pauses the drop alerts (0 = off)
+DYN_K = float(os.environ.get("FC_DYN_K", "2"))                    # market down: a drop must be this many times the market 6 h fall under 4-day sold (0 = off)
+DYN_START = float(os.environ.get("FC_DYN_START", "-3"))          # ...from this 6 h market change down
+CRASH_RESUME = float(os.environ.get("FC_CRASH_RESUME", "-3"))     # ...and they resume above this, once the last 3 h are flat
+EXTRA_FEATURES: list = []       # future variables: (name, fn(db, cards, now) -> float); stored in market_state.extra
+
+
+def _px_window(db, t: float) -> dict:
+    d = dict(db.execute("select card_id, avg(price) from prices where ts between ? and ? group by card_id", (t - 1800, t + 1800)))
+    if len(d) < 200:                                   # older than the raw prices: the stored hourly prices
+        d.update(dict(db.execute("select card_id, avg(price) from prices_hourly where hour_ts between ? and ? group by card_id",
+                                 (t - 3600, t + 3600))))
+    return d
+
+
+def market_state(db, cards, now: float) -> dict:
+    """The market now, from established cards (>= 10k, not new): median card change over 1 / 3 / 6 / 12 / 24 h, the share
+    falling and rising, new-card and sales counts. One row per hour in `market_state` (the last reading of the hour);
+    `lvl` is a running index (sum of hourly median changes) so any forward change can be read off later."""
+    last = get_meta(db, "mstate_ts")
+    if last and now - float(last) < 300 and get_meta(db, "mstate"):
+        return json.loads(get_meta(db, "mstate"))
+    new = new_card_ids(db, now)
+    cur = {c.card_id: c.price for c in cards if c.price >= 10_000 and c.card_id not in new}
+    out: dict = {"ts": now}
+    ch_by = {}
+    for h in (1, 3, 6, 12, 24):
+        old = _px_window(db, now - h * 3600)
+        ch = [(cur[c] / old[c] - 1) * 100 for c in cur if old.get(c, 0) >= 10_000]
+        ch_by[h] = ch
+        out[f"ch{h}"] = round(statistics.median(ch), 2) if len(ch) >= 50 else None
+    moved6 = [x for x in ch_by[6] if abs(x) >= 0.5]
+    moved24 = [x for x in ch_by[24] if abs(x) >= 0.5]
+    out["down6"] = round(sum(x < 0 for x in moved6) / len(moved6), 2) if moved6 else None
+    out["down24"] = round(sum(x < 0 for x in moved24) / len(moved24), 2) if moved24 else None
+    out["up24"] = round(sum(x > 1 for x in ch_by[24]) / len(ch_by[24]), 2) if ch_by[24] else None
+    out["n"] = len(ch_by[1])
+    out["new_cards"] = len(new)
+    out["sales24"] = db.execute("select count(*) from sales_inferred where kind='sale' and ts>=?", (now - 86400,)).fetchone()[0]
+    extra = {}
+    for name, fn_ in EXTRA_FEATURES:
+        try:
+            extra[name] = fn_(db, cards, now)
+        except Exception as e:
+            print(f"[warn] feature {name} failed: {e}")
+    out["extra"] = extra
+    hour = int(now // 3600 * 3600)
+    prev = db.execute("select lvl from market_state where hour_ts < ? order by hour_ts desc limit 1", (hour,)).fetchone()
+    lvl = (prev[0] if prev else 0.0) + (math.log(1 + out["ch1"] / 100) if out["ch1"] is not None else 0.0)
+    out["lvl"] = lvl
+    db.execute("insert or replace into market_state values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+               (hour, now, out["ch1"], out["ch3"], out["ch6"], out["ch12"], out["ch24"], out["down6"], out["down24"],
+                out["up24"], out["n"], out["new_cards"], out["sales24"], lvl, json.dumps(extra)))
+    db.execute("delete from market_state where hour_ts < ?", (now - 120 * 86400,))
+    set_meta(db, "mstate", json.dumps(out))
+    set_meta(db, "mstate_ts", now)
+    db.commit()
+    return out
+
+
+def _ms_key(st_: dict, hour_local: int) -> tuple:
+    c6, c3 = st_.get("ch6"), st_.get("ch3")
+    b6 = "?" if c6 is None else "<=-8" if c6 <= -8 else "-8..-4" if c6 <= -4 else "-4..-1" if c6 <= -1 else "flat" if c6 < 1 else "up"
+    f3 = "?" if c3 is None else ("flat3" if c3 >= -0.7 else "fall3")
+    return b6, f3, hour_local // 6
+
+
+def predict_market(db, st_: dict, now: float) -> None:
+    """Once an hour: from the history of market_state rows with a known outcome, the typical market change over the next
+    6 / 12 / 24 h in the same situation (6 h change band x last 3 h flat or falling x six-hour block of the day). Falls back
+    to fewer conditions when there are too few cases. Logged to market_pred and scored when the outcome is known."""
+    hour = int(now // 3600 * 3600)
+    if db.execute("select 1 from market_pred where hour_ts=?", (hour,)).fetchone() or st_.get("ch6") is None:
+        return
+    rows = db.execute("select hour_ts, ch3, ch6, lvl from market_state where hour_ts < ? order by hour_ts", (hour,)).fetchall()
+    lv = {r[0] // 3600: r[3] for r in rows}
+    key = _ms_key(st_, _local(now).hour)
+    for h in MS_HORIZONS:
+        samples = {"full": [], "b6f3": [], "b6": [], "all": []}
+        for ht, c3, c6, l0 in rows:
+            hh = ht // 3600
+            l1 = lv.get(hh + h)
+            if l1 is None or c6 is None:
+                continue
+            fwd = (math.exp(l1 - l0) - 1) * 100
+            k2 = _ms_key({"ch6": c6, "ch3": c3}, _local(ht).hour)
+            samples["all"].append(fwd)
+            if k2[0] == key[0]:
+                samples["b6"].append(fwd)
+                if k2[1] == key[1]:
+                    samples["b6f3"].append(fwd)
+                    if k2[2] == key[2]:
+                        samples["full"].append(fwd)
+        for lab in ("full", "b6f3", "b6", "all"):
+            v = samples[lab]
+            if len(v) >= 6 or lab == "all":
+                if v:
+                    db.execute("insert or ignore into market_pred(hour_ts, h, med, p_up, n, key) values (?,?,?,?,?,?)",
+                               (hour, h, statistics.median(v), sum(x > 0 for x in v) / len(v), len(v),
+                                f"{lab}:{key[0]}|{key[1]}|{key[2]}"))
+                break
+    db.commit()
+
+
+def resolve_market(db, now: float) -> None:
+    lv = {r[0] // 3600: r[1] for r in db.execute("select hour_ts, lvl from market_state")}
+    for hour, h in db.execute("select hour_ts, h from market_pred where actual is null and hour_ts + h*3600 + 3600 <= ?",
+                              (now,)).fetchall():
+        a, b = lv.get(hour // 3600), lv.get(hour // 3600 + h)
+        if a is not None and b is not None:
+            db.execute("update market_pred set actual=? where hour_ts=? and h=?", ((math.exp(b - a) - 1) * 100, hour, h))
+    db.commit()
+
+
+def crash_breaker(db, st_: dict, now: float):
+    """-> (paused, text, transition embed or None). Pauses the drop alerts when the market falls CRASH_PAUSE % or more in
+    6 h (alerts then lost: below -8 % the median was -30 %); resumes above CRASH_RESUME once the last 3 h are flat."""
+    if not CRASH_PAUSE or st_.get("ch6") is None:
+        return False, "", None
+    on = get_meta(db, "crash_on") == "1"
+    c6, c3 = st_["ch6"], st_.get("ch3") if st_.get("ch3") is not None else 0.0
+    if not on and c6 <= CRASH_PAUSE:
+        set_meta(db, "crash_on", "1")
+        emb = {"title": f"⏸ Drop alerts paused · market {c6:+.1f}% in 6 h · {PLATFORM_LABEL}",
+               "description": (f"The market fell **{c6:.1f}%** (median card) in 6 h and {st_.get('ch24') or 0:+.1f}% in 24 h. "
+                               f"In past falls like this the drop alerts lost money, so they go to the 🔹 low-confidence list "
+                               f"without calls until it stabilises (6 h change above {CRASH_RESUME:.0f}% and the last 3 h flat)."),
+               "color": 0xE74C3C}
+        return True, f"market {c6:+.1f}% in 6 h: auto-paused", emb
+    if on and c6 > CRASH_RESUME and c3 >= -0.7:
+        set_meta(db, "crash_on", "0")
+        emb = {"title": f"▶️ Drop alerts resumed · market {c6:+.1f}% in 6 h · {PLATFORM_LABEL}",
+               "description": f"The market has stabilised (6 h {c6:+.1f}%, last 3 h {c3:+.1f}%): normal drop alerts are back.",
+               "color": 0x2ECC71}
+        return False, "", emb
+    return on, (f"market {c6:+.1f}% in 6 h: auto-paused" if on else ""), None
+
+
+def market_text(db) -> str:
+    row = db.execute("select ts, ch1, ch3, ch6, ch12, ch24, down24, n, new_cards, sales24 from market_state order by hour_ts desc limit 1").fetchone()
+    if not row:
+        return "📈 No market readings yet."
+    ts, c1, c3, c6, c12, c24, d24, n, nw, s24 = row
+    f = lambda v: "?" if v is None else f"{v:+.1f}%"
+    lines = [f"📈 **Market now** ({(time.time() - ts) / 60:.0f} min old, {n} cards): 1 h {f(c1)} · 3 h {f(c3)} · 6 h {f(c6)} · 12 h {f(c12)} · 24 h {f(c24)}"
+             + (f" · {d24 * 100:.0f}% of moved cards falling" if d24 is not None else ""),
+             "Drop alerts: " + ("⏸ **paused** (crash breaker)" if get_meta(db, "crash_on") == "1" else "▶️ on")]
+    pr = db.execute("select h, med, p_up, n, key from market_pred where hour_ts=(select max(hour_ts) from market_pred) order by h").fetchall()
+    if pr:
+        lines.append("**Prediction** (typical move of the median card from now): " + " · ".join(
+            f"{h} h {m:+.1f}% ({p * 100:.0f}% up, n={n_})" for h, m, p, n_, _ in pr) + f"  [{pr[0][4]}]")
+    sc = db.execute("select h, count(*), avg(abs(med-actual)), avg(abs(actual)), avg((med>0)=(actual>0)) from market_pred "
+                    "where actual is not null group by h order by h").fetchall()
+    if sc:
+        lines.append("**Scorecard** (error of the prediction vs guessing 'no change', direction right): " + " · ".join(
+            f"{h} h: {a:.1f} vs {b:.1f} pts, {d * 100:.0f}% (n={c})" for h, c, a, b, d in sc))
+    else:
+        lines.append("Scorecard: no prediction has a known outcome yet.")
+    return "\n".join(lines)[:1900]
+
+
 def holding_text(db, cards_map: dict, now: float) -> str:
     """The cards you reported buying and have not sold: floor now, net after tax, target, time held."""
     held = held_cards(db)
@@ -3725,6 +3916,14 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             try:
                 _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
                      json={"content": holding_text(db, cards_map, now), "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
+        if low in ("market", "market now", "state"):
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": market_text(db), "message_reference": {"message_id": m["id"]},
                            "allowed_mentions": {"parse": []}})
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")

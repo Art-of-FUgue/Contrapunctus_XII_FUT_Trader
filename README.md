@@ -237,6 +237,7 @@ Type in the alert channel (the bot replies to each message):
   - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
   - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
 - **`shadow`**: report of the adaptive-criteria shadow mode (5.10).
+- **`market`**: market state, prediction and its scorecard (5.15).
 - **`weekly`**: results of the paper-traded weekly calls (5.14).
 - **`fills`**: how often you got the cards you reacted on (5.13).
 - **`holding`** (also `holdings`, `held`, `portfolio`, `inventory`): the cards you logged as bought and have not sold, with the floor now, net after tax, target, distance to it and time held, plus the unrealized total.
@@ -284,6 +285,12 @@ Tests the weekly cycle (prices lowest Monday evening / Tuesday, highest Wednesda
 - **Sell call** (only posted with `FC_WEEKLY_POST=1`): **Thursday 20:00** a 🗓 **Weekly Sell Call** lists each card with the floor now and the net after tax: sell tonight, because Friday morning is usually weak. Paper exit price = floor at Thursday 21:00.
 - **Score**: Friday 07:00 the floor is recorded as well (with `FC_WEEKLY_POST=1` a 🗓 result post compares the Thursday exit with holding to Friday morning). Table `weekly_calls`; the bot command `weekly` shows every week and the totals.
 - Why paper-traded: a back-test of buying Monday and selling Thursday over the last 4 weeks was not profitable in any single week (the market drifted down about 5 % a week); judge after 4-5 weeks, then keep it as a real call or drop it.
+
+### 5.15 Market state, predictor and market-aware drop alerts
+- **Market state** (`market_state`, one row per hour, the last reading of the hour; also cached 5 min): median card change over 1, 3, 6, 12 and 24 h of established cards (>= 10k, not new), share of moved cards falling and rising, new-card and sales counts, a running index level `lvl` (sum of hourly median changes, so any forward change can be read off later) and an `extra` JSON column. **Add a variable** by appending `(name, fn(db, cards, now))` to `EXTRA_FEATURES`; it is stored per hour and can be used by the predictor later.
+- **Predictor** (`predict_market`, hourly, logged to `market_pred`, no alerts): the typical move of the market over the next 6 / 12 / 24 h and the share of cases that went up, from past hours in the same situation (6 h change band x last 3 h flat or still falling x six-hour block of the day), falling back to fewer conditions when there are fewer than 6 cases. Scored when the outcome is known (`resolve_market`): the bot command `market` shows the state, the latest prediction and the scorecard (error vs guessing "no change", direction hit rate). It only becomes useful once the history contains rebounds; a first look over 4 weeks found none (after a 6 h fall of 4 %+ the median 24 h move was -9.7 %).
+- **Market-aware drop alerts** (replaces a flat pause): when the market is down `FC_DYN_START` (-3) % or more over 6 h, a fast / volume drop must sit at least `FC_DYN_K` (2) times that fall **under the 4-day sold price** (market -7 % -> at least 14 % under sold); the rest go to the 🔹 low-confidence list with the reason. Past alerts in market falls of 3 %+: kept 2x +5.1 % median (68 % won), dropped -1.8 %; 3x +6.9 %.
+- **Crash breaker** `FC_CRASH_PAUSE` (-8, 0 = off): below -8 % in 6 h every drop alert lost in the data (212 alerts, median -30 %, 7 % won, even the deep ones), so all drop alerts go to the low-confidence list and a ⏸ post says why; they resume (▶️ post) when the 6 h change is above `FC_CRASH_RESUME` (-3) % and the last 3 h are flat. That was a single episode, so the threshold is to be re-checked as data grows.
 
 ### 5.12 Fewer repeats
 - **Cooldown for held / watchlist posts**: 💰 Your Card (spike and sell-now) and 🎯 Watchlist Buy post once per card, then stay quiet for `FC_QUIET_HOURS` (6) unless the price moved `FC_QUIET_MOVE_PCT` (5 %) since the last post. Before this, a held card re-posted every few minutes (141 posts a day for one card).
