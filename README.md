@@ -237,6 +237,7 @@ Type in the alert channel (the bot replies to each message):
   - `sold Carpenter, holo totw, 47k held 3h`: sets the hold time yourself (otherwise it is the time since the buy message). `sold … 30 min ago` backdates the sale.
   - `hold Carpenter, holo totw, 3h` (or `held`): fixes the hold time of your last closed trade in that card.
 - **`shadow`**: report of the adaptive-criteria shadow mode (5.10).
+- **`weekly`**: results of the paper-traded weekly calls (5.14).
 - **`fills`**: how often you got the cards you reacted on (5.13).
 - **`holding`** (also `holdings`, `held`, `portfolio`, `inventory`): the cards you logged as bought and have not sold, with the floor now, net after tax, target, distance to it and time held, plus the unrealized total.
 - **`calls`**: how the 📞 calls of the last 7 days did (5.11).
@@ -276,6 +277,13 @@ Every fast / volume alert is logged in `shadow_alerts` with what two adaptive la
 - Bot permissions needed in the channel: Read Message History (already) and **Add Reactions** (to pre-add the buttons; without it the bot says so once and you add the emoji by hand).
 - Table `posts` stores message id, card, alert price, drop and under-sold %, outcome and when the reaction was first seen. The bot command `fills` shows tries vs ✅, by drop size, by whether the listing was already gone at the next update (compare with `FC_CALL`'s 60 % catch assumption `CALL_GONE_W`) and the median time from alert to your ✅. Nothing feeds the calls automatically yet; the numbers are there to set `CALL_GONE_W` by hand once there are 30+ tries.
 - Messages per day go up because drops are no longer grouped; `FC_TRACK_FILLS=0` restores the grouped embeds.
+
+### 5.14 Weekly calls (paper-traded)
+Tests the weekly cycle (prices lowest Monday evening / Tuesday, highest Wednesday to Friday morning, weak again from Friday morning). `FC_WEEKLY` (default on).
+- **Buy calls**: once a week, the first scan after **Monday 20:00 Central** (until Tuesday 22:00): up to `FC_WEEKLY_N` (12) established cards (15k-500k, at least 5 days of daily history so no new promos, ≥ 6 inferred sales/24 h and ≥ 20 in 96 h) whose floor is **5-20 % under their own 7-day norm** (mean of the last 7 daily medians; deeper than 20 % is a collapse, not a dip). Posted once as 🗓 **Weekly Buy Calls**.
+- **Sell call**: **Thursday 20:00** a 🗓 **Weekly Sell Call** lists each card with the floor now and the net after tax: sell tonight, because Friday morning is usually weak. Paper exit price = floor at Thursday 21:00.
+- **Score**: Friday 07:00 the floor is recorded as well and a 🗓 result post compares the Thursday exit with holding to Friday morning. Table `weekly_calls`; the bot command `weekly` shows every week and the totals.
+- Why paper-traded: a back-test of buying Monday and selling Thursday over the last 4 weeks was not profitable in any single week (the market drifted down about 5 % a week); judge after 4-5 weeks, then keep it as a real call or drop it.
 
 ### 5.12 Fewer repeats
 - **Cooldown for held / watchlist posts**: 💰 Your Card (spike and sell-now) and 🎯 Watchlist Buy post once per card, then stay quiet for `FC_QUIET_HOURS` (6) unless the price moved `FC_QUIET_MOVE_PCT` (5 %) since the last post. Before this, a held card re-posted every few minutes (141 posts a day for one card).
