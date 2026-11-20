@@ -403,6 +403,8 @@ def open_db(path: str) -> sqlite3.Connection:
                "share_down real, n integer)")
     db.execute("create table if not exists posts(msg_id text primary key, card_id text, price int, ts real, kind text, "
                "drop_pct real, under real, outcome text, seen_ts real)")
+    db.execute("create table if not exists weekly_calls(week text, card_id text, buy_ts real, buy_price int, norm_pct real, "
+               "norm int, thu_ts real, thu_price int, fri_ts real, fri_price int, primary key(week, card_id))")
     db.execute("create table if not exists calls(id integer primary key autoincrement, ts real, card_id text, price int, "
                "buy_cap int, target int, stretch int, hold_h real, exp_net real, win real, n int, key text, "
                "r_net real, hit int, done int default 0)")
@@ -3144,6 +3146,120 @@ def resolve_calls(db, now: float) -> None:
     db.commit()
 
 
+WEEKLY_ON = os.environ.get("FC_WEEKLY", "1") != "0"      # paper-traded weekly cycle calls (buy Mon night / Tue, sell Thu night)
+WEEKLY_N = int(os.environ.get("FC_WEEKLY_N", "12"))      # cards per week
+WEEKLY_MIN_BELOW = float(os.environ.get("FC_WEEKLY_MIN_BELOW", "5"))   # % under the card's own 7-day norm
+WEEKLY_MAX_BELOW = float(os.environ.get("FC_WEEKLY_MAX_BELOW", "20"))   # deeper than this is a collapse, not a weekly dip
+WEEKLY_PRICE = (15_000, 500_000)
+
+
+def _local(now: float):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    return datetime.fromtimestamp(now, ZoneInfo(TIMEZONE))
+
+
+def weekly_calls(db, cards: list, now: float, dry_run: bool) -> None:
+    """The weekly cycle as paper-traded calls. Mon 20:00 to Tue 22:00 (once a week): the established, liquid cards
+    sitting well under their own 7-day norm become weekly BUY calls. Thu 20:00: a SELL call reminder with the net now
+    (the paper exit is the floor at Thu 21:00, because Friday morning is usually weak). Fri 07:00: the floor then is
+    recorded too and the week is scored: so the data also shows what holding through Friday morning costs."""
+    if not WEEKLY_ON:
+        return
+    loc = _local(now)
+    wd, hr = loc.weekday(), loc.hour
+    week = (loc - __import__("datetime").timedelta(days=wd)).strftime("%Y-%m-%d")
+    price_of = {c.card_id: c for c in cards}
+    # ---- buy calls
+    if ((wd == 0 and hr >= 20) or (wd == 1 and hr < 22)) and not get_meta(db, f"weekly_buy_{week}"):
+        picks = []
+        day0 = int(now // 86400)
+        for c in cards:
+            if not (WEEKLY_PRICE[0] <= c.price <= WEEKLY_PRICE[1]):
+                continue
+            meds = [r[0] for r in db.execute("select med from prices_daily where card_id=? and day between ? and ? and hours>=12",
+                                              (c.card_id, day0 - 8, day0 - 1))]
+            if len(meds) < 5:
+                continue                                   # no real history: new promo
+            norm = statistics.mean(meds)
+            below = (c.price / norm - 1) * 100
+            if below > -WEEKLY_MIN_BELOW or below < -WEEKLY_MAX_BELOW:
+                continue
+            st = sm.sale_stats(db, c.card_id, now, 96, 24)
+            if not st or st["n24"] < 6 or st["n"] < 20:
+                continue                                   # liquid cards only: they sell on Thursday night
+            picks.append((below, c, int(norm)))
+        picks.sort(key=lambda x: x[0])
+        picks = picks[:WEEKLY_N]
+        set_meta(db, f"weekly_buy_{week}", len(picks))
+        for below, c, norm in picks:
+            db.execute("insert or ignore into weekly_calls(week, card_id, buy_ts, buy_price, norm_pct, norm) values (?,?,?,?,?,?)",
+                       (week, c.card_id, now, c.price, below, norm))
+        db.commit()
+        if picks:
+            lines = ["Experimental, paper-tracked: established cards well under their own 7-day norm. Plan: sell **Thursday night**, "
+                     "before the Friday-morning weakness.", ""]
+            lines += [f"{k(c.price)} · {c.name} · {c.kind} · `{below:+.0f}%` vs norm {k(norm)}{open_link(c)}" for below, c, norm in picks]
+            post([{"title": f"🗓 Weekly Buy Calls · {PLATFORM_LABEL}", "description": "\n".join(lines)[:3900],
+                   "color": 0x7F8C8D, "footer": {"text": "Scored automatically (Thu 21:00 and Fri 07:00); `weekly` shows the results"}}],
+                 dry_run, db)
+    # ---- Thursday night sell call and paper exit
+    rows = db.execute("select card_id, buy_price, thu_price, fri_price from weekly_calls where week=?", (week,)).fetchall()
+    if rows and wd == 3 and hr >= 20 and not get_meta(db, f"weekly_sell_{week}"):
+        set_meta(db, f"weekly_sell_{week}", 1)
+        lines = ["**Sell tonight** if you took these: Friday morning is usually the weak point.", ""]
+        res = []
+        for cid, buy, _, _ in rows:
+            c = price_of.get(cid)
+            if c:
+                res.append((_net_pct(c.price, buy), c, buy))
+        for net, c, buy in sorted(res, key=lambda r: -r[0]):
+            lines.append(f"{'✅' if net > 0 else '🔴'} {c.name} · {c.kind} · bought {k(buy)} → floor **{k(c.price)}** · `{net:+.1f}%` net{open_link(c)}")
+        if res:
+            post([{"title": f"🗓 Weekly Sell Call · {PLATFORM_LABEL}", "description": "\n".join(lines)[:3900],
+                   "color": 0xE67E22}], dry_run, db)
+    if rows and wd == 3 and hr >= 21:
+        for cid, buy, thu, _ in rows:
+            c = price_of.get(cid)
+            if c and thu is None:
+                db.execute("update weekly_calls set thu_ts=?, thu_price=? where week=? and card_id=?", (now, c.price, week, cid))
+        db.commit()
+    if rows and ((wd == 4 and 7 <= hr < 20)):
+        for cid, buy, thu, fri in rows:
+            c = price_of.get(cid)
+            if c and fri is None:
+                db.execute("update weekly_calls set fri_ts=?, fri_price=? where week=? and card_id=?", (now, c.price, week, cid))
+        db.commit()
+        if not get_meta(db, f"weekly_done_{week}"):
+            set_meta(db, f"weekly_done_{week}", 1)
+            txt = weekly_text(db, 1)
+            post([{"title": f"🗓 Weekly Calls · result of this week · {PLATFORM_LABEL}", "description": txt[:3900],
+                   "color": 0x7F8C8D}], dry_run, db)
+
+
+def weekly_text(db, weeks: int = 6) -> str:
+    rows = db.execute("select week, buy_price, thu_price, fri_price, norm_pct from weekly_calls order by week desc, card_id").fetchall()
+    if not rows:
+        return "🗓 No weekly calls yet. They are made Monday after 20:00 (Central) and scored Thursday 21:00 and Friday 07:00."
+    by = collections.OrderedDict()
+    for r in rows:
+        by.setdefault(r[0], []).append(r)
+    lines = ["🗓 **Weekly calls (paper-traded)**: buy Mon night / Tue, sell Thu 21:00; also shows holding to Fri 07:00"]
+    allthu, allfri = [], []
+    for wk, rs in list(by.items())[:weeks]:
+        thu = [_net_pct(r[2], r[1]) for r in rs if r[2]]
+        fri = [_net_pct(r[3], r[1]) for r in rs if r[3]]
+        allthu += thu
+        allfri += fri
+        t = (f"Thu exit median {statistics.median(thu):+.1f}% (win {sum(x > 0 for x in thu) / len(thu) * 100:.0f}%)" if thu else "Thu exit pending")
+        f = (f" · Fri 07:00 median {statistics.median(fri):+.1f}%" if fri else "")
+        lines.append(f"• week of {wk}: {len(rs)} cards · {t}{f}")
+    if len(allthu) >= 20:
+        lines.append(f"**All weeks:** Thu exit median {statistics.median(allthu):+.1f}% (win {sum(x > 0 for x in allthu) / len(allthu) * 100:.0f}%, n={len(allthu)})"
+                     + (f" · Fri 07:00 median {statistics.median(allfri):+.1f}%" if len(allfri) >= 20 else ""))
+    return "\n".join(lines)[:1900]
+
+
 def holding_text(db, cards_map: dict, now: float) -> str:
     """The cards you reported buying and have not sold: floor now, net after tax, target, time held."""
     held = held_cards(db)
@@ -3581,6 +3697,14 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
             continue
+        if low in ("weekly", "weekly calls"):
+            try:
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": weekly_text(db), "message_reference": {"message_id": m["id"]},
+                           "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] bot reply failed: {e}")
+            continue
         if low in ("fills", "fill"):
             try:
                 _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
@@ -3750,6 +3874,10 @@ def run_cycle(db, dry_run: bool, watchlist: set[str] | None = None,
                                "color": 0xE67E22})
             set_meta(db, "purchased_warn", sig)
         post(embeds, dry_run, db)
+        try:
+            weekly_calls(db, cards, now, dry_run)
+        except Exception as e:
+            print(f"[warn] weekly calls failed: {e}")
         save_snapshot(db, cards, now)
         try:
             write_bid_sheet(db, cards, now)
