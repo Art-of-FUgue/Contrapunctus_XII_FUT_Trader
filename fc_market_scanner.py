@@ -3279,6 +3279,7 @@ def resolve_calls(db, now: float) -> None:
 
 
 WEEKLY_ON = os.environ.get("FC_WEEKLY", "1") != "0"      # paper-traded weekly cycle calls (buy Mon night / Tue, sell Thu night)
+WEEKLY_POST = os.environ.get("FC_WEEKLY_POST", "0") == "1"   # 1 = also post the buy / sell / result embeds; default: track silently
 WEEKLY_N = int(os.environ.get("FC_WEEKLY_N", "12"))      # cards per week
 WEEKLY_MIN_BELOW = float(os.environ.get("FC_WEEKLY_MIN_BELOW", "5"))   # % under the card's own 7-day norm
 WEEKLY_MAX_BELOW = float(os.environ.get("FC_WEEKLY_MAX_BELOW", "20"))   # deeper than this is a collapse, not a weekly dip
@@ -3328,7 +3329,7 @@ def weekly_calls(db, cards: list, now: float, dry_run: bool) -> None:
             db.execute("insert or ignore into weekly_calls(week, card_id, buy_ts, buy_price, norm_pct, norm) values (?,?,?,?,?,?)",
                        (week, c.card_id, now, c.price, below, norm))
         db.commit()
-        if picks:
+        if picks and WEEKLY_POST:
             lines = ["Experimental, paper-tracked: established cards well under their own 7-day norm. Plan: sell **Thursday night**, "
                      "before the Friday-morning weakness.", ""]
             lines += [f"{k(c.price)} · {c.name} · {c.kind} · `{below:+.0f}%` vs norm {k(norm)}{open_link(c)}" for below, c, norm in picks]
@@ -3347,7 +3348,7 @@ def weekly_calls(db, cards: list, now: float, dry_run: bool) -> None:
                 res.append((_net_pct(c.price, buy), c, buy))
         for net, c, buy in sorted(res, key=lambda r: -r[0]):
             lines.append(f"{'✅' if net > 0 else '🔴'} {c.name} · {c.kind} · bought {k(buy)} → floor **{k(c.price)}** · `{net:+.1f}%` net{open_link(c)}")
-        if res:
+        if res and WEEKLY_POST:
             post([{"title": f"🗓 Weekly Sell Call · {PLATFORM_LABEL}", "description": "\n".join(lines)[:3900],
                    "color": 0xE67E22}], dry_run, db)
     if rows and wd == 3 and hr >= 21:
@@ -3362,7 +3363,7 @@ def weekly_calls(db, cards: list, now: float, dry_run: bool) -> None:
             if c and fri is None:
                 db.execute("update weekly_calls set fri_ts=?, fri_price=? where week=? and card_id=?", (now, c.price, week, cid))
         db.commit()
-        if not get_meta(db, f"weekly_done_{week}"):
+        if WEEKLY_POST and not get_meta(db, f"weekly_done_{week}"):
             set_meta(db, f"weekly_done_{week}", 1)
             txt = weekly_text(db, 1)
             post([{"title": f"🗓 Weekly Calls · result of this week · {PLATFORM_LABEL}", "description": txt[:3900],

@@ -280,9 +280,9 @@ Every fast / volume alert is logged in `shadow_alerts` with what two adaptive la
 
 ### 5.14 Weekly calls (paper-traded)
 Tests the weekly cycle (prices lowest Monday evening / Tuesday, highest Wednesday to Friday morning, weak again from Friday morning). `FC_WEEKLY` (default on).
-- **Buy calls**: once a week, the first scan after **Monday 20:00 Central** (until Tuesday 22:00): up to `FC_WEEKLY_N` (12) established cards (15k-500k, at least 5 days of daily history so no new promos, ≥ 6 inferred sales/24 h and ≥ 20 in 96 h) whose floor is **5-20 % under their own 7-day norm** (mean of the last 7 daily medians; deeper than 20 % is a collapse, not a dip). Posted once as 🗓 **Weekly Buy Calls**.
-- **Sell call**: **Thursday 20:00** a 🗓 **Weekly Sell Call** lists each card with the floor now and the net after tax: sell tonight, because Friday morning is usually weak. Paper exit price = floor at Thursday 21:00.
-- **Score**: Friday 07:00 the floor is recorded as well and a 🗓 result post compares the Thursday exit with holding to Friday morning. Table `weekly_calls`; the bot command `weekly` shows every week and the totals.
+- **Buy calls**: once a week, the first scan after **Monday 20:00 Central** (until Tuesday 22:00): up to `FC_WEEKLY_N` (12) established cards (15k-500k, at least 5 days of daily history so no new promos, ≥ 6 inferred sales/24 h and ≥ 20 in 96 h) whose floor is **5-20 % under their own 7-day norm** (mean of the last 7 daily medians; deeper than 20 % is a collapse, not a dip). **Silent by default** (`FC_WEEKLY_POST=0`): the picks are only stored; `FC_WEEKLY_POST=1` also posts them once as 🗓 **Weekly Buy Calls**.
+- **Sell call** (only posted with `FC_WEEKLY_POST=1`): **Thursday 20:00** a 🗓 **Weekly Sell Call** lists each card with the floor now and the net after tax: sell tonight, because Friday morning is usually weak. Paper exit price = floor at Thursday 21:00.
+- **Score**: Friday 07:00 the floor is recorded as well (with `FC_WEEKLY_POST=1` a 🗓 result post compares the Thursday exit with holding to Friday morning). Table `weekly_calls`; the bot command `weekly` shows every week and the totals.
 - Why paper-traded: a back-test of buying Monday and selling Thursday over the last 4 weeks was not profitable in any single week (the market drifted down about 5 % a week); judge after 4-5 weeks, then keep it as a real call or drop it.
 
 ### 5.12 Fewer repeats
