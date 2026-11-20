@@ -2801,6 +2801,11 @@ def send_discord(payload: dict) -> "requests.Response":
 TRACK_FILLS = os.environ.get("FC_TRACK_FILLS", "1") != "0"      # drop alerts as one message per card, with reaction buttons
 REACT_EMOJI = {"bought": "✅", "missed": "❌", "offline": "💤"}
 _REACT_BY_EMOJI = {v: k_ for k_, v in REACT_EMOJI.items()}
+for _em in ("✔️", "✔", "☑️", "☑", "🟢", "👍", "💰"):
+    _REACT_BY_EMOJI[_em] = "bought"                       # other ticks and thumbs count as bought
+for _em in ("✖️", "✖", "👎", "🚫", "🔴"):
+    _REACT_BY_EMOJI[_em] = "missed"
+_REACT_BY_EMOJI["😴"] = "offline"
 
 
 def add_reactions(mid: str) -> bool:
@@ -2848,19 +2853,32 @@ def post(embeds: list[dict], dry_run: bool, db=None) -> None:
 
 
 def read_reactions(db, now: float) -> None:
-    """Your ✅ / ❌ / 💤 on recent drop alerts. ✅ logs the buy at the alert price (type the real price to correct it)."""
+    """Your ✅ / ❌ / 💤 on recent drop alerts. ✅ logs the buy at the alert price (type the real price to correct it)
+    and the bot confirms in the channel. The last 100 messages are read every scan, up to 500 (back to your oldest
+    open alert) every 10 minutes, so a reaction on an alert from hours ago is still found."""
     if not bot_on():
         return
     rows = {r[0]: r for r in db.execute("select msg_id, card_id, price, ts, outcome, seen_ts from posts where ts >= ?",
-                                         (now - 12 * 3600,))}
+                                         (now - 24 * 3600,))}
     db.execute("delete from posts where ts < ?", (now - 45 * 86400,))
     if not rows:
         return
-    r = _bot("GET", f"/channels/{BOT_CHANNEL}/messages", params={"limit": 100})
-    if r is None or not r.ok:
-        return
+    deep = now - float(get_meta(db, "react_deep") or 0) >= 600
+    if deep:
+        set_meta(db, "react_deep", now)
+    oldest = min(int(i) for i in rows)
+    msgs, before = [], None
+    for _ in range(5 if deep else 1):
+        r = _bot("GET", f"/channels/{BOT_CHANNEL}/messages", params={"limit": 100, **({"before": before} if before else {})})
+        if r is None or not r.ok:
+            break
+        page = r.json()
+        msgs += page
+        if len(page) < 100 or int(page[-1]["id"]) <= oldest:
+            break
+        before = page[-1]["id"]
     held = held_cards(db)
-    for m in r.json():
+    for m in msgs:
         row = rows.get(m.get("id"))
         if not row:
             continue
@@ -2868,10 +2886,10 @@ def read_reactions(db, now: float) -> None:
         for rx in m.get("reactions") or []:
             name = (rx.get("emoji") or {}).get("name")
             if name in _REACT_BY_EMOJI and rx.get("count", 0) - (1 if rx.get("me") else 0) > 0:
-                mine.add(name)
+                mine.add(_REACT_BY_EMOJI[name])
         if not mine:
             continue
-        out = _REACT_BY_EMOJI["✅" if "✅" in mine else "❌" if "❌" in mine else "💤"]
+        out = "bought" if "bought" in mine else "missed" if "missed" in mine else "offline"
         if out == row[4]:
             continue
         db.execute("update posts set outcome=?, seen_ts=coalesce(seen_ts, ?) where msg_id=?", (out, now, row[0]))
@@ -2880,7 +2898,19 @@ def read_reactions(db, now: float) -> None:
             ctx = buy_context(db, cid, price, now)
             db.execute("insert or replace into held(card_id, price, target, ts, ctx, note) values (?,?,?,?,?,?)",
                        (cid, price, None, now, json.dumps(ctx), "reaction"))
+            held[cid] = price
             print(f"[info] reaction: bought {cid} at {price}")
+            try:
+                st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
+                floor_t = price / (1 - EA_TAX) * (1 + OWNED_MIN_NET / 100)
+                tgt = max(st["fair"], floor_t) if st and st["n"] >= 4 else floor_t
+                _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                     json={"content": f"✅ Tracking **{_card_label(cid)}** · bought {k(price)} (the alert price) · sell alert at "
+                                      f"**{k(int(tgt))}**. Paid something else? Type `bought {_card_label(cid).split(' · ')[0]}, <price>`. "
+                                      f"`holding` lists everything you hold.",
+                           "message_reference": {"message_id": row[0]}, "allowed_mentions": {"parse": []}})
+            except Exception as e:
+                print(f"[warn] reaction confirmation failed: {e}")
     db.commit()
 
 
