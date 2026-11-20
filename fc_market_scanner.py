@@ -1501,7 +1501,7 @@ def build_flashes(spike_items, dip_items) -> list[dict]:
     if TRACK_FILLS and bot_on():                  # one message per card, so a reaction belongs to exactly one card
         for d in sorted(drops, key=lambda i: i[2]):
             e = drop_embed([d], bool(d[1].get("vol")))
-            e["footer"] = {"text": e["footer"]["text"] + "  ·  React: ✅ bought · ❌ missed · 💤 offline"}
+            e["footer"] = {"text": e["footer"]["text"] + "  ·  React: ✅ bought · ❌ tried but missed (no reaction = offline)"}
             e["_track"] = {"card": d[0].card_id, "price": d[0].price, "kind": "volume" if d[1].get("vol") else "fast",
                            "drop": d[2], "under": d[1].get("under")}
             embeds.append(e)
@@ -2806,7 +2806,7 @@ _REACT_BY_EMOJI = {v: k_ for k_, v in REACT_EMOJI.items()}
 def add_reactions(mid: str) -> bool:
     """Pre-add the three buttons so one tap is enough. False when the bot may not add reactions."""
     from urllib.parse import quote
-    for em in REACT_EMOJI.values():
+    for em in (REACT_EMOJI["bought"], REACT_EMOJI["missed"]):            # no reaction at all = offline
         r = _bot("PUT", f"/channels/{BOT_CHANNEL}/messages/{mid}/reactions/{quote(em, safe='')}/@me")
         if r is None or r.status_code == 403:
             return False
@@ -2841,7 +2841,7 @@ def post(embeds: list[dict], dry_run: bool, db=None) -> None:
                                 set_meta(db, "react_perm", "no")
                                 _webhook_note(db, "react_note", "ℹ️ The bot cannot add reactions here (it needs the "
                                               "**Add Reactions** permission). Alerts can still be reacted to by hand: "
-                                              "✅ bought · ❌ missed · 💤 offline.")
+                                              "✅ bought · ❌ tried but missed (no reaction = offline).")
                 except Exception as ex:
                     print(f"[warn] could not track post: {ex}")
             time.sleep(1)
@@ -2890,12 +2890,13 @@ def fills_text(db, days: int = 14) -> str:
                       "(select alive from shadow_alerts s where s.card_id=p.card_id and abs(s.ts-p.ts)<240 limit 1) "
                       "from posts p where p.ts>=?", (now - days * 86400,)).fetchall()
     if not rows:
-        return "🎯 No tracked drop alerts yet. Each ⚡/📦 drop is now one message: react ✅ bought · ❌ missed · 💤 offline."
+        return "🎯 No tracked drop alerts yet. Each ⚡/📦 drop is now one message: react ✅ bought · ❌ tried but missed; no reaction counts as offline."
+    rows = [(*r[:4], r[4] or ("offline" if r[2] < now - 12 * 3600 else None), *r[5:]) for r in rows]   # no reaction after 12 h = offline
     reacted = [r for r in rows if r[4]]
     act = [r for r in reacted if r[4] in ("bought", "missed")]
     cnt = collections.Counter(r[4] for r in reacted)
-    lines = [f"🎯 **Fills · last {days} d** · {len(rows)} drop alerts, {len(reacted)} reacted "
-             f"(✅ {cnt['bought']} · ❌ {cnt['missed']} · 💤 {cnt['offline']})"]
+    lines = [f"🎯 **Fills · last {days} d** · {len(reacted)} drop alerts closed "
+             f"(✅ {cnt['bought']} bought · ❌ {cnt['missed']} tried but missed · 💤 {cnt['offline']} offline / no reaction)"]
     if len(act) >= 5:
         lines.append(f"You got it **{cnt['bought'] / len(act) * 100:.0f}%** of the times you tried ({len(act)} tries)")
         for lo, hi, nm in ((0, 15, "under 15%"), (15, 25, "15–25%"), (25, 100, "25%+")):
