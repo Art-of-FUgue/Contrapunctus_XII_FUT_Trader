@@ -328,6 +328,7 @@ The manual `watchlist.json` is empty; the list is built automatically.
 | `FC_OWNED_SPIKE_PCT` | 15 | owned-card spike threshold |
 | `FC_SUMMARY_HOURS` | `7,19` | Austin hours for the 12-hour summary |
 | `FC_INDEX_POST_HOURS` | 0 | market index cadence in hours (0 = off; the 12 h summary has the segment table, the index is still recorded) |
+| `FC_WATCH_SELL` | 0 | `1` brings back 🎯 Watchlist Sell (a make-believe position opened by each Watchlist Buy that later posts a sell alert). Off because your logged buys now drive 💰 Your Card · Sell Now |
 | `FC_QUIET_HOURS` / `FC_QUIET_MOVE_PCT` | 6 / 5 | a held or watchlist card posts once, then waits this many hours unless its price moved this many % since the last post |
 | `FC_WINDOWS_POST_HOURS` | 0 | buy-window report cadence (0 = off) |
 | `FC_SPIKE_ALERTS` | 0 | enable spike alerts |

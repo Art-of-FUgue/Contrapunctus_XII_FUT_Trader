@@ -484,6 +484,7 @@ def repeat_blocked(db, card_id: str, kind: str, price: float, now: float) -> boo
     return bool(row and row[0] > 0 and abs(price / row[0] - 1) * 100 < REPEAT_MOVE_PCT)
 
 
+WATCH_SELL = os.environ.get("FC_WATCH_SELL", "0") == "1"      # 🎯 Watchlist Sell: off, your logged buys drive Your Card · Sell Now
 QUIET_HOURS = float(os.environ.get("FC_QUIET_HOURS", "6"))        # a card you hold / watch posts once, then waits this long...
 QUIET_MOVE_PCT = float(os.environ.get("FC_QUIET_MOVE_PCT", "5"))  # ...unless its price moved this much since the last post
 
@@ -713,11 +714,12 @@ def watch_dip(db, card: Card, now: float):
     est_h = estimate_sell_hours(db, card, tgt[0], now)
     est_ts = now + est_h * 3600
     db.execute("insert into alerts values (?,?,?,?)", (card.card_id, kind, now, card.price))
-    db.execute(
-        "insert or replace into watch_positions(card_id, buy_price, target_price, buy_ts, est_hours) "
-        "values (?,?,?,?,?)",
-        (card.card_id, card.price, int(tgt[0]), now, est_h)
-    )
+    if WATCH_SELL:                    # make-believe position that later fires a Watchlist Sell
+        db.execute(
+            "insert or replace into watch_positions(card_id, buy_price, target_price, buy_ts, est_hours) "
+            "values (?,?,?,?,?)",
+            (card.card_id, card.price, int(tgt[0]), now, est_h)
+        )
     db.commit()
     return {"pct": pct, "why": f"vs {k(usual)} **{PREMIUM_HISTORY_HOURS} h median**", "ref": usual,
             "extra": f" · net {tgt[2]:+.1f}% at fair value",
@@ -2575,6 +2577,8 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     watch_hits: list = []
     watch_sells: list = []
     db.execute("delete from watch_positions where buy_ts < ?", (now - WATCH_POSITION_EXPIRE_HOURS * 3600,))
+    if not WATCH_SELL:
+        db.execute("delete from watch_positions")
     open_watch_positions = {r[0] for r in db.execute("select card_id from watch_positions")}
     stats = {c.card_id: card_stats(db, c, now) for c in cards
              if c.card_id not in muted_new and c.card_id not in watch}
