@@ -497,6 +497,37 @@ QUIET_HOURS = float(os.environ.get("FC_QUIET_HOURS", "6"))        # a card you h
 QUIET_MOVE_PCT = float(os.environ.get("FC_QUIET_MOVE_PCT", "5"))  # ...unless its price moved this much since the last post
 
 
+# ---- card-level falling-knife guard ------------------------------------------
+# A card that is already sliding (e.g. a promo card losing 70 % in a day) keeps "dipping under its 4-day sold price" at
+# every step, so each step fires an alert. If the card was already down KNIFE_DROP % from its 6 h high half an hour ago and
+# its price has not gone flat since, the alert goes to the 🔹 low-confidence list instead. A fresh sudden drop on a
+# card that was steady (the case the drop alerts are for) is not affected. 0 = off.
+KNIFE_DROP = float(os.environ.get("FC_KNIFE_DROP", "25"))
+KNIFE_FLAT = float(os.environ.get("FC_KNIFE_FLAT", "3"))      # % range over the previous hour that counts as flat again
+
+
+def falling_knife(db, card_id: str, now: float) -> str:
+    """Reason text if the card is in a slide (see above), else ''."""
+    if not KNIFE_DROP:
+        return ""
+    rows = db.execute("select ts, price from prices where card_id=? and ts>=? order by ts", (card_id, now - 6 * 3600)).fetchall()
+    if len(rows) < 6:
+        return ""
+    before = [(t, p) for t, p in rows if t <= now - 1800]
+    if len(before) < 4:
+        return ""
+    hi = max(p for _, p in rows)
+    p_before = before[-1][1]
+    fall = (p_before / hi - 1) * 100
+    if fall > -KNIFE_DROP:
+        return ""
+    hour = [p for t, p in before if t >= now - 5400]
+    if len(hour) >= 3 and (max(hour) / min(hour) - 1) * 100 <= KNIFE_FLAT:
+        return ""                                      # flat for the hour before: the slide has stopped
+    return f"falling knife: already {fall:.0f}% from its 6 h high and still moving, no flat hour yet"
+
+
+
 def quiet_blocked(db, card_id: str, kind: str, price: float, now: float) -> bool:
     """Per-card cooldown for owned / watchlist posts: no repeat inside QUIET_HOURS unless the price moved QUIET_MOVE_PCT."""
     row = db.execute("select price from alerts where card_id=? and kind=? and ts>=? order by ts desc limit 1",
@@ -2711,6 +2742,22 @@ def scan(db, cards: list[Card], now: float, watchlist: set[str] | None = None,
     except Exception as e:
         print(f"[warn] shadow mode failed: {e}")
     premium_dips = fresh_dips(db, premium_dips, now, "prem")
+    try:                                              # cards already in a slide: low-confidence list instead
+        keep = []
+        for it in flash_dips:
+            why = falling_knife(db, it[0].card_id, now)
+            (low_dips.append((*it, why)) if why else keep.append(it))
+        flash_dips = keep
+        keep = []
+        for c, ps in premium_dips:
+            why = falling_knife(db, c.card_id, now)
+            if why:
+                low_dips.append((c, {"vol": False}, ps.get("dip_pct", 0.0), "💎 premium · " + why))
+            else:
+                keep.append((c, ps))
+        premium_dips = keep
+    except Exception as e:
+        print(f"[warn] knife guard failed: {e}")
 
     # chance of a sale within the horizon, and log each dip for later review (outcomes table)
     for items, dtype in ((dips, "6h"), (flash_dips, "micro")):
