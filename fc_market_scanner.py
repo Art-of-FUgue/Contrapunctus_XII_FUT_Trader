@@ -2961,11 +2961,39 @@ def read_reactions(db, now: float) -> None:
             name = (rx.get("emoji") or {}).get("name")
             if name in _REACT_BY_EMOJI and rx.get("count", 0) - (1 if rx.get("me") else 0) > 0:
                 mine.add(_REACT_BY_EMOJI[name])
-        if not mine:
-            continue
+        cid = row[1]
+        if not mine:                                  # reaction taken away: undo what it did
+            if row[4]:
+                db.execute("update posts set outcome=null, seen_ts=null where msg_id=?", (row[0],))
+                if row[4] == "bought":
+                    _unhold_reaction(db, cid, held)
+        else:
+            _apply_reaction(db, m, row, mine, held, now)
+    db.commit()
+
+
+def _unhold_reaction(db, cid: str, held: dict) -> None:
+    """Drop a holding that a ✅ reaction created (not one you typed with `bought`)."""
+    r = db.execute("select note from held where card_id=?", (cid,)).fetchone()
+    if r and r[0] == "reaction":
+        db.execute("delete from held where card_id=?", (cid,))
+        held.pop(cid, None)
+        print(f"[info] reaction removed: {cid} no longer held")
+        try:
+            _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
+                 json={"content": f"↩️ Reaction removed: **{_card_label(cid)}** is no longer tracked as held.",
+                       "allowed_mentions": {"parse": []}})
+        except Exception:
+            pass
+
+
+def _apply_reaction(db, m, row, mine, held, now) -> None:
+    if True:
         out = "bought" if "bought" in mine else "missed" if "missed" in mine else "offline"
         if out == row[4]:
-            continue
+            return
+        if row[4] == "bought" and out != "bought":    # changed ✅ to ❌ / 💤
+            _unhold_reaction(db, row[1], held)
         db.execute("update posts set outcome=?, seen_ts=coalesce(seen_ts, ?) where msg_id=?", (out, now, row[0]))
         cid, price = row[1], row[2]
         if out == "bought" and cid not in held:
@@ -2973,6 +3001,7 @@ def read_reactions(db, now: float) -> None:
             db.execute("insert or replace into held(card_id, price, target, ts, ctx, note) values (?,?,?,?,?,?)",
                        (cid, price, None, now, json.dumps(ctx), "reaction"))
             held[cid] = price
+            set_meta(db, "last_action", json.dumps({"t": "buy", "card": cid, "prev": None}))   # so `undo` works on it
             print(f"[info] reaction: bought {cid} at {price}")
             try:
                 st = sm.sale_stats(db, cid, now, PREMIUM_SALE_WINDOW_H, PREMIUM_HALFLIFE_H)
@@ -2985,7 +3014,6 @@ def read_reactions(db, now: float) -> None:
                            "message_reference": {"message_id": row[0]}, "allowed_mentions": {"parse": []}})
             except Exception as e:
                 print(f"[warn] reaction confirmation failed: {e}")
-    db.commit()
 
 
 def fills_text(db, days: int = 14) -> str:
