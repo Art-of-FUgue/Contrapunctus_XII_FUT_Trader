@@ -3987,7 +3987,7 @@ def poll_channel(db, cards_map: dict, now: float) -> None:
             except Exception as e:
                 print(f"[warn] bot reply failed: {e}")
             continue
-        if low in ("holding", "holdings", "held", "portfolio", "inventory", "active cards"):
+        if low in ("holding", "holdings", "held", "portfolio", "inventory", "active cards", "open", "opened", "open cards", "opened cards", "bought list", "bought cards", "my cards", "open positions"):
             try:
                 _bot("POST", f"/channels/{BOT_CHANNEL}/messages",
                      json={"content": holding_text(db, cards_map, now), "message_reference": {"message_id": m["id"]},
